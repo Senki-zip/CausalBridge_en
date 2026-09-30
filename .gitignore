@@ -1,0 +1,36 @@
+# Cache directories
+cache_test/
+cache_mouse/
+
+# Run results
+results/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+
+# Large-file cache
+*.pkl
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# System files
+.DS_Store
+.Rhistory
+.RData
+
+# Environment
+.env
+.env.local
+
+# Local orchestration notes
+.slim/deepwork/

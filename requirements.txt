@@ -1,0 +1,28 @@
+# =============================================================================
+# CausalBridge dependencies
+# =============================================================================
+# Install: pip install -r requirements.txt
+# =============================================================================
+
+# --- Core dependencies (required) ---
+numpy>=1.26
+pandas>=2.2
+scipy>=1.14
+scikit-learn>=1.5
+anndata>=0.10
+scanpy>=1.10
+statsmodels>=0.14
+pyyaml>=6.0
+
+# --- Pseudotime inference ---
+palantir>=1.4              # Palantir: multi-lineage pseudotime
+
+# --- Motif scanning (conditional import, checked at startup) ---
+biopython>=1.84            # Bio.SeqIO + Bio.motifs: JASPAR motif scanning
+
+# --- NN transfer function (required: sole ATAC→RNA path, no method switch) ---
+torch>=2.0                 # PyTorch: shared neural-network transfer function (required, not optional)
+
+# --- Visualization scripts (optional) ---
+matplotlib>=3.9            # plot_causal_network.py: causal network visualization
+networkx>=3.0              # plot_causal_network.py: graph layout algorithms

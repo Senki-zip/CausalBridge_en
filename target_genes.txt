@@ -1,0 +1,6 @@
+# Target gene list (for knockout/perturbation simulation)
+# Format: gene_name  gene_type
+#   gene_type = TF:     this gene is a transcription factor; KO propagates through the TF→peak→gene path
+#   gene_type = target: this gene is not a transcription factor; KO propagates through a co-expression proxy TF
+RUNX1	TF
+MYB	TF
