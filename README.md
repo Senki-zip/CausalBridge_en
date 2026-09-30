@@ -130,7 +130,6 @@ run_peak_perturbation.py            Standalone CLI: peak perturbation trial runs
 convert_10x_to_atac_bridge.py       Convert 10x output to the atac_bridge input format
 plot_causal_network.py              Python visualization: causal network plots
 visualize_perturbation.R            R visualization: Volcano + Pathway Sankey plots
-visualize_multi_tf_perturbation.R   R visualization: multi-TF perturbation comparison plots
 target_genes.txt                    List of knockout target genes (supports TF/TARGET type annotations)
 config.yaml                         User configuration file
 FIGUERS_README.md                   Figure-generation instructions
