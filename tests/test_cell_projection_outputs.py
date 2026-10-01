@@ -1,9 +1,9 @@
 import pandas as pd
 import numpy as np
 
-from atac_bridge.io import save_results
-from atac_bridge.run import _project_bin_forward_inputs
-from atac_bridge.perturbation import (
+from CausalBridge.io import save_results
+from CausalBridge.run import _project_bin_forward_inputs
+from CausalBridge.perturbation import (
     _floor_rna_l1,
     _projection_membership_weights,
     _projection_operators,

@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import anndata as ad
 
-from atac_bridge.io import normalize_anndata_string_metadata
+from CausalBridge.io import normalize_anndata_string_metadata
 
 
 def test_nullable_string_metadata_is_writable(tmp_path):

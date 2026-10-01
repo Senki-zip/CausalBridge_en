@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 from typing import Any
 
-from atac_bridge.perturbation import (
+from CausalBridge.perturbation import (
     _active_proxy_seeds,
     _extract_subnetwork,
     _extract_unlimited_subnetwork,

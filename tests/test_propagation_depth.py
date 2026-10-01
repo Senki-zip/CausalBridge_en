@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 
-from atac_bridge.perturbation import (
+from CausalBridge.perturbation import (
     _accumulate_tf_l1_output_event,
     _active_proxy_seeds,
     _record_gene_cascade_depth,

@@ -619,7 +619,7 @@ def main(pert_csv, tf_csv, edges_csv, top_n=5, output_dir=None):
 
 
 if __name__ == "__main__":
-    base = "/home/huangtao/Desktop/huangchengqi/code_1/atac_bridge/results"
+    base = "/home/huangtao/Desktop/huangchengqi/code_1/CausalBridge/results"
     pert_csv = f"{base}/perturbation_results.csv"
     tf_csv   = f"{base}/tf_peak_weights.csv"
     edges_csv = f"{base}/causal_peak_gene_edges.csv"

@@ -12,7 +12,7 @@ Pipeline overview:
   Step 9: Aggregate results + generate report
 
 Usage:
-  from atac_bridge.run import run_pipeline
+  from CausalBridge.run import run_pipeline
   results = run_pipeline("config.yaml")
 """
 
@@ -44,7 +44,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger("atac_bridge")
+logger = logging.getLogger("CausalBridge")
 
 
 def _aggregate_context_l0(context_registry, modeled_context_l0, gene_names,

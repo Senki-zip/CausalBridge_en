@@ -8,20 +8,20 @@ Supports two input modes:
     Cell Ranger ARC outputs ATAC+RNA to one h5 file or mtx directory;
     features are automatically split by type label (Gene Expression / Peaks).
 
-    python convert_10x_to_atac_bridge.py \
+    python convert_10x_to_CausalBridge.py \
         -i /home/huangtao/Desktop/huangchengqi/GSE282390_WT_KO/WT/ \
         -g /home/huangtao/Desktop/huangchengqi/reference_documents/refdata-cellranger-arc-mm10-2020-A-2.0.0/genes/genes.gtf \
         -o /home/huangtao/Desktop/huangchengqi/test_1
 
-    python convert_10x_to_atac_bridge.py \
+    python convert_10x_to_CausalBridge.py \
         -i /home/huangtao/Desktop/single_cell/analysis_results/CTRL_ARC_Output/outs/raw_feature_bc_matrix/ \
         -g genes.gtf \
-        -o /home/huangtao/Desktop/huangchengqi/atac_bridge/result/
+        -o /home/huangtao/Desktop/huangchengqi/CausalBridge/result/
 
   Mode B — separate RNA and ATAC paths
     Use when RNA and ATAC come from different 10x output directories.
 
-    python convert_10x_to_atac_bridge.py \
+    python convert_10x_to_CausalBridge.py \
         --rna  RNA/ \
         --atac scATAC-seq/Matrix_Export/ \
         --atac-peaks peaks.bed \
@@ -39,7 +39,7 @@ import urllib.request
 from pathlib import Path
 
 import numpy as np
-from atac_bridge.io import normalize_anndata_string_metadata
+from CausalBridge.io import normalize_anndata_string_metadata
 import pandas as pd
 import scanpy as sc
 import anndata as ad
@@ -83,8 +83,8 @@ def main():
 
     # --- Output and filtering ---
     parser.add_argument(
-        "--output", "-o", default="./atac_bridge_input",
-        help="Output directory (default: ./atac_bridge_input)",
+        "--output", "-o", default="./CausalBridge_input",
+        help="Output directory (default: ./CausalBridge_input)",
     )
     parser.add_argument(
         "--min-genes", type=int, default=200,
@@ -511,7 +511,7 @@ def _annotate_gene_coords(rna_adata: ad.AnnData, gtf_path: str = None, genome: s
 
     # Strategy 3: local cache
     if gene_info is None:
-        cache = Path.home() / ".atac_bridge" / "gene_coords.parquet"
+        cache = Path.home() / ".CausalBridge" / "gene_coords.parquet"
         if cache.exists():
             df = pd.read_parquet(cache)
             gene_info = {
@@ -609,7 +609,7 @@ def _query_mygene(gene_names, genome: str = None) -> dict:
                 }
 
         if info:
-            cache = Path.home() / ".atac_bridge" / "gene_coords.parquet"
+            cache = Path.home() / ".CausalBridge" / "gene_coords.parquet"
             cache.parent.mkdir(parents=True, exist_ok=True)
             pd.DataFrame([
                 {"gene_name": g, "chr": i["chr"], "start": i["start"], "end": i["end"]}

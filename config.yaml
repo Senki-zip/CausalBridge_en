@@ -14,7 +14,7 @@ input:
   rna_h5ad: "/home/huangtao/Desktop/huangchengqi/test/output/rna_adata.h5ad"           # RNA AnnData; .var must contain chr, start, end
   atac_h5ad: "/home/huangtao/Desktop/huangchengqi/test/output/atac_adata.h5ad"         # ATAC AnnData; .var must contain chr, start, end
   genome_fasta: "/home/huangtao/Desktop/huangchengqi/reference_documents/refdata-cellranger-arc-GRCh38-2024-A/fasta/genome.fa"       # Reference genome (for motif scanning)
-  target_genes: "/home/huangtao/Desktop/huangchengqi/code_1/atac_bridge/target_genes.txt"          # KO target-gene list, one per line
+  target_genes: "/home/huangtao/Desktop/huangchengqi/code_1/CausalBridge/target_genes.txt"          # KO target-gene list, one per line
 
 # --- RNA data preprocessing ---
 preprocess:
@@ -157,7 +157,7 @@ clustering:
 
 # --- Output ---
 output:
-  dir: "/home/huangtao/Desktop/huangchengqi/code_1/atac_bridge/results/test/GATA1_KLF1/"  # Output directory
-  cache_dir: "/home/huangtao/Desktop/huangchengqi/code_1/atac_bridge/cache_test/"                       # Cache directory (persistent cache for motif scans, TF databases, etc.)
+  dir: "/home/huangtao/Desktop/huangchengqi/code_1/CausalBridge/results/test/GATA1_KLF1/"  # Output directory
+  cache_dir: "/home/huangtao/Desktop/huangchengqi/code_1/CausalBridge/cache_test/"                       # Cache directory (persistent cache for motif scans, TF databases, etc.)
   checkpoint_dir: null                           # Checkpoint directory (null=use output.dir/checkpoints)
   save_intermediate: true                        # Whether to retain intermediate files

@@ -5,10 +5,10 @@ from pathlib import Path
 
 import pandas as pd
 
-from atac_bridge.io import load_config
-from atac_bridge.nn_transfer import _train_validation_sizes
-from atac_bridge.perturbation import _nn_delta_or_linear, _read_nn_rna_log_normalized
-from atac_bridge.run import _validate_step5_checkpoint, _validate_step6_checkpoint
+from CausalBridge.io import load_config
+from CausalBridge.nn_transfer import _train_validation_sizes
+from CausalBridge.perturbation import _nn_delta_or_linear, _read_nn_rna_log_normalized
+from CausalBridge.run import _validate_step5_checkpoint, _validate_step6_checkpoint
 
 
 def test_nn_train_validation_sizes():

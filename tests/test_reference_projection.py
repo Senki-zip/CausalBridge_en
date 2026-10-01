@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from atac_bridge.reference_projection import fit_reference_projection, project_reference, reconstruct_counterfactual
+from CausalBridge.reference_projection import fit_reference_projection, project_reference, reconstruct_counterfactual
 
 
 def _model():

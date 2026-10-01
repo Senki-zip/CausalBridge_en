@@ -112,7 +112,7 @@ Layer 2+: recursive expansion (depth controlled by subnetwork_depth; both the sh
 ## 4. Module Structure
 
 ```
-atac_bridge/
+CausalBridge/
 ├── run.py           Main pipeline entry; chains the full workflow (including checkpoint resume)
 ├── io.py            Config file parsing, data loading, result saving
 ├── preprocess.py    RNA/ATAC QC and normalization, PCA + KNN + Leiden clustering + UMAP
@@ -127,7 +127,7 @@ atac_bridge/
 ```
 run_example.py                      Command-line entry script
 run_peak_perturbation.py            Standalone CLI: peak perturbation trial runs (checkpoint reuse; try peaks/strengths/depths in seconds)
-convert_10x_to_atac_bridge.py       Convert 10x output to the atac_bridge input format
+convert_10x_to_CausalBridge.py       Convert 10x output to the CausalBridge input format
 plot_causal_network.py              Python visualization: causal network plots
 visualize_perturbation.R            R visualization: Volcano + regulatory pathway plots
 target_genes.txt                    List of knockout target genes (supports TF/TARGET type annotations)
@@ -177,7 +177,7 @@ python run_example.py config.yaml
 ### Python API
 
 ```python
-from atac_bridge.run import run_pipeline
+from CausalBridge.run import run_pipeline
 results = run_pipeline("config.yaml")
 ```
 
@@ -1624,7 +1624,7 @@ directly; set `subnetwork_depth` to a finite integer when the closure needs a st
 
 ### Code fallbacks (only when a user configuration omits a key)
 
-The following values come from `atac_bridge/io.py` and apply only when the corresponding key is absent from a user configuration; they do not replace the shipped `config.yaml`.
+The following values come from `CausalBridge/io.py` and apply only when the corresponding key is absent from a user configuration; they do not replace the shipped `config.yaml`.
 
 | Parameter | Code fallback |
 |------|------------|

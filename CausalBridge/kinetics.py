@@ -40,7 +40,7 @@ def _get_cache_dir(config: Optional[dict] = None) -> Path:
         cache_dir = config.get("output", {}).get("cache_dir")
         if cache_dir:
             return Path(cache_dir)
-    return Path.home() / ".atac_bridge"
+    return Path.home() / ".CausalBridge"
 
 
 # ============================================================================
@@ -432,7 +432,7 @@ def _load_gimmemotifs_database(cache_dir: Optional[Path] = None) -> Optional[dic
         Same format as _load_jaspar_motifs
     """
     if cache_dir is None:
-        cache_dir = Path.home() / ".atac_bridge"
+        cache_dir = Path.home() / ".CausalBridge"
     # Load from cache first
     cache_path = cache_dir / "gimmemotifs_cache.pkl"
     if cache_path.exists():
@@ -789,7 +789,7 @@ def _load_jaspar_motifs(db_name: str = "jaspar2024", cache_dir: Optional[Path] =
         {motif_id: {"name": str, "tf_name": str, "pwm": ndarray}}
     """
     if cache_dir is None:
-        cache_dir = Path.home() / ".atac_bridge"
+        cache_dir = Path.home() / ".CausalBridge"
 
     # Strategy A: biopython online API
     try:
@@ -1490,7 +1490,7 @@ def _assign_tfs_fallback(
       in the RNA data that have motif structural domains
     """
     if cache_dir is None:
-        cache_dir = Path.home() / ".atac_bridge"
+        cache_dir = Path.home() / ".CausalBridge"
     tf_db_path = cache_dir / "tf_database.txt"
 
     if tf_db_path.exists():

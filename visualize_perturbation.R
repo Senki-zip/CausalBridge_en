@@ -31,15 +31,15 @@ HAS_ANNDATA <- requireNamespace("anndata", quietly = TRUE)
 
 # Default result directory (can be overridden by command-line argument)
 RESULT_DIR <- Sys.getenv(
-  "ATAC_BRIDGE_RESULT_DIR",
-  unset = "/home/huangtao/Desktop/huangchengqi/code_1/atac_bridge/results/test_2/D3/"
+  "CAUSALBRIDGE_RESULT_DIR",
+  unset = "/home/huangtao/Desktop/huangchengqi/code_1/CausalBridge/results/test_2/D3/"
 )
 
 # Genes to draw pathway schematics for.
 #   NULL         → auto-select top 5 by |delta_rna_signed|
 #   c("A","B")   → draw specified genes only
 # Can be overridden by:  --genes GENE1,GENE2,...
-pathway_genes_env <- Sys.getenv("ATAC_BRIDGE_PATHWAY_GENES", unset = "")
+pathway_genes_env <- Sys.getenv("CAUSALBRIDGE_PATHWAY_GENES", unset = "")
 PATHWAY_GENES <- if (identical(pathway_genes_env, "__AUTO__")) {
   NULL
 } else if (nzchar(pathway_genes_env)) {
@@ -74,7 +74,7 @@ if (length(positional) > 0) {
 }
 
 OUTPUT_DIR <- Sys.getenv(
-  "ATAC_BRIDGE_OUTPUT_DIR",
+  "CAUSALBRIDGE_OUTPUT_DIR",
   unset = file.path(RESULT_DIR, "figures_R")
 )
 dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
@@ -203,7 +203,7 @@ target_gene_names <- trimws(unlist(strsplit(target_gene_raw, "[,+]")))
 target_gene_names <- unique(target_gene_names[nzchar(target_gene_names)])
 target_gene_name <- paste(target_gene_names, collapse = " + ")
 
-if (identical(Sys.getenv("ATAC_BRIDGE_REQUIRE_MULTI_TF"), "1") &&
+if (identical(Sys.getenv("CAUSALBRIDGE_REQUIRE_MULTI_TF"), "1") &&
     length(target_gene_names) < 2) {
   stop("The joint KO visualization script requires target_gene to contain at least two TFs")
 }

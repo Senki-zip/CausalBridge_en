@@ -16,10 +16,10 @@ import sys
 import argparse
 from pathlib import Path
 
-# Add the directory containing the atac_bridge package to the path
+# Add the directory containing the CausalBridge package to the path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from atac_bridge.run import run_pipeline
+from CausalBridge.run import run_pipeline
 
 
 def main():
@@ -52,11 +52,11 @@ Examples:
 
     if args.verbose:
         import logging
-        logging.getLogger("atac_bridge").setLevel(logging.DEBUG)
+        logging.getLogger("CausalBridge").setLevel(logging.DEBUG)
 
     if args.dry_run:
         print("Dry-run mode: validating configuration and data format...")
-        from atac_bridge.io import load_config, load_data
+        from CausalBridge.io import load_config, load_data
         config = load_config(args.config)
         rna, atac = load_data(config)
         print(f"  RNA: {rna.n_obs} cells × {rna.n_vars} genes")

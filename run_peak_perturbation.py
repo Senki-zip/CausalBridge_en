@@ -70,7 +70,7 @@ def main():
     print(f"[peak-ko] output.dir={config['output']['dir']}")
     print(f"[peak-ko] checkpoint_dir={config['output']['checkpoint_dir']} (reused)")
 
-    from atac_bridge.run import run_pipeline
+    from CausalBridge.run import run_pipeline
     res = run_pipeline(str(derived))
     if "error" in res:
         print(f"[peak-ko] Failed: {res['error']}")
