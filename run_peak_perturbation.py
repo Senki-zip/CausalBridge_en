@@ -24,7 +24,7 @@ def main():
     ap.add_argument("--config", required=True, help="Path to the base config.yaml")
     ap.add_argument("--peak", required=True, help="Target peak, e.g. chr3:123400-123900")
     ap.add_argument("--strength", type=float, default=-1.0,
-                    help="Perturbation strength s∈[-1,1]: -1=fully closed, -0.5=50% reduction, +0.5=enhanced")
+                     help="Perturbation strength s∈[-1,1]: -1=fully closed, -0.5=50%% reduction, +0.5=enhanced")
     ap.add_argument("--mode", choices=["relative", "absolute"], default="relative",
                      help="relative: A'=A(1+s) | absolute: A'=s (raw [0,1] target value)")
     ap.add_argument("--depth", type=int, default=1,

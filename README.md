@@ -93,7 +93,7 @@ Starting from the target gene, a breadth-first search extracts a multi-layer reg
 ```
 Layer 0: target_gene
 Layer 1: direct causal peaks (from Granger + TF→peak weights) + the genes regulated by these peaks
-Layer 2+: recursive expansion (depth controlled by subnetwork_depth; io default 3, the shipped config.yaml sets it to "unlimited")
+Layer 2+: recursive expansion (depth controlled by subnetwork_depth; both the shipped config.yaml and the code fallback use "unlimited")
 ```
 
 ### Key mechanisms
@@ -1468,6 +1468,8 @@ All three independent sources of perturbation amplification are now constrained:
 
 ## 9. Complete configuration reference
 
+> Every “Default” in this section is the value in the shipped `config.yaml`. Different code fallbacks used when a user configuration omits a key are listed separately at the end of this section.
+
 ### input — input data
 
 | Parameter | Type | Default | Description |
@@ -1567,7 +1569,10 @@ All three independent sources of perturbation amplification are now constrained:
 | joint_knockout | true | Whether to knock out all target_genes jointly (all targets in one simulation) |
 | propagation_rounds | 1 | Propagation rounds. 1=single round with no fold accumulation (default); >1=multiple rounds with state inheritance enabled |
 | ko_strength | 1.0 | Knockout strength (1.0=complete knockout) |
-| subnetwork_depth | 3 (io default; shipped config.yaml sets "unlimited") | BFS subnetwork extraction depth; gene-KO bin_forward can experimentally use `"unlimited"`, meaning a strictly downstream executable TF→peak→gene closure after R²/lag/endpoint filtering |
+| subnetwork_depth | unlimited | BFS subnetwork extraction depth; gene-KO bin_forward uses a strictly downstream executable TF→peak→gene closure after R²/lag/endpoint filtering |
+| subnetwork_unlimited_max_edges | 125000 | Maximum simulated edges retained in unlimited mode |
+| subnetwork_unlimited_max_work_edges | 250000 | Safety limit for candidate rows traversed during unlimited closure |
+| min_lag_per_peak_filter | true | Retain only TFs with the minimum lag per peak; retain all TFs tied at that lag |
 
 `subnetwork_depth: "unlimited"` applies only to gene-KO `bin_forward` and does not expand the whole network without limit:
 it only keeps traversing along executable TF→peak→gene directions. The executable simulation edges finally retained are limited by
@@ -1575,7 +1580,7 @@ it only keeps traversing along executable TF→peak→gene directions. The execu
 `subnetwork_unlimited_max_work_edges` (which transparently becomes
 `max(max_edges*10, max_edges+100)` when unset). The latter is a conservative safety limit on candidate rows scanned, not equal to the
 number of edges finally retained, and it raises an error before continuing to expand. Exceeding either budget raises an error
-directly; keep the default finite depth `3` when the experimental closure is not needed.
+directly; set `subnetwork_depth` to a finite integer when the closure needs a stricter size limit.
 | min_r2_threshold | 0.3 | Hard R² filter threshold for peak→gene edges; edges below it are dropped outright |
 | min_delta_threshold | 0 | Perturbation output filter: minimum \|delta_rna\|; 0=no filtering |
 | log_accumulation | true | (v1.36) Accumulation space. **true** (default) = accumulate delta_r in log1p-log1p (native NN L2) space (+δ/−δ cancel symmetrically, removing the exponential positive bias of raw accumulation), then back-convert to L1 at the end and compute `log2(L1_pert/L1_orig)` to restore the legacy signal amplitude; **false** = legacy raw path (kept for regression comparison) |
@@ -1584,9 +1589,14 @@ directly; keep the default finite depth `3` when the experimental closure is not
 | peak_ko.peak_id | — | (v1.37) Target peak, e.g. `chr10:1008923-1009780`; supports exact/overlap/nearest matching |
 | peak_ko.mode | relative | (v1.37) Perturbation definition: **relative** `A′=A(1+s)` (recommended; s=-1 fully closes) / absolute `A′=s` (raw [0,1] target value) |
 | peak_ko.strength | -1.0 | (v1.37) Perturbation strength s ∈ [-1,+1]: -1=fully closed, -0.5=50% reduction, +0.5=enhanced |
-| peak_ko.depth | 1 | (v1.37/1.38) Propagation depth: 1=direct (default, direct target genes only) / 2/3=cascade (v1.38: TF→secondary peak→secondary gene, layer-limited BFS) |
+| peak_ko.depth | 2 | (v1.37/1.38) Propagation depth: 1=direct (direct target genes only) / 2/3=cascade (v1.38: TF→secondary peak→secondary gene, layer-limited BFS) |
 | peak_ko.state | all | (v1.38) Leiden cluster label (run a single cluster only) or "all" (all clusters + merged weighted by cluster cell count) |
-| peak_ko.match | exact | (v1.37) Peak matching strategy: exact / overlap / nearest (distance is output explicitly; never silently substituted) |
+| peak_ko.match | overlap | (v1.37) Peak matching strategy: exact / overlap / nearest (distance is output explicitly; never silently substituted) |
+| cell_projection.enabled | false | Enable optional RNA reference projection |
+| cell_projection.n_components | null | Retain all estimable PCA components |
+| cell_projection.n_neighbors | 10 | Reference neighbors for inverse-distance projection |
+| cell_projection.history_delta_threshold | 1e-8 | Sparse-history nonzero cutoff |
+| cell_projection.state_unit | rna_log1p_cp10k | Unit of projected RNA state values |
 ### clustering — cell clustering
 
 | Parameter | Default | Description |
@@ -1595,12 +1605,12 @@ directly; keep the default finite depth `3` when the experimental closure is not
 | cluster_key | leiden | Column name for cluster labels in obs |
 | n_neighbors | 20 | Number of KNN graph neighbors |
 | n_pcs | 20 | Number of PCA components |
-| resolution | 0.8 | Leiden resolution |
+| resolution | 0.5 | Leiden resolution |
 | random_state | 42 | Random seed |
 | min_cells_per_cluster | 50 | Minimum cells per cluster (smaller clusters trigger fallback) |
 | fallback_pseudotime_method | palantir | Pseudotime method for the global fallback (Palantir recommended) |
-| clustering.paga.enabled | true (io) / false (shipped config) | Whether to enable PAGA lineage merging: identify topological connectivity between clusters and merge connected clusters into one lineage before inferring pseudotime |
-| clustering.paga.connectivity_threshold | 0.1 (io) / 0.08 (shipped config) | PAGA connectivity threshold; between-cluster links below this value are not treated as the same lineage |
+| clustering.paga.enabled | false | Whether to enable PAGA lineage merging: identify topological connectivity between clusters and merge connected clusters into one lineage before inferring pseudotime |
+| clustering.paga.connectivity_threshold | 0.08 | PAGA connectivity threshold; between-cluster links below this value are not treated as the same lineage |
 | clustering.paga.min_cells_per_lineage | 50 | Minimum cells in a merged lineage (smaller lineages merge into the nearest lineage) |
 
 ### output — output
@@ -1611,6 +1621,24 @@ directly; keep the default finite depth `3` when the experimental closure is not
 | cache_dir | cache/ | Cache directory (motif scans, TF databases, etc.) |
 | checkpoint_dir | null | Checkpoint directory (null=use output.dir/checkpoints) |
 | save_intermediate | true | Whether to retain intermediate files
+
+### Code fallbacks (only when a user configuration omits a key)
+
+The following values come from `atac_bridge/io.py` and apply only when the corresponding key is absent from a user configuration; they do not replace the shipped `config.yaml`.
+
+| Parameter | Code fallback |
+|------|------------|
+| pseudotime.n_neighbors | 30 |
+| pseudotime.n_bins | 100 |
+| granger.distance_thresh | 1000000 |
+| granger.significance_threshold | 0.10 |
+| granger.min_effect_size | 0.02 |
+| rna_to_atac.motif_pval_threshold | 1e-4 |
+| rna_to_atac.max_lag | 0 |
+| perturbation.subnetwork_unlimited_max_work_edges | null (then derives `max(max_edges*10, max_edges+100)`) |
+| clustering.resolution | 0.8 |
+| clustering.paga.enabled | true |
+| clustering.paga.connectivity_threshold | 0.1 |
 
 ---
 

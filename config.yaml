@@ -69,7 +69,7 @@ atac_to_rna:
   # --- NN parameters ---
   nn_d_embed: 4                            # Embedding dimension (small dimension forces NN dependence on ATAC)
   nn_d_atac: 16                              # ATAC feature-vector dimension (dot-product modulation allows pair-specific signs/shapes)
-  # nn_atac_hidden_dims: [32, 64, 128]       # (default) atac_net hidden-layer dimensions
+  nn_atac_hidden_dims: [32, 64, 128]         # atac_net hidden-layer dimensions
   nn_dropout: 0.1                           # Dropout ratio
   nn_batch_size: 4096                        # Training batch size
   nn_learning_rate: 0.001                   # Initial learning rate
@@ -105,6 +105,12 @@ rna_to_atac:
 
 # --- Perturbation simulation ---
 perturbation:
+  cell_projection:
+    enabled: false                            # Enable optional RNA reference projection
+    n_components: null                        # null=retain all estimable PCA components
+    n_neighbors: 10                           # Reference neighbors for inverse-distance projection
+    history_delta_threshold: 1.0e-8           # Sparse-history nonzero cutoff
+    state_unit: rna_log1p_cp10k               # Unit of projected RNA state values
   perturbation_mode: "bin_forward"               # Bin-wise forward propagation: TF-specific lag + causal ordering
   propagation_rounds: 1                          # Propagation rounds: 1=single round (no fold accumulation, symmetric), >1=multiple rounds (independent delta per round)
   joint_knockout: true                         # Whether bin_forward jointly knocks out all target_genes (true=one simulation, false=per gene)
