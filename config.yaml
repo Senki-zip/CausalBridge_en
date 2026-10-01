@@ -1,5 +1,5 @@
 # =============================================================================
-# CausalBridge: ATAC-bridged causal perturbation prediction framework — configuration
+# CausalBridge: causal perturbation prediction framework with ATAC bridging — configuration
 # =============================================================================
 # Core idea:
 #   Use chromatin accessibility (ATAC) as a mechanistic mediator and explicitly model the propagation path of gene perturbations:

@@ -29,6 +29,7 @@ import pickle
 import warnings
 from typing import Dict, Tuple, Optional, List
 from pathlib import Path
+from sysconfig import get_paths
 
 logger = logging.getLogger(__name__)
 
@@ -443,10 +444,10 @@ def _load_gimmemotifs_database(cache_dir: Optional[Path] = None) -> Optional[dic
         except Exception:
             pass
 
-    # gimmemotifs may be installed in several locations
+    # Use the active interpreter's site-packages directory rather than a
+    # machine- or environment-name-specific Conda path.
     possible_dirs = [
-        Path.home() / "miniconda3/envs/atac-bridge/lib/python3.10/site-packages/data/motif_databases",
-        Path("/home/huangtao/miniconda3/envs/atac-bridge/lib/python3.10/site-packages/data/motif_databases"),
+        Path(get_paths()["purelib"]) / "data" / "motif_databases",
     ]
 
     data_dir = None
