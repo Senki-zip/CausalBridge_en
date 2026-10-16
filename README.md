@@ -345,16 +345,15 @@ Currently $S=10000$, and both upper-bound expansion coefficients are $0.25$. The
 
 A softsign curve has two plateaus, a center, and a scale:
 
-```math
-f_j(x)=\operatorname{clip}_{[L,U]}\left[b_j+a_jh\!\left(\frac{x-c_j}{s_j}\right)\right],\qquad
-b_j=\frac{p_{0j}+p_{1j}}2,\quad a_j=\frac{p_{1j}-p_{0j}}2,\quad s_j>0.
-```
+![Equation 6.2.1](docs/equations/response-6-2-01.svg)
+
+[LaTeX](docs/equations/response-6-2-01.tex)
 
 Both plateaus $p_{0j},p_{1j}\in[L,U]$ are learned from WT and are the limits as $x\to-\infty,+\infty$, respectively. Activation and repression are allowed; the plateaus are not forced to $L,U$. Let $r=\max(x_{\max}-x_{\min},10^{-8})$. Constraints are $c_j\in[x_{\min}-r,x_{\max}+r]$ and $s_j\in[10^{-6}r,100r]$, with actual optimization variables $(p_{0j},p_{1j},c_j,\log s_j)$. SciPy least squares uses residuals $(f_j(x_{ij})-y_i)/D$, equivalent to minimizing:
 
-```math
-J_{{\rm sat},j}=\sum_{i=1}^n\left(\frac{f_j(x_{ij})-y_i}{D}\right)^2.
-```
+![Equation 6.2.2](docs/equations/response-6-2-02.svg)
+
+[LaTeX](docs/equations/response-6-2-02.tex)
 
 There is no single-relation ridge. SciPy's reported cost is $1/2$ of this sum of squares. Within deterministic `det_starts` and `max_nfev` budgets, valid candidates are selected by WT MSE. The current `best_finite` policy can retain finite, bounded candidates after budget exhaustion while recording `solver_converged=False`, raw solver status, and evaluation count. Numerical failures are excluded.
 
@@ -408,50 +407,43 @@ Candidate group $G$ uses the two / three inputs with the highest WT singles scor
 
 **saturation groups** use WT population means / standard deviations to form $u_j=(x_j-\mu_j)/s_j$, then map a quadratic polynomial through softsign:
 
-```math
-\eta(u)=\beta_0+\sum_{j=1}^d\beta_j u_j+\sum_{j=1}^d\beta_{jj}u_j^2
-+\sum_{j<k}\beta_{jk}u_ju_k,\qquad
-F_G(x)=\operatorname{clip}_{[L,U]}\left[\frac{L+U}{2}+\frac D2h(\eta(u))\right].
-```
+![Equation 6.5.1](docs/equations/response-6-5-01.svg)
+
+[LaTeX](docs/equations/response-6-5-01.tex)
 
 There are $p=(d+1)(d+2)/2$ parameters, or $6/10$ for two / three inputs; all coefficients are bounded to $[-100,100]$. Least-squares residuals concatenate $(F_G-y)/(D/2)$ and $\sqrt{\lambda_r n/p}\,\beta$, equivalent to minimizing $M_G+P_G$, where:
 
-```math
-P_G^{\rm sat}=\left(\frac D2\right)^2\lambda_r\frac{\|\beta\|_2^2}{p}.
-```
+![Equation 6.5.2](docs/equations/response-6-5-02.svg)
+
+[LaTeX](docs/equations/response-6-5-02.tex)
 
 This ridge **includes the intercept**, rather than penalizing only interactions or non-intercept terms. **NN groups** directly use the $d$-input network and objective in 6.3, with $p=H(d+2)+1$. In original output units, the penalty is:
 
-```math
-P_G^{\rm NN}=D^2\lambda_{\rm NN}\frac{\|\theta\|_2^2}{p}.
-```
+![Equation 6.5.3](docs/equations/response-6-5-03.svg)
+
+[LaTeX](docs/equations/response-6-5-03.tex)
 
 **spline groups** first apply each input's WT min–max transformation to obtain $z_j$. Let $m_j=\operatorname{median}_i z_{ij}$. $N_{j1},N_{j2}$ are natural cubic interpolation bases at knots $(0,m_j,1)$, with respective values $(0,1,0)$ and $(0,0,1)$ and zero second derivatives at endpoints. Extend every basis with $T_\tau$ from 6.4 and define:
 
-```math
-A_{j\ell}(z_j)=(T_\tau N_{j\ell})(z_j)-\frac1n\sum_i N_{j\ell}(z_{ij}),\qquad
-q_j(z_j)=(T_\tau \mathrm{id})(z_j)-\frac1n\sum_i z_{ij},\quad \mathrm{id}(z)=z.
-```
+![Equation 6.5.4](docs/equations/response-6-5-04.svg)
+
+[LaTeX](docs/equations/response-6-5-04.tex)
 
 Within $[0,1]$, $q_j$ is $z_j-\bar z_j$, with no additional standard-deviation scaling. Before centering, its left and right tails are $\tau(e^{z_j/\tau}-1)$ and $1+\tau(1-e^{-(z_j-1)/\tau})$. Group latent curves and outputs are:
 
-```math
-g_G(z)=\beta_0+\sum_{j=1}^d\sum_{\ell=1}^2\beta_{j\ell}A_{j\ell}(z_j)
-+\sum_{j<k}\gamma_{jk}q_j(z_j)q_k(z_k)
-+\mathbf1_{\{d=3\}}\gamma_{123}q_1(z_1)q_2(z_2)q_3(z_3),\qquad
-F_G(x)=L+D\,\sigma(g_G(z)).
-```
+![Equation 6.5.5](docs/equations/response-6-5-05.svg)
+
+[LaTeX](docs/equations/response-6-5-05.tex)
 
 Two- / three-input groups have $6/11$ parameters. Let $\gamma$ contain all pairwise and third-order interaction coefficients. Define the complete Hessian and boundary normal-slope penalty:
 
-```math
-R_G=\int_{[0,1]^d}\left[\sum_j(\partial_{jj}g_G)^2+2\sum_{j<k}(\partial_{jk}g_G)^2\right]dz
-+\frac1{2\tau}\sum_{j=1}^d\sum_{e\in\{0,1\}}\int_{[0,1]^{d-1}}(\partial_jg_G(z_{-j},e))^2\,dz_{-j}.
-```
+![Equation 6.5.6](docs/equations/response-6-5-06.svg)
 
-```math
-P_G^{\rm spline}=D^2\left(\lambda_sR_G+\lambda_{\rm int}\|\gamma\|_2^2\right).
-```
+[LaTeX](docs/equations/response-6-5-06.tex)
+
+![Equation 6.5.7](docs/equations/response-6-5-07.svg)
+
+[LaTeX](docs/equations/response-6-5-07.tex)
 
 The interaction penalty is a **sum** of squared coefficients, currently `group_interaction_penalty: 0.01`. $R_G$ uses 4-point Gauss–Legendre tensor-product quadrature over $[0,m_j]$ and $[m_j,1]$ in each coordinate, with face-normal coordinates fixed at $0/1$. The mixed-second-derivative coefficient is indeed $2$. Geometric group support separately uses WT mean / standard-deviation coordinates $u$; do not confuse these with the function bases' min–max coordinates $z$.
 
@@ -459,40 +451,35 @@ The interaction penalty is a **sum** of squared coefficients, currently `group_i
 
 Let $r_i$ be target row indices, $t_{ij}$ each input's source bin, and $b_i$ the branch. After failed relations are removed, define adjacent pairs on common WT rows of the remaining singles:
 
-```math
-\mathcal A=\{i:\ r_{i+1}-r_i=1,\ b_{i+1}=b_i,\ t_{i+1,j}-t_{ij}=1\ \text{对所有保留的 }j\}.
-```
+![Equation 6.6.1](docs/equations/response-6-6-01.svg)
+
+[LaTeX](docs/equations/response-6-6-01.tex)
 
 Only originally adjacent rows in the same branch are compared; rows are not sorted, and missing rows or branches are not bridged. Weights are neither Pearson coefficients nor training R²; they are the mean absolute adjacent change of the fitted response:
 
-```math
-S_j=\frac1{|\mathcal A|}\sum_{i\in\mathcal A}|f_j(x_{i+1,j})-f_j(x_{ij})|,\qquad
-\alpha_j=\frac{S_j}{\sum_kS_k},\qquad
-F_{\rm single}(x)=\sum_j\alpha_j f_j(x_j).
-```
+![Equation 6.6.2](docs/equations/response-6-6-02.svg)
+
+[LaTeX](docs/equations/response-6-6-02.tex)
 
 If $\mathcal A$ is empty, all $S_j=0$. Failed relations have no weight (equivalently $\alpha_j=0$); WT scores / normalization are recomputed over retained relations. If the total score is zero, all weights are zero, the WT mean is returned with `no_information`, and groups are not fitted. **$\alpha$ is frozen during perturbation**, without renormalization for actual changes, enabled lags, or “active” inputs. Under singles routing:
 
-```math
-\Delta y=F_{\rm single}(x')-F_{\rm single}(x)
-=\sum_j\alpha_j\big[f_j(x'_j)-f_j(x_j)\big].
-```
+![Equation 6.6.3](docs/equations/response-6-6-03.svg)
+
+[LaTeX](docs/equations/response-6-6-03.tex)
 
 Use frozen singles WT predictions as the comparison baseline, with $B=n^{-1}\sum_i(F_{\rm single}(X_i)-y_i)^2$. All three families use penalized group loss and gain in original $y$ units:
 
-```math
-J_G=M_G+P_G+\frac pn B,\qquad
-\operatorname{gain}_G=\frac{B-J_G}{B}\quad(B>0).
-```
+![Equation 6.6.4](docs/equations/response-6-6-04.svg)
+
+[LaTeX](docs/equations/response-6-6-04.tex)
 
 The complexity term $pB/n$ is used for group selection / acceptance and does not change the optimum within a fixed group. For $B=0$, saturation / NN record gain $0$ and spline records $-1$; neither passes the current `min_penalized_gain: 0.05`. Multiple starts also check WT prediction spread $\max_i(\max_a\hat y_i^{(a)}-\min_a\hat y_i^{(a)})/D$. saturation / spline groups require every start to succeed finitely; NN uses finite best snapshots and does not treat fixed epochs as convergence evidence.
 
 Candidate groups also check row counts, cell ESS, effective kernel rows, and global / branch geometry. If $W$ is the normalized weight matrix from common WT rows to cells and $\bar w=n^{-1}\sum_iW_{i:}$, the implementation uses:
 
-```math
-\mathrm{ESS}_{\rm cell}=\frac1{\sum_c\bar w_c^2},\qquad
-n_{\rm eff}=\frac{[\operatorname{tr}(WW^\top)]^2}{\|WW^\top\|_F^2}.
-```
+![Equation 6.6.5](docs/equations/response-6-6-05.svg)
+
+[LaTeX](docs/equations/response-6-6-05.tex)
 
 These are support indicators, not independent observation counts. Current settings are `min_group_rows: 24, min_group_cell_ess: 30, min_query_cell_ess: 10, min_group_effective_rows: 12, max_geometry_condition: 10000`. Every family requires $n_{\rm eff}\ge\max(12,2p)$. NN / spline also require $n\ge\max(24,2p)$; saturation requires $24$ raw rows. Rejection of all groups means current data and thresholds do not support a group; it does not automatically indicate a bug or justify relaxing production thresholds.
 
