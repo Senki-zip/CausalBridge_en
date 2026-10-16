@@ -1,6 +1,5 @@
-# Target gene list (for knockout/perturbation simulation)
-# Format: gene_name  gene_type
-#   gene_type = TF:     this gene is a transcription factor; KO propagates through the TF→peak→gene path
-#   gene_type = target: this gene is not a transcription factor; KO propagates through a co-expression proxy TF
-RUNX1	TF
-MYB	TF
+# 靶基因列表 (用于敲除/扰动模拟)
+# 格式: gene_name  gene_type
+#   gene_type = TF:    该基因为转录因子, KO 通过 TF→peak→gene 通路传播
+#   gene_type = target: 该基因非转录因子, KO 通过共表达代理 TF传播
+GATA1	TF

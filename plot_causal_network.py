@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-CausalBridge four-layer causal network visualization
-Show the complete perturbation propagation path: Target Gene → TF → Peak → Affected Gene
+CausalBridge 四层因果网络可视化
+展示完整的扰动传播路径: Target Gene → TF → Peak → Affected Gene
 
-Data sources:
-  - tf_peak_weights.csv        : TF → Peak regulatory weights (single-feature Pearson per lag)
-  - causal_peak_gene_edges.csv : Peak → Gene causal edges (Granger)
-  - perturbation_results.csv   : final Target → Affected effects
+数据来源:
+  - tf_peak_weights.csv        : TF → Peak 调控权重 (逐 lag 单特征 Pearson)
+  - causal_peak_gene_edges.csv : Peak → Gene 因果边 (Granger)
+  - perturbation_results.csv   : Target → Affected 最终效应
 """
 
 import matplotlib
@@ -19,7 +19,10 @@ import numpy as np
 import networkx as nx
 from pathlib import Path
 from collections import deque
-import sys
+import os
+import json
+import argparse
+import re
 
 # ==============================================================================
 # Color scheme
@@ -40,15 +43,106 @@ C_TEXT        = "#2C3E50"
 # ==============================================================================
 
 
+def identity_frame(frame, roles):
+    """Use canonical IDs internally; keep presentation names on each row."""
+    frame = frame.copy()
+    for role in roles:
+        if role not in frame:
+            continue
+        frame[role + "_label"] = frame.get(role + "_name", frame[role])
+        if role + "_id" in frame:
+            frame[role] = frame[role + "_id"].where(
+                frame[role + "_id"].notna(), frame[role])
+    return frame
+
+
+def target_members(row):
+    """JSON is authoritative: symbols may themselves contain delimiters."""
+    if pd.notna(row.get("target_gene_ids_json")):
+        ids = json.loads(row["target_gene_ids_json"])
+        names = json.loads(row.get("target_gene_names_json", row["target_gene_ids_json"]))
+        if (not isinstance(ids, list) or not isinstance(names, list) or not ids
+                or len(ids) != len(names)
+                or not all(isinstance(value, str) and value for value in ids + names)):
+            raise ValueError("target gene JSON arrays must have matching lengths")
+        return ids, names
+    ids = [v.strip() for v in re.split(r"[,+]", str(row["target_gene"])) if v.strip()]
+    names = [v.strip() for v in re.split(r"[,+]", str(row.get("target_gene_label", row["target_gene"]))) if v.strip()]
+    return ids, names if len(names) == len(ids) else ids
+
+
+def boolean_flags(values):
+    def parse(value):
+        if pd.isna(value):
+            return None
+        text = str(value).lower().strip()
+        if text in ("true", "1", "1.0"):
+            return True
+        if text in ("false", "0", "0.0"):
+            return False
+        raise ValueError(f"invalid is_fallback flag: {value!r}")
+    return values.map(parse)
+
+
+def adapt_effects(frame, merged=False):
+    """Select signed display effects, never replace missing effects with zero."""
+    frame = identity_frame(frame, ("target_gene", "affected_gene"))
+    merged = merged or any(c in frame for c in (
+        "l0_log2fc_unclipped", "aggregation_method", "aggregation_scope"))
+    candidates = (["delta_rna_signed"] if merged else []) + [
+        "endpoint_delta_rna_log2fc", "delta_rna_log2fc",
+        "delta_log1p_rna_log1p_cp10k", "delta_rna_signed", "delta_rna"]
+    column = next((c for c in candidates if c in frame), None)
+    if column is None:
+        raise ValueError("No supported RNA effect column")
+    frame["plot_delta"] = pd.to_numeric(frame[column], errors="coerce")
+    unit = "RNA effect (legacy units)"
+    if column in ("endpoint_delta_rna_log2fc", "delta_rna_log2fc") or (merged and column == "delta_rna_signed"):
+        unit = "log2FC (display)"
+    elif column == "delta_log1p_rna_log1p_cp10k":
+        unit = "Δ log1p RNA (CP10k)"
+    elif {"control_mean_cp10k", "perturbed_mean_cp10k"}.issubset(frame):
+        unit = "log2FC (CP10k endpoint)"
+    elif {"control_mean_l1", "perturbed_mean_l1"}.issubset(frame):
+        unit = "log2FC (RNA state endpoint)"
+    elif "native_effect_unit" in frame:
+        units = frame.native_effect_unit.dropna().unique()
+        if len(units) == 1:
+            unit = str(units[0])
+    frame["effect_unit"] = unit
+    valid = np.isfinite(frame.plot_delta)
+    if "status" in frame:
+        valid &= frame.status.eq("ok")
+    if "aggregation_scope" in frame:
+        valid &= ~frame.aggregation_scope.eq("unavailable")
+    frame["plot_available"] = valid
+    frame["effect_note"] = ["; ".join(
+        f"{c}={r[c]}" for c in ("aggregation_scope", "aggregation_cell_fraction",
+        "aggregation_used_contexts", "aggregation_total_contexts", "aggregation_context_exclusions",
+        "display_clipped", "status") if c in r and pd.notna(r[c])) for _, r in frame.iterrows()]
+    if "is_fallback" in frame:
+        frame["is_fallback"] = boolean_flags(frame.is_fallback)
+    return frame
+
+
 def build_full_network(tf_csv, edges_csv):
     """Build bipartite TF↔peak↔gene network from all available edges."""
-    tf = pd.read_csv(tf_csv)
-    edges = pd.read_csv(edges_csv)
+    tf = identity_frame(pd.read_csv(tf_csv), ("tf_gene",))
+    edges = identity_frame(pd.read_csv(edges_csv), ("gene",))
+    return network_from_frames(tf, edges)
 
+
+def context_rows(frame, cluster):
+    if "cluster" in frame and cluster != "global":
+        return frame[frame.cluster.astype(str).eq(str(cluster))]
+    return frame
+
+
+def network_from_frames(tf, edges):
     G = nx.DiGraph()
 
     for _, r in tf.iterrows():
-        G.add_node(r["tf_gene"], ntype="tf")
+        G.add_node(r["tf_gene"], ntype="tf", label=r["tf_gene_label"])
         G.add_node(r["peak_id"], ntype="peak")
         G.add_edge(r["tf_gene"], r["peak_id"],
                    etype="TF_PEAK", weight=abs(r["weight"]),
@@ -56,7 +150,7 @@ def build_full_network(tf_csv, edges_csv):
 
     for _, r in edges.iterrows():
         G.add_node(r["peak_id"], ntype="peak")
-        G.add_node(r["gene"], ntype="gene")
+        G.add_node(r["gene"], ntype="gene", label=r["gene_label"])
         G.add_edge(r["peak_id"], r["gene"],
                    etype="PEAK_GENE",
                    weight=r.get("composite_score", r.get("delta_r2", 0.1)),
@@ -98,6 +192,7 @@ def extract_subgraph(G, target_gene, affected_genes, orphan_genes,
     sg = nx.DiGraph()
     sg.graph["target"] = target_gene
 
+    targets = target_gene if isinstance(target_gene, tuple) else (target_gene,)
     sg.add_node(target_gene, ntype="target", layer=0)
 
     # Precompute lookups
@@ -119,7 +214,7 @@ def extract_subgraph(G, target_gene, affected_genes, orphan_genes,
         )
 
     # --- Layer 1: peaks regulated by target ---
-    tf_peaks = set(tf_weights_df[tf_weights_df["tf_gene"] == target_gene]["peak_id"])
+    tf_peaks = set(tf_weights_df[tf_weights_df["tf_gene"].isin(targets)]["peak_id"])
     peaks_layer1 = set()
 
     for p in tf_peaks:
@@ -365,21 +460,21 @@ def draw_network(ax, G, target_gene, cluster_label, delta_map=None,
             va = "top"
             rotation = 0  # No rotation to reduce overlap
         elif ntype == "orphan":
-            label = _truncate_label(node, 12)
+            label = _truncate_label(str(ndata.get("label", node)), 12)
             fontsize = 5.5
             fw = "bold"
             offset_y = 0.030
             va = "bottom"
             rotation = 0
         elif ntype in ("target", "affected"):
-            label = _truncate_label(node, 14)
+            label = _truncate_label(str(ndata.get("label", node)), 14)
             fontsize = 5.8
             fw = "bold"
             offset_y = 0.026
             va = "bottom"
             rotation = 0
         else:  # tf, gene
-            label = _truncate_label(node, 12)
+            label = _truncate_label(str(ndata.get("label", node)), 12)
             fontsize = 4.8
             fw = "bold" if ntype == "tf" else "normal"
             offset_y = 0.024
@@ -387,7 +482,7 @@ def draw_network(ax, G, target_gene, cluster_label, delta_map=None,
             rotation = 0
 
         # Append delta for affected and orphan genes
-        if ntype in ("affected", "orphan") and delta_map and node in delta_map:
+        if ntype in ("affected", "orphan", "gene", "tf") and delta_map and node in delta_map:
             dv = delta_map[node]
             if abs(dv) >= 1.0:
                 ds = f"{dv:+.2f}"
@@ -425,7 +520,9 @@ def draw_network(ax, G, target_gene, cluster_label, delta_map=None,
                    if d.get("ntype") == "orphan")
     n_total = n_causal + n_orphan
 
-    title = f"Cluster {cluster_label}  |  {target_gene} → {n_total} affected"
+    title = f"Cluster {cluster_label}  |  {G.nodes[target_gene].get('label', target_gene)} → {n_total} affected"
+    if G.graph.get("effect_note"):
+        title += "\n" + G.graph["effect_note"]
     if n_orphan > 0:
         title += f" ({n_orphan} orphan fallback)"
     ax.set_title(title, fontsize=9, fontweight="bold", color=C_TEXT, pad=6)
@@ -459,9 +556,18 @@ def draw_network(ax, G, target_gene, cluster_label, delta_map=None,
 
 
 def main(pert_csv, tf_csv, edges_csv, top_n=5, output_dir=None):
-    pert = pd.read_csv(pert_csv)
-    tf_df = pd.read_csv(tf_csv)
-    edges_df = pd.read_csv(edges_csv)
+    if top_n < 1:
+        raise ValueError("top_n must be positive")
+    for path in (pert_csv, tf_csv, edges_csv):
+        if not Path(path).is_file():
+            raise FileNotFoundError(path)
+    pert = adapt_effects(pd.read_csv(pert_csv), merged=Path(pert_csv).name == "perturbation_merged.csv")
+    print(f"Excluded {int((~pert.plot_available).sum())} unavailable RNA effects")
+    pert = pert[pert.plot_available].copy()
+    if "cluster" not in pert:
+        pert["cluster"] = "global"
+    tf_df = identity_frame(pd.read_csv(tf_csv), ("tf_gene",))
+    edges_df = identity_frame(pd.read_csv(edges_csv), ("gene",))
 
     if output_dir is None:
         output_dir = str(Path(pert_csv).parent)
@@ -472,12 +578,12 @@ def main(pert_csv, tf_csv, edges_csv, top_n=5, output_dir=None):
     G = build_full_network(tf_csv, edges_csv)
     print(f"  {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
 
-    pert["abs_delta"] = pert["delta_rna"].abs()
+    pert["abs_delta"] = pert["plot_delta"].abs()
     target_genes = pert["target_gene"].unique()
-    clusters = sorted(pert["cluster"].unique(), key=int)
+    clusters = sorted(pert["cluster"].dropna().unique(), key=str)
 
     # Use is_fallback column if available, otherwise compute via BFS
-    if "is_fallback" not in pert.columns:
+    if "is_fallback" not in pert.columns or pert["is_fallback"].isna().any():
         print("  Computing reachability (is_fallback column not found)...")
         def _reachable_genes(G, target, max_depth=5):
             reached = set()
@@ -500,8 +606,19 @@ def main(pert_csv, tf_csv, edges_csv, top_n=5, output_dir=None):
                                     visited.add(nbr2)
                                     queue.append((nbr2, depth + 1))
             return reached
-        reachable = _reachable_genes(G, target_genes[0], max_depth=5)
-        pert["is_fallback"] = ~pert["affected_gene"].isin(reachable)
+        if "is_fallback" not in pert:
+            pert["is_fallback"] = None
+        for tg in target_genes:
+            for cl in clusters:
+                mask = pert.target_gene.eq(tg) & pert.cluster.eq(cl) & pert.is_fallback.isna()
+                if not mask.any():
+                    continue
+                row = pert[mask].iloc[0]
+                local_graph = network_from_frames(context_rows(tf_df, cl), context_rows(edges_df, cl))
+                reachable = set().union(*(_reachable_genes(local_graph, member) if member in local_graph else set()
+                                          for member in target_members(row)[0]))
+                pert.loc[mask, "is_fallback"] = ~pert.loc[mask, "affected_gene"].isin(reachable)
+    pert["is_fallback"] = pert["is_fallback"].astype(bool)
 
     all_plots = []
     for tg in target_genes:
@@ -527,15 +644,26 @@ def main(pert_csv, tf_csv, edges_csv, top_n=5, output_dir=None):
             orphan_set = set(orphan_genes["affected_gene"])
             delta_map = {}
             for _, row in top.iterrows():
-                delta_map[row["affected_gene"]] = row["delta_rna"]
+                delta_map[row["affected_gene"]] = row["plot_delta"]
 
             # Build subgraph with both causal and orphan genes
+            members, member_names = target_members(dfc.iloc[0])
+            target_key = members[0] if len(members) == 1 else tuple(members)
+            # Context-specific tables prevent paths assembled across clusters.
+            local_tf = context_rows(tf_df, cl)
+            local_edges = context_rows(edges_df, cl)
             sg, _ = extract_subgraph(
-                G, tg,
+                G, target_key,
                 set(causal_genes["affected_gene"]),
                 orphan_set,
-                tf_df, edges_df
+                local_tf, local_edges
             )
+            labels = dict(zip(pert.affected_gene, pert.affected_gene_label))
+            for node in sg:
+                sg.nodes[node]["label"] = labels.get(node, G.nodes[node].get("label", node) if node in G else node)
+            sg.nodes[target_key]["label"] = " + ".join(member_names)
+            sg.graph["effect_note"] = "; ".join(dict.fromkeys(
+                list(dfc.effect_unit) + [note for note in dfc.effect_note if note]))
 
             # Also add orphan nodes if they weren't already added
             # (some may have been added via causal edges if they happen to have partial paths)
@@ -548,7 +676,7 @@ def main(pert_csv, tf_csv, edges_csv, top_n=5, output_dir=None):
             if n_orphan > 0:
                 print(f"  Cluster {cl}: {n_causal} causal + {n_orphan} orphan")
 
-            all_plots.append((tg, cl, sg, delta_map, orphan_set,
+            all_plots.append((target_key, cl, sg, delta_map, orphan_set,
                               len(dfc), n_causal, n_orphan))
 
     if not all_plots:
@@ -619,9 +747,18 @@ def main(pert_csv, tf_csv, edges_csv, top_n=5, output_dir=None):
 
 
 if __name__ == "__main__":
-    base = "/home/huangtao/Desktop/huangchengqi/code_1/CausalBridge/results"
-    pert_csv = f"{base}/perturbation_results.csv"
-    tf_csv   = f"{base}/tf_peak_weights.csv"
-    edges_csv = f"{base}/causal_peak_gene_edges.csv"
-    top = int(sys.argv[1]) if len(sys.argv) > 1 else 5
-    main(pert_csv, tf_csv, edges_csv, top_n=top)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("top", nargs="?", type=int, default=5)
+    parser.add_argument("--result-dir", type=Path, default=Path(os.environ.get(
+        "CAUSALBRIDGE_RESULT_DIR", Path(__file__).resolve().parent / "results/test/RUNX1")))
+    parser.add_argument("--pert-csv", type=Path)
+    parser.add_argument("--tf-csv", type=Path)
+    parser.add_argument("--edges-csv", type=Path)
+    parser.add_argument("--output-dir", type=Path, default=os.environ.get("CAUSALBRIDGE_OUTPUT_DIR"))
+    options = parser.parse_args()
+    if options.top < 1:
+        parser.error("top must be positive")
+    main(options.pert_csv or options.result_dir / "perturbation_results.csv",
+         options.tf_csv or options.result_dir / "tf_peak_weights.csv",
+         options.edges_csv or options.result_dir / "causal_peak_gene_edges.csv",
+         top_n=options.top, output_dir=options.output_dir)

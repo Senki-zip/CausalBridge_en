@@ -1,10 +1,11 @@
 # =============================================================================
-# CausalBridge dependencies
+# CausalBridge 依赖
 # =============================================================================
-# Install: pip install -r requirements.txt
+# 安装: pip install -r requirements.txt
+# 以下为 Python 依赖；官方 CytoTRACE 的 R 依赖见文件末尾。
 # =============================================================================
 
-# --- Core dependencies (required) ---
+# --- 核心依赖 (必需) ---
 numpy>=1.26
 pandas>=2.2
 scipy>=1.14
@@ -13,16 +14,30 @@ anndata>=0.10
 scanpy>=1.10
 statsmodels>=0.14
 pyyaml>=6.0
+threadpoolctl>=3.1         # 拟合 worker 的底层线程限制
+tqdm>=4.66                # 拟合及扫描进度
 
-# --- Pseudotime inference ---
-palantir>=1.4              # Palantir: multi-lineage pseudotime
+# --- 伪时间推断 ---
+palantir>=1.4              # Palantir: 多谱系伪时间
 
-# --- Motif scanning (conditional import, checked at startup) ---
-biopython>=1.84            # Bio.SeqIO + Bio.motifs: JASPAR motif scanning
+# --- Motif 扫描 (条件导入，启动时检测) ---
+biopython>=1.84            # Bio.SeqIO + Bio.motifs: JASPAR motif 扫描
 
-# --- NN transfer function (required: sole ATAC→RNA path, no method switch) ---
-torch>=2.0                 # PyTorch: shared neural-network transfer function (required, not optional)
+# --- 独立 NN 响应训练 ---
+torch>=2.0                 # 独立 nn 响应训练；推理使用 NumPy
 
-# --- Visualization scripts (optional) ---
-matplotlib>=3.9            # plot_causal_network.py: causal network visualization
-networkx>=3.0              # plot_causal_network.py: graph layout algorithms
+# --- 可视化脚本 (可选) ---
+matplotlib>=3.9            # plot_causal_network.py: 因果网络可视化
+networkx>=3.0              # plot_causal_network.py: 图布局算法
+
+# --- 官方 CytoTRACE 2020 / 0.3.1（R 依赖，不能通过 pip 安装） ---
+# 所有 R 包及原生依赖均须安装到同一个 CausalBridge conda 环境。
+# 激活环境后可安装核心依赖：
+# conda install -n CausalBridge -c conda-forge 'r-base>=4.0' r-matrix r-hiclimr r-ccapp r-nnls r-rcpp r-ncdf4
+# 上述包的传递依赖由 conda 解析，包括 pcaPP、robustbase 和 netCDF。
+# 完整官方 R 包还要求 DESCRIPTION 中的所有 Imports（例如 Bioconductor sva）；
+# 安装到当前环境的 R 库：R CMD INSTALL -l "$CONDA_PREFIX/lib/R/library" ../CytoTRACE_official
+# 官方源码：https://github.com/gunsagargulati/CytoTRACE
+# 固定 commit：f4ff6c0ab93cc704eef44e17adcd5c6baf09703a（版本 0.3.1）。
+# 项目通过已验证的官方源码运行；Rscript、R 包库和原生库必须来自同一环境。
+# R 可视化脚本另需其脚本头部声明的 R 包；它们同样不属于 pip requirements。

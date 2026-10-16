@@ -1,17 +1,16 @@
 """
-CausalBridge Granger causal inference module
+CausalBridge Granger 因果推断模块
 
-Core principle (see GrID-Net, Wu et al., Nature Communications, 2025):
-  Infer causal regulatory relationships from time-lagged effects between ATAC and RNA.
-  Chromatin accessibility changes occur before transcriptional changes—in the same cell,
-  the ATAC signal captures the state at an "earlier time point", while the RNA signal
-  captures the state at a "later time point".
-  This "cell-state parallax" makes Granger causality testing possible.
+核心原理（参考 GrID-Net, Wu et al., Nature Communications, 2025）：
+  利用 ATAC 和 RNA 之间的时间滞后效应推断因果调控关系。
+  染色质可及性变化发生在转录变化之前——同一细胞中 ATAC 信号捕获的是
+  "较早时间点"的状态，而 RNA 信号捕获的是"较晚时间点"的状态。
+  这种"细胞状态视差"(cell-state parallax) 使得 Granger 因果检验成为可能。
 
-Granger causality testing logic:
-  - Reduced model: predict current gene expression from its past expression  Y(t) ~ Y(t-1)
-  - Full model:    add past accessibility of the candidate peak    Y(t) ~ Y(t-1) + X(t-1)
-  - F test: determine whether the peak signal significantly improves prediction → evidence of causality
+Granger 因果检验逻辑：
+  - 简约模型 (reduced): 用基因过去的表达预测当前表达  Y(t) ~ Y(t-1)
+  - 完整模型 (full):    加入候选 peak 的过去可及性    Y(t) ~ Y(t-1) + X(t-1)
+  - F 检验判断: peak 信号是否显著改善预测 → 因果性证据
 """
 
 import numpy as np
@@ -28,45 +27,66 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# Pseudotime inference
+# 伪时间推断
 # ============================================================================
 
 def infer_pseudotime(
     rna_adata,
     atac_adata,
     config: dict,
+    *,
+    defer_binning: bool = False,
+    joint_repr=None,
 ) -> pd.DataFrame:
     """
-    Infer developmental pseudotime from multi-omics data.
+    从多组学数据推断发育伪时间。
 
-    Method (controlled by config["pseudotime"]["method"]):
+    方法（由 config["pseudotime"]["method"] 控制）：
 
-    - "dpt" (default): Diffusion Pseudotime via scanpy
-      Based on diffusion distance, robust to noise, with no additional dependencies
-    - "palantir": Palantir pseudotime
-      Based on a diffusion map + entropy, naturally supports multi-lineage branching; requires pip install palantir
-    When the selected method is unavailable, automatically fall back to the next method (Palantir → DPT → fallback).
+    - "dpt" (默认): Diffusion Pseudotime via scanpy
+      基于扩散距离，对噪声鲁棒，无需额外依赖
+    - "palantir": Palantir 伪时间
+      基于扩散图 + 熵，天然支持多谱系分岔，需 pip install palantir
+    当所选方法不可用时，自动回退到下一级方法（Palantir → DPT → fallback）。
 
     Returns
     -------
     pseudotime_df : DataFrame
-        Columns: cell_barcode, pseudotime, branch (if branching is present)
+        列: cell_barcode, pseudotime, branch (如有分岔)
     """
     cfg = config["pseudotime"]
+    if ("gene_identity" in rna_adata.uns
+            or config.get("input", {}).get("gene_identity_mode") == "gtf_gene_id"):
+        marker = cfg.get("root_cell_marker")
+        if marker and marker not in rna_adata.var_names:
+            raise ValueError(f"root_cell_marker {marker!r} must resolve to a retained RNA gene ID")
     method = cfg.get("method", "dpt")
 
-    # --- Step 1: construct a joint low-dimensional representation ---
+    # --- 步骤1: 构造联合低维表示 ---
     rna_adata_copy = rna_adata.copy()
-    joint_repr, _ = _build_joint_representation(rna_adata_copy, atac_adata)
+    if joint_repr is None:
+        joint_repr, _ = _build_joint_representation(rna_adata_copy, atac_adata)
+    else:
+        if (not rna_adata.obs_names.is_unique or not atac_adata.obs_names.is_unique
+                or rna_adata.obs_names.hasnans or atac_adata.obs_names.hasnans
+                or not rna_adata.obs_names.equals(atac_adata.obs_names)):
+            raise ValueError("joint_repr requires unique RNA/ATAC cell IDs in exact order")
+        if isinstance(joint_repr, pd.DataFrame) and not joint_repr.index.equals(rna_adata.obs_names):
+            raise ValueError("joint_repr cell IDs must match RNA/ATAC exactly in order")
+        joint_repr = np.asarray(joint_repr, dtype=float)
+        if (joint_repr.ndim != 2 or joint_repr.shape[0] != rna_adata.n_obs
+                or joint_repr.shape[0] != atac_adata.n_obs or joint_repr.shape[1] == 0
+                or not np.isfinite(joint_repr).all()):
+            raise ValueError("joint_repr must be finite with one row per RNA/ATAC cell")
     rna_adata_copy.obsm["X_joint"] = joint_repr
 
-    # --- Step 2: infer pseudotime using the configured method (with automatic fallback) ---
+    # --- 步骤2: 按配置方法推断伪时间（带自动回退） ---
     pseudotime, branch_labels = _dispatch_pseudotime_method(
         method, rna_adata_copy, joint_repr, cfg, config
     )
 
-    # --- Step 3: bin pseudotime (single entry point; downstream code only reads) ---
-    # Merge branches that are too small (cell count < min_cells_per_branch)
+    # --- 步骤3: 伪时间分箱（统一入口，下游只读不写） ---
+    # 合并过小的 branch（细胞数 < min_cells_per_branch）
     min_cells_for_branch = cfg.get("min_cells_per_branch", 10)
     if branch_labels is not None and len(np.unique(branch_labels)) > 1:
         unique_branches = np.unique(branch_labels)
@@ -84,11 +104,19 @@ def infer_pseudotime(
                         np.median(pseudotime[branch_labels == br])))
                 branch_labels[branch_labels == br] = nearest
                 logger.warning(
-                    f"Branch {br}: only {(branch_labels == br).sum()} cells "
-                    f"(<{min_cells_for_branch}); merging into branch {nearest}"
+                    f"Branch {br}: 仅 {(branch_labels == br).sum()} 细胞 "
+                    f"(<{min_cells_for_branch})，合并到 branch {nearest}"
                 )
 
-    # Construct a temporary DataFrame for _adaptive_rebin
+    if defer_binning:
+        results = pd.DataFrame({"pseudotime": pseudotime}, index=rna_adata_copy.obs_names)
+        results.index.name = "cell_barcode"
+        if branch_labels is not None:
+            results["branch"] = branch_labels
+        results.attrs["branch_boundaries"] = None
+        return results
+
+    # 构造临时 DataFrame 供 _adaptive_rebin 使用
     temp_df = pd.DataFrame({"pseudotime": pseudotime})
     if branch_labels is not None:
         temp_df["branch"] = branch_labels
@@ -110,22 +138,22 @@ def infer_pseudotime(
     results.index.name = "cell_barcode"
     if branch_labels is not None:
         results["branch"] = branch_labels
-    # _adaptive_rebin writes branch_boundaries to temp_df.attrs; transfer them to results
+    # branch_boundaries 由 _adaptive_rebin 写入 temp_df.attrs，转移到 results
     results.attrs["branch_boundaries"] = temp_df.attrs.get("branch_boundaries")
 
     bin_counts = results["bin"].value_counts().sort_index()
     logger.info(
-        f"Pseudotime inference complete ({method}): "
-        f"pseudotime range [{pseudotime.min():.3f}, {pseudotime.max():.3f}], "
+        f"伪时间推断完成 ({method}): "
+        f"伪时间范围 [{pseudotime.min():.3f}, {pseudotime.max():.3f}], "
         f"{total_bins} bins, "
-        f"cells per bin: min={bin_counts.min()}, median={bin_counts.median():.0f}, "
+        f"每 bin 细胞数: min={bin_counts.min()}, median={bin_counts.median():.0f}, "
         f"max={bin_counts.max()}"
     )
     return results
 
 
 def _dispatch_pseudotime_method(method, rna_adata, joint_repr, cfg, config):
-    """Dispatch pseudotime inference according to method, falling back on failure."""
+    """按 method 配置调度伪时间推断，失败时自动回退到下一级。"""
     fallback_chain = {
         "palantir": ["dpt", "fallback"],
         "dpt":      ["fallback"],
@@ -138,20 +166,20 @@ def _dispatch_pseudotime_method(method, rna_adata, joint_repr, cfg, config):
                 result = _pseudotime_via_palantir(rna_adata, joint_repr, cfg, config)
                 if result is not None:
                     return result
-            logger.warning("Palantir unavailable; falling back to the next method")
+            logger.warning("Palantir 不可用，回退到下一级方法")
         elif m == "dpt":
             if _scanpy_available():
                 return _pseudotime_via_dpt(rna_adata, joint_repr, cfg, config)
-            logger.warning("scanpy unavailable; falling back to the next method")
+            logger.warning("scanpy 不可用，回退到下一级方法")
         elif m == "fallback":
-            logger.warning("Using the custom diffusion pseudotime implementation (fallback)")
+            logger.warning("使用自实现扩散伪时间（fallback）")
             return _diffusion_pseudotime_fallback(joint_repr, rna_adata, cfg, config)
 
     return _diffusion_pseudotime_fallback(joint_repr, rna_adata, cfg, config)
 
 
 def _scanpy_available() -> bool:
-    """Check whether scanpy is available."""
+    """检测 scanpy 是否可用。"""
     try:
         import scanpy  # noqa
         return True
@@ -160,7 +188,7 @@ def _scanpy_available() -> bool:
 
 
 def _palantir_available() -> bool:
-    """Check whether Palantir is available."""
+    """检测 Palantir 是否可用。"""
     try:
         import palantir  # noqa
         return True
@@ -170,20 +198,19 @@ def _palantir_available() -> bool:
 
 def _build_joint_representation(rna_adata, atac_adata):
     """
-    Build a joint low-dimensional representation of ATAC+RNA.
+    构造 ATAC+RNA 联合低维表示。
 
-    Uses a WNN-style strategy: reduce dimensionality independently for each
-    modality, then concatenate.
-    Improvements over naively concatenating PCA embeddings:
-    - Uses scanpy.pp.pca instead of sklearn PCA (better support for sparse matrices)
-    - Optionally weights the two modalities (normalized via explained_variance_ratio)
+    使用 WNN 风格策略: 对每个模态独立降维后拼接。
+    相比简单拼接 PCA 的改进:
+    - 使用 scanpy.pp.pca 而非 sklearn PCA（更好的稀疏矩阵支持）
+    - 可选地加权两个模态（通过 explained_variance_ratio 归一化）
     """
     rna_mat = rna_adata.X.toarray() if issparse(rna_adata.X) else np.array(rna_adata.X)
     atac_mat = (
         atac_adata.X.toarray() if issparse(atac_adata.X) else np.array(atac_adata.X)
     )
 
-    # scanpy PCA (when available, use the more efficient and canonical implementation)
+    # scanpy PCA（当可用时使用更高效和规范的实现）
     if _scanpy_available():
         import scanpy as sc
         rna_temp = rna_adata.copy()
@@ -194,7 +221,7 @@ def _build_joint_representation(rna_adata, atac_adata):
         sc.pp.pca(atac_temp, n_comps=15, zero_center=True)
         pca_rna = rna_temp.obsm["X_pca"]
         pca_atac = atac_temp.obsm["X_pca"]
-        # Weight by explained variance so that the two modalities contribute in a balanced way
+        # 按 explained variance 加权，使两种模态的贡献均衡
         rna_weight = np.sqrt(rna_temp.uns["pca"]["variance_ratio"].sum())
         atac_weight = np.sqrt(atac_temp.uns["pca"]["variance_ratio"].sum())
         total_weight = rna_weight + atac_weight + 1e-10
@@ -206,20 +233,19 @@ def _build_joint_representation(rna_adata, atac_adata):
         pca_atac = PCA(n_components=15).fit_transform(atac_mat)
 
     joint_repr = np.hstack([pca_rna, pca_atac])
-    logger.info(f"Joint low-dimensional representation: {joint_repr.shape}")
+    logger.info(f"联合低维表示: {joint_repr.shape}")
 
     return joint_repr, rna_adata
 
 
 def _pseudotime_via_dpt(rna_adata_with_repr, joint_repr, cfg, config):
     """
-    Diffusion Pseudotime (DPT) via scanpy.
+    Diffusion Pseudotime (DPT) via scanpy。
 
-    DPT principle (Haghverdi et al., Nature Methods, 2016):
-    1. Define a diffusion process (random walk) on the KNN graph
-    2. Compute the diffusion distance between any two points — accounting for
-       all possible paths, not just the shortest path
-    3. The diffusion distance from the root cell = pseudotime
+    DPT 原理（Haghverdi et al., Nature Methods, 2016）：
+    1. 在 KNN 图上定义扩散过程（随机游走）
+    2. 计算任意两点间的扩散距离——考虑所有可能路径，不是仅最短路径
+    3. 从根细胞出发的扩散距离 = 伪时间
     """
     import scanpy as sp
 
@@ -248,21 +274,21 @@ def _pseudotime_via_dpt(rna_adata_with_repr, joint_repr, cfg, config):
         pseudotime[~np.isinf(pseudotime)]
     ) * 1.1
 
-    logger.info(f"DPT pseudotime inference complete (scanpy), root cell #{root_idx}")
+    logger.info(f"DPT 伪时间推断完成 (scanpy), 根细胞 #{root_idx}")
     return pseudotime, None
 
 
 def _pseudotime_via_palantir(rna_adata_with_repr, joint_repr, cfg, config):
     """
-    Palantir pseudotime inference.
+    Palantir 伪时间推断。
 
-    Palantir principle (Setty et al., Nature Biotechnology, 2019):
-    1. Diffusion map embedding → captures the global structure of the developmental trajectory
-    2. Shortest paths from the root cell → initial pseudotime
-    3. Entropy computation → differentiation potential (cells with low entropy sit at the end of differentiation)
-    4. Supports multi-lineage branching detection
+    Palantir 原理（Setty et al., Nature Biotechnology, 2019）：
+    1. 扩散图降维 → 捕捉发育轨迹的全局结构
+    2. 从根细胞出发的最短路径 → 初始伪时间
+    3. 熵计算 → 分化潜能（entropy 低的细胞处于分化末端）
+    4. 支持多谱系分岔检测
 
-    Requires pip install palantir
+    需要 pip install palantir
     """
     import scanpy as sp
     import palantir
@@ -304,33 +330,32 @@ def _pseudotime_via_palantir(rna_adata_with_repr, joint_repr, cfg, config):
             pr_res.branch_probs.idxmax(axis=1)
         )
         logger.info(
-            f"Palantir detected {pr_res.branch_probs.shape[1]} branches, "
+            f"Palantir 检测到 {pr_res.branch_probs.shape[1]} 个分支, "
             f"branch_probs shape={pr_res.branch_probs.shape}"
         )
     else:
         logger.info(
-            "Palantir detected no branches (branch_probs is empty/None); "
-            "global pseudotime binning will be used"
+            "Palantir 未检测到分支 (branch_probs 为空/None)，"
+            "将使用全局伪时间分箱"
         )
 
-    logger.info(f"Palantir pseudotime inference complete, root cell #{root_idx}")
+    logger.info(f"Palantir 伪时间推断完成, 根细胞 #{root_idx}")
     return pseudotime, branch_labels
 
 
 def _diffusion_pseudotime_fallback(joint_repr, rna_adata, cfg, config):
     """
-    Self-implemented diffusion pseudotime (fallback when scanpy is unavailable).
+    自实现扩散伪时间（scanpy 不可用时的 fallback）。
 
-    Simplified diffusion pseudotime:
-    1. Build a mutual KNN graph (mutual nearest neighbors) to reduce noisy edges
-    2. Use a diffusion process: T = D^{-1/2} · A_sym · D^{-1/2}
-    3. After spectral decomposition, take the second eigenvector (the first
-       non-trivial component of the diffusion map)
-    4. Anchor the direction using the root cell
+    简化版扩散伪时间:
+    1. 构造相互 KNN 图（mutual nearest neighbors）以减少噪声边
+    2. 使用扩散过程: T = D^{-1/2} · A_sym · D^{-1/2}
+    3. 谱分解后取第二特征向量（扩散图的第一非平凡分量）
+    4. 以根细胞锚定方向
 
-    This is a fundamental improvement over the initial Dijkstra shortest-path version:
-    - Shortest paths are extremely sensitive to the weight of a single edge
-    - Diffusion mapping accounts for all paths and is naturally smooth
+    这比初版的 Dijkstra 最短路径有本质改进:
+    - 最短路径对单一边的权重极度敏感
+    - 扩散映射考虑了所有路径，自然平滑
     """
     from sklearn.neighbors import NearestNeighbors
 
@@ -341,21 +366,20 @@ def _diffusion_pseudotime_fallback(joint_repr, rna_adata, cfg, config):
     nn.fit(joint_repr)
     distances, indices = nn.kneighbors(joint_repr)
 
-    # Build a mutual KNN graph (mutual nearest neighbors) — an edge exists only
-    # when two cells are neighbors in both directions
-    # This is sparser and more reliable than the full KNN graph
+    # 构造互 KNN 图（mutual nearest neighbors）— 边仅在双向为近邻时存在
+    # 这比全 KNN 图更稀疏、更可靠
     rows, cols, data = [], [], []
     for i in range(n_cells):
         for j_idx, d in zip(indices[i], distances[i]):
-            if i in indices[j_idx]:  # mutual-neighbor check
+            if i in indices[j_idx]:  # 互近邻检查
                 rows.append(i)
                 cols.append(j_idx)
                 weight = np.exp(-d ** 2 / (np.median(distances) ** 2 + 1e-10))
                 data.append(weight)
 
     if len(data) == 0:
-        # If the mutual KNN is too strict and yields no edges, fall back to the full KNN
-        logger.warning("Mutual KNN graph is empty; falling back to the full KNN graph")
+        # 如果互 KNN 太严格导致没有边，退化为全 KNN
+        logger.warning("互 KNN 图为空，退化为全 KNN 图")
         for i in range(n_cells):
             for j_idx, d in zip(indices[i], distances[i]):
                 rows.append(i)
@@ -363,9 +387,9 @@ def _diffusion_pseudotime_fallback(joint_repr, rna_adata, cfg, config):
                 data.append(np.exp(-d / (np.median(distances) + 1e-10)))
 
     adj = csr_matrix((data, (rows, cols)), shape=(n_cells, n_cells))
-    adj = (adj + adj.T) / 2  # symmetrize
+    adj = (adj + adj.T) / 2  # 对称化
 
-    # Diffusion map: take the second eigenvector (the first non-trivial component)
+    # 扩散映射: 取第二特征向量（第一非平凡分量）
     from scipy.sparse.linalg import eigsh
 
     degree = np.array(adj.sum(axis=1)).flatten()
@@ -374,9 +398,9 @@ def _diffusion_pseudotime_fallback(joint_repr, rna_adata, cfg, config):
 
     try:
         _, eigenvectors = eigsh(laplacian, k=3, which="LM")
-        diffusion_component = eigenvectors[:, 1]  # second eigenvector
+        diffusion_component = eigenvectors[:, 1]  # 第二特征向量
     except Exception:
-        # fallback: simple spectral decomposition
+        # fallback: 简单谱分解
         from scipy.sparse.csgraph import dijkstra
         root_idx = _find_root_cell(
         rna_adata, cfg.get("root_cell_marker"),
@@ -385,7 +409,7 @@ def _diffusion_pseudotime_fallback(joint_repr, rna_adata, cfg, config):
     )
         diffusion_component = dijkstra(adj, directed=False, indices=root_idx)
 
-    # Determine direction: make the root-cell end equal 0
+    # 确定方向: 使根细胞端为 0
     root_idx = _find_root_cell(
         rna_adata, cfg.get("root_cell_marker"),
         method=cfg.get("root_cell_method"),
@@ -394,10 +418,10 @@ def _diffusion_pseudotime_fallback(joint_repr, rna_adata, cfg, config):
     if diffusion_component[root_idx] > np.median(diffusion_component):
         diffusion_component = -diffusion_component
     pseudotime = diffusion_component - diffusion_component[root_idx]
-    pseudotime = np.maximum(pseudotime, 0)  # non-negativity constraint
+    pseudotime = np.maximum(pseudotime, 0)  # 非负约束
 
     branch_labels = None
-    logger.info(f"Self-implemented diffusion pseudotime inference complete, root cell #{root_idx}")
+    logger.info(f"自实现扩散伪时间推断完成, 根细胞 #{root_idx}")
     return pseudotime, branch_labels
 
 
@@ -405,77 +429,9 @@ def _compute_cytotrace_scores(
     rna_adata,
     n_top_genes: int = 200,
 ) -> np.ndarray:
-    """CytoTRACE 2020 (Gulati et al., Science): per-cell differentiation potential.
-
-    Higher score = more stem-like / undifferentiated (pluripotent).
-
-    Algorithm:
-      1. Gene Count (gc): the number of genes with expression > 0. Fewer → more stem-like.
-      2. Mean Pairwise Correlation (mpc): the mean pairwise Pearson correlation among
-         each cell's own top-N highly expressed genes (correlations are computed across
-         the full dataset). Higher → more stem-like
-         (high transcriptional coordination indicates the cell is in a more upstream progenitor state).
-      3. CytoTRACE score = (rev_rank(gc) + rank(mpc)) / 2, both normalized to (0, 1].
-
-    Notes:
-    - Prefer ``rna_adata.layers["raw"]`` (raw counts) for computing gc;
-      when no raw layer exists, fall back to ``.X`` (if already log-normalized, gc values
-      are more continuous but still comparable).
-    - The gene universe is the current gene set of rna_adata (typically already filtered
-      by preprocess_rna to HVG + target genes, ~3K-3.5K), so the gene-gene correlation
-      matrix stays manageable in size.
-    - Computational complexity is O(G²·n + n·G·log_G), which runs in seconds at HVG scale.
-    """
-    from scipy.stats import rankdata
-
-    X = rna_adata.layers.get("raw")
-    if X is None:
-        X = rna_adata.X
-    if issparse(X):
-        X = X.toarray()
-    X = np.asarray(X, dtype=np.float64)
-    n_cells, n_genes = X.shape
-
-    if n_cells == 0 or n_genes == 0:
-        logger.warning("CytoTRACE: empty matrix, returning zeros")
-        return np.zeros(n_cells)
-
-    # --- 1. Gene count ---
-    gc = (X > 0).sum(axis=1).astype(float)
-
-    n_top = int(min(n_top_genes, n_genes))
-    if n_top < 2 or n_cells < 3:
-        # Not enough data to compute correlations → use gene count alone as a single signal (revrank)
-        cyto = (n_cells - rankdata(gc)) / max(n_cells, 1)
-        return cyto
-
-    # --- 2. Build the G x G gene-gene Pearson correlation matrix (across all cells) ---
-    X_centered = X - X.mean(axis=0, keepdims=True)
-    X_std = X_centered.std(axis=0, ddof=0)
-    valid_genes = X_std > 1e-10
-    X_normed = np.zeros_like(X_centered)
-    X_normed[:, valid_genes] = X_centered[:, valid_genes] / X_std[valid_genes]
-    gene_corr_mat = (X_normed.T @ X_normed) / max(n_cells, 1)
-    np.fill_diagonal(gene_corr_mat, 0.0)
-
-    # --- 3. For each cell, take the mean of the sub-correlation matrix over its own top-N genes ---
-    triu_i, triu_j = np.triu_indices(n_top, k=1)
-    mpc = np.zeros(n_cells)
-    for c in range(n_cells):
-        expr = X[c]
-        if n_top < n_genes:
-            top_idx = np.argpartition(expr, -n_top)[-n_top:]
-        else:
-            top_idx = np.arange(n_genes)
-        sub_corr = gene_corr_mat[np.ix_(top_idx, top_idx)]
-        vals = sub_corr[triu_i, triu_j]
-        mpc[c] = float(vals.mean()) if vals.size else 0.0
-
-    # --- 4. Composite score (rank-normalized into (0, 1]) ---
-    rev_gc_rank = (n_cells - rankdata(gc)) / max(n_cells, 1)
-    mpc_rank = rankdata(mpc) / max(n_cells, 1)
-    cyto = (rev_gc_rank + mpc_rank) / 2.0
-    return cyto
+    """Read verified official per-cohort scores; n_top_genes is legacy API only."""
+    from .cytotrace import verified_scores
+    return verified_scores(rna_adata)
 
 
 def _find_root_cell(
@@ -483,22 +439,28 @@ def _find_root_cell(
     marker_gene: Optional[str] = None,
     method: Optional[str] = None,
     n_top_genes: int = 200,
+    *, gene_identity=None,
 ) -> int:
     """
-    Determine the root cell (starting point) of the developmental trajectory.
-    The root-selection strategy is controlled by ``method``.
+    确定发育轨迹的根细胞（起点）。由 ``method`` 控制根选取策略。
 
     method (None / "auto" / "marker" / "cytotrace" / "min_umi"):
-      - "marker":    force use of marker_gene; fall back to min_umi if the marker is missing
-      - "cytotrace": use CytoTRACE 2020 stemness scores and pick the cell with the
-                     highest stemness within the cluster (read the global cache in
-                     obs["cytotrace_score"] first; if absent, compute on the fly within this cluster)
-      - "min_umi":   the cell with the lowest transcriptional diversity (standard approach in the DPT paper)
-      - None / "auto": marker_gene given → marker; otherwise default to cytotrace (new default)
+      - "marker":    强制使用 marker_gene；marker 缺失则回退 min_umi
+      - "cytotrace": 使用 CytoTRACE 2020 干性分数, 选簇内 stemness 最高的细胞
+                      (仅接受官方算法按本模型细胞队列计算的完整原始计数分数)
+      - "min_umi":   转录多样性最低的细胞 (DPT 论文标准做法)
+      - None / "auto": marker_gene 给定 → marker; 否则默认 cytotrace (新默认)
     """
+    if marker_gene and (gene_identity is not None or "gene_identity" in rna_adata.uns):
+        if gene_identity is not None:
+            from .gene_identity import resolve_gene_token
+            marker_gene = resolve_gene_token(marker_gene, gene_identity,
+                                            allowed_ids=rna_adata.var_names, purpose="root marker")
+        elif marker_gene not in rna_adata.var_names:
+            raise ValueError(f"root marker {marker_gene!r} must resolve to a retained RNA gene ID")
     valid = {"marker", "cytotrace", "min_umi", "auto", None}
     if method not in valid:
-        logger.warning(f"Unknown root_cell_method='{method}'; falling back to auto")
+        logger.warning(f"未知的 root_cell_method='{method}'，回退 auto")
         method = None
 
     use = method
@@ -514,27 +476,17 @@ def _find_root_cell(
                 else rna_adata[:, marker_gene].X.flatten()
             )
             root = int(np.argmax(expr))
-            logger.info(f"Root cell selected by marker gene: {marker_gene} → cell #{root}")
+            logger.info(f"根细胞由标记基因选定: {marker_gene} → 细胞 #{root}")
             return root
-        logger.info(f"marker method requested but marker='{marker_gene}' is missing; falling back to min_umi")
+        logger.info(f"marker 方法指定但 marker='{marker_gene}' 缺失, 回退 min_umi")
         use = "min_umi"
 
     # --- (2) cytotrace ---
     if use == "cytotrace":
-        if "cytotrace_score" in rna_adata.obs.columns:
-            root = int(np.argmax(rna_adata.obs["cytotrace_score"].values))
-            logger.info(
-                f"Root cell selected by CytoTRACE: cell #{root} "
-                f"(stemness={rna_adata.obs['cytotrace_score'].iloc[root]:.4f}, "
-                f"from the global obs cache)"
-            )
-            return root
-        # Compute on the fly within the sub-cluster (scheme A fallback; triggered when
-        # the pipeline has not injected global scores)
         scores = _compute_cytotrace_scores(rna_adata, n_top_genes=n_top_genes)
         root = int(np.argmax(scores))
         logger.info(
-            f"Root cell computed on the fly by CytoTRACE: cell #{root} "
+            f"根细胞由 CytoTRACE on-the-fly 计算: 细胞 #{root} "
             f"(stemness={scores[root]:.4f})"
         )
         return root
@@ -547,13 +499,13 @@ def _find_root_cell(
     ).flatten()
     if total_umi.min() > 0:
         root = int(np.argmin(total_umi))
-        logger.info(f"Root cell selected by transcriptional activity: cell #{root}")
+        logger.info(f"根细胞由转录活性选定: 细胞 #{root}")
         return root
     return 0
 
 
 # ============================================================================
-# Granger causality testing
+# Granger 因果检验
 # ============================================================================
 
 def granger_test(
@@ -561,108 +513,121 @@ def granger_test(
     atac_adata,
     pseudotime_df: pd.DataFrame,
     config: dict,
+    *,
+    bin_plan=None,
 ) -> pd.DataFrame:
     """
-    Run Granger causality testing for every candidate peak-gene pair.
+    对每个候选 peak-gene 对进行 Granger 因果检验。
 
-    Candidate pair generation rules:
-    - The genomic distance between the peak and the gene's TSS is < distance_thresh (default 1Mb)
-    - Both signals vary sufficiently along pseudotime (constant signals are excluded)
+    候选对生成规则：
+    - peak 和 gene 的 TSS 在基因组上的距离 < distance_thresh（默认 1Mb）
+    - 两者在伪时间上有足够变化（排除恒定信号）
 
-    For each candidate pair:
-    1. Build time-lagged features on binned pseudotime:
-       - Y(t) = mean expression of the gene in bin t
-       - Y(t-1) = mean expression of the gene in bin t-1
-       - X(t-1) = mean accessibility of the peak in bin t-1
-    2. Fit two linear models:
+    对每个候选对：
+    1. 在 binned 伪时间上构造 time-lagged 特征:
+       - Y(t) = 基因在 bin t 的平均表达
+       - Y(t-1) = 基因在 bin t-1 的平均表达
+       - X(t-1) = peak 在 bin t-1 的平均可及性
+    2. 拟合两个线性模型:
        - Reduced:  Y(t) ~ Y(t-1)
        - Full:     Y(t) ~ Y(t-1) + X(t-1)
-    3. F test: does the lagged ATAC term significantly improve prediction (F(df=1, n-3))
-    4. Multiple-testing correction (FDR)
+    3. F 检验: ATAC 滞后项是否显著改善预测 (F(df=1, n-3))
+    4. 多重检验校正 (FDR)
 
     Returns
     -------
     results : DataFrame
-        Columns: peak_id, gene, peak_chr, peak_start, peak_end, gene_chr, gene_tss,
+        列: peak_id, gene, peak_chr, peak_start, peak_end, gene_chr, gene_tss,
              F_statistic, p_value, p_adj, delta_r2, is_causal
     """
     cfg = config["granger"]
     pcfg = config["pseudotime"]
+    from .binning_adapter import require_bin_plan, validate_bin_plan, execution_pseudotime
+    require_bin_plan(config, bin_plan)
+    if bin_plan is not None:
+        validate_bin_plan(bin_plan, pseudotime_df, rna_adata.obs_names)
+        validate_bin_plan(bin_plan, pseudotime_df, atac_adata.obs_names)
+        pseudotime_df = execution_pseudotime(bin_plan, pseudotime_df, rna_adata.obs_names)
     ablation_mode = cfg.get("ablation_lag0", False)
 
     if ablation_mode:
-        logger.info("=== Granger ablation mode: drop the time lag and test the pure correlation Y(t)~X(t) ===")
+        logger.info("=== Granger 消融模式: 去掉时间滞后, Y(t)~X(t) 纯相关检验 ===")
 
-    # Adaptive binning based on cluster size
+    # 按簇规模自适应分箱
     _smooth_kernel = pcfg.get("smooth_kernel", "hard")
     _overlap = pcfg.get("smooth_overlap_factor") if _smooth_kernel == "gaussian" else None
-
-    # Debug logging: check whether pseudotime has been shuffled
+    
+    # 调试日志：检查伪时间是否被打乱
     if hasattr(pseudotime_df, 'attrs') and pseudotime_df.attrs.get("_need_rebin"):
-        logger.info(f"  [DEBUG] granger_test: detected the _need_rebin flag; pseudotime has been shuffled")
-        logger.info(f"  [DEBUG] pseudotime range: [{pseudotime_df['pseudotime'].min():.4f}, {pseudotime_df['pseudotime'].max():.4f}]")
-
-    bin_indices, n_bins = _adaptive_rebin(
-        pseudotime_df, rna_adata.n_obs,
-        max_bins=pcfg["n_bins"],
-        min_cells_per_bin=pcfg.get("min_cells_per_bin", 5),
-        target_bins=pcfg["n_bins"] if _smooth_kernel == "gaussian" else None,
-        overlap_factor=_overlap,
-    )
-    pseudotime_df["bin"] = bin_indices
-    mode_label = "ablation" if ablation_mode else "Granger"
-    logger.info(f"{mode_label} binning: {rna_adata.n_obs} cells → {n_bins} bins "
+        logger.info(f"  [DEBUG] granger_test: 检测到 _need_rebin 标记，伪时间已被打乱")
+        logger.info(f"  [DEBUG] 伪时间范围: [{pseudotime_df['pseudotime'].min():.4f}, {pseudotime_df['pseudotime'].max():.4f}]")
+    
+    if bin_plan is None:
+        bin_indices, n_bins = _adaptive_rebin(
+            pseudotime_df, rna_adata.n_obs,
+            max_bins=pcfg["n_bins"],
+            min_cells_per_bin=pcfg.get("min_cells_per_bin", 5),
+            target_bins=pcfg["n_bins"] if _smooth_kernel == "gaussian" else None,
+            overlap_factor=_overlap,
+        )
+        pseudotime_df["bin"] = bin_indices
+    else:
+        bin_indices, n_bins = bin_plan.labels, bin_plan.n_bins
+    mode_label = "消融" if ablation_mode else "Granger"
+    logger.info(f"{mode_label} 分箱: {rna_adata.n_obs} 细胞 → {n_bins} bins "
                 f"(smooth={_smooth_kernel})")
-
-    # Debug logging: check the recomputed bin distribution
+    
+    # 调试日志：检查重新计算的 bin 分布
     if hasattr(pseudotime_df, 'attrs') and pseudotime_df.attrs.get("_need_rebin"):
         bin_counts = np.bincount(bin_indices.astype(int))
-        logger.info(f"  [DEBUG] recomputed bin distribution: {bin_counts[:5]}...")
+        logger.info(f"  [DEBUG] 重新计算的 bin 分布: {bin_counts[:5]}...")
 
-    # --- Step 1: aggregate ATAC and RNA signals over binned pseudotime ---
-    # Save the pre-shuffle binning result for comparison
-    _need_rebin = hasattr(pseudotime_df, 'attrs') and pseudotime_df.attrs.get("_need_rebin")
+    # --- 步骤1: 在 binned 伪时间上聚合 ATAC 和 RNA 信号 ---
+    # 保存打乱前的分箱结果用于比较
+    _need_rebin = bin_plan is None and hasattr(pseudotime_df, 'attrs') and pseudotime_df.attrs.get("_need_rebin")
     if _need_rebin:
         rna_binned_before = _bin_expression(rna_adata, pseudotime_df, n_bins,
                                            smooth="hard",
                                            min_cells_per_bin=pcfg.get("min_cells_per_bin", 5))
     
     rna_binned = _bin_expression(rna_adata, pseudotime_df, n_bins,
+                                 **({"bin_plan": bin_plan} if bin_plan is not None else {}),
                                  smooth=pcfg.get("smooth_kernel", "hard"),
                                  min_cells_per_bin=pcfg.get("min_cells_per_bin", 5))
     atac_binned = _bin_expression(atac_adata, pseudotime_df, n_bins,
+                                  **({"bin_plan": bin_plan} if bin_plan is not None else {}),
                                   smooth=pcfg.get("smooth_kernel", "hard"),
                                   min_cells_per_bin=pcfg.get("min_cells_per_bin", 5))
 
-    logger.info(f"Binned data: RNA {rna_binned.shape}, ATAC {atac_binned.shape}")
-
-    # Debug logging: check whether the binning result actually changed
+    logger.info(f"Binned 数据: RNA {rna_binned.shape}, ATAC {atac_binned.shape}")
+    
+    # 调试日志：检查分箱结果是否真的变化了
     if _need_rebin:
         rna_diff = np.abs(rna_binned - rna_binned_before).max()
-        logger.info(f"  [DEBUG] max difference in RNA binning before vs. after shuffling: {rna_diff:.6f}")
+        logger.info(f"  [DEBUG] 打乱前后 RNA 分箱最大差异: {rna_diff:.6f}")
         if rna_diff < 1e-6:
-            logger.warning("  ⚠️ Warning: RNA binning results before and after shuffling are almost identical!")
+            logger.warning("  ⚠️ 警告: 打乱前后 RNA 分箱结果几乎相同！")
         else:
-            logger.info(f"  ✓ RNA binning results before and after shuffling differ; the difference is significant")
+            logger.info(f"  ✓ 打乱前后 RNA 分箱结果不同，差异显著")
 
-    # --- Lag pre-slicing ---
+    # --- 滞后预切片 ---
     branch_boundaries = pseudotime_df.attrs.get("branch_boundaries") if hasattr(pseudotime_df, "attrs") else None
 
     if ablation_mode:
-        # Ablation mode: use same-time-point data, no lag processing
-        # Tests the pure correlation Y(t) ~ X(t)
+        # 消融模式：使用同时刻数据，不做任何 lag 处理
+        # 检验 Y(t) ~ X(t) 纯相关性
         _rna_t = rna_binned
-        _rna_t1 = None  # ablation mode does not need Y(t-1)
+        _rna_t1 = None  # 消融模式不需要 Y(t-1)
         _atac_lag_mats = None
-        _atac_current = atac_binned  # X(t): same-time-point ATAC
+        _atac_current = atac_binned  # X(t): 同时刻 ATAC
         n_valid_pairs = rna_binned.shape[0]
-        logger.info(f"Ablation mode valid pairs: {n_valid_pairs} (no lag, contemporaneous)")
+        logger.info(f"消融模式 有效 pairs: {n_valid_pairs} (无滞后, contemporaneous)")
     else:
-        # Standard Granger mode: use max_lag from the configuration
+        # 标准 Granger 模式：使用配置中的 max_lag
         granger_max_lag = cfg.get("max_lag", 1)
-        logger.info(f"Granger mode: lag={granger_max_lag}")
-
-        # Tests Y(t) ~ Y(t-lag) + X(t-lag)
+        logger.info(f"Granger 模式: lag={granger_max_lag}")
+        
+        # 检验 Y(t) ~ Y(t-lag) + X(t-lag)
         rna_lag0, rna_lag1 = _branch_aware_lag_pairs(
             rna_binned, rna_binned, lag=granger_max_lag,
             branch_boundaries=branch_boundaries,
@@ -671,46 +636,47 @@ def granger_test(
             atac_binned, atac_binned, lag=granger_max_lag,
             branch_boundaries=branch_boundaries,
         )
-        _rna_t = rna_lag1      # Y(t): RNA at time t
-        _rna_t1 = rna_lag0     # Y(t-lag): RNA at time t-lag
-        _atac_lag_mats = [atac_lag0]  # X(t-lag): ATAC at time t-lag
-        _atac_current = atac_lag1     # X(t): ATAC at time t (spare)
+        _rna_t = rna_lag1      # Y(t): RNA 在时间 t
+        _rna_t1 = rna_lag0     # Y(t-lag): RNA 在时间 t-lag
+        _atac_lag_mats = [atac_lag0]  # X(t-lag): ATAC 在时间 t-lag
+        _atac_current = atac_lag1     # X(t): ATAC 在时间 t (备用)
         n_valid_pairs = _rna_t.shape[0]
-        logger.info(f"Granger lag slicing: {n_valid_pairs} valid pairs (lag={granger_max_lag})")
+        logger.info(f"Granger 滞后切片: {n_valid_pairs} 有效 pairs (lag={granger_max_lag})")
 
     if n_valid_pairs < 5:
-        logger.warning(f"Lag slicing produced only {n_valid_pairs} valid pairs; "
-                       f"the Granger test cannot be performed")
+        logger.warning(f"滞后切片仅产生 {n_valid_pairs} 个有效 pair，"
+                       f"Granger 检验无法执行")
         return pd.DataFrame()
 
-    # --- Step 2: generate candidate peak-gene pairs ---
+    # --- 步骤2: 生成候选 peak-gene 对 ---
     candidates = _generate_candidate_pairs(
         rna_adata, atac_adata, cfg["distance_thresh"]
     )
-    logger.info(f"Candidate peak-gene pairs: {len(candidates)}")
+    logger.info(f"候选 peak-gene 对: {len(candidates)}")
 
     if len(candidates) == 0:
-        logger.warning("No candidate peak-gene pairs were found; please check the genomic coordinate annotations")
+        logger.warning("没有找到任何候选 peak-gene 对，请检查基因组坐标注释")
         return pd.DataFrame()
 
-    # --- Step 3: Granger test pair by pair ---
-    # Pre-build index maps to avoid an O(n) lookup every time
+    # --- 步骤3: 逐对 Granger 检验 ---
+    # 预建索引映射，避免每次 O(n) 查找
     atac_name_to_idx = {name: i for i, name in enumerate(atac_adata.var_names)}
     rna_name_to_idx = {name: i for i, name in enumerate(rna_adata.var_names)}
-    # Pre-extract genomic position info into numpy arrays to avoid repeated loc indexing
+    # 预提基因组位置信息为 numpy 数组，避免重复 loc 索引
     atac_chr_arr = atac_adata.var["chr"].values
     atac_start_arr = atac_adata.var["start"].values.astype(int)
     atac_end_arr = atac_adata.var["end"].values.astype(int)
     rna_chr_arr = rna_adata.var["chr"].values
-    rna_start_arr = rna_adata.var["start"].values.astype(int)
+    from .gene_identity import gene_tss_coordinates
+    rna_tss_arr = gene_tss_coordinates(rna_adata)
 
-    # Pre-compute each gene's autoregressive SSR (each gene is used only once)
+    # 预计算基因的自回归 SSR（每个基因只用一次）
     ones = np.ones(n_valid_pairs)
     gene_ssr_cache = {}
 
     results = []
     total = len(candidates)
-    log_interval = max(total // 20, 1000)  # log progress every 5%
+    log_interval = max(total // 20, 1000)  # 每 5% 输出一次进度
 
     for i, (peak_id, gene) in enumerate(candidates):
         peak_idx = atac_name_to_idx.get(peak_id)
@@ -724,9 +690,9 @@ def granger_test(
         if np.var(Y_t) < 1e-6:
             continue
 
-        # Reduced model: Y(t) ~ Y(t-1); cache the result so each gene is not computed repeatedly
+        # Reduced model: Y(t) ~ Y(t-1), 缓存结果，同一基因不重复算
         if ablation_mode:
-            # Ablation mode: Reduced = Y(t) ~ 1 (intercept only, no autoregression)
+            # 消融模式: Reduced = Y(t) ~ 1 (仅截距，无自回归)
             ssr_reduced = float(np.sum((Y_t - np.mean(Y_t)) ** 2))
             if ssr_reduced < 1e-10:
                 continue
@@ -738,7 +704,9 @@ def granger_test(
                 _, residuals_reduced, _, _ = np.linalg.lstsq(
                     Y_lag_const, Y_t, rcond=None
                 )
-                ssr_reduced = np.sum(residuals_reduced ** 2)
+                # lstsq returns sums of squared residuals, not residual vectors.
+                # Empty arrays (rank-deficient fits) retain the existing skip policy.
+                ssr_reduced = float(np.sum(residuals_reduced))
                 if ssr_reduced < 1e-10:
                     ssr_reduced = 0.0
                 gene_ssr_cache[gene_idx] = ssr_reduced
@@ -748,7 +716,7 @@ def granger_test(
 
         # Full model
         if ablation_mode:
-            # Ablation mode: Y(t) ~ X(t) (same-time-point peak, no lag)
+            # 消融模式: Y(t) ~ X(t) (同时刻 peak，无滞后)
             x_col = _atac_current[:, peak_idx]
             if np.var(x_col) < 1e-6:
                 continue
@@ -757,10 +725,11 @@ def granger_test(
                 X_const, Y_t, rcond=None
             )
             atac_coef = float(coeffs[1])  # β₁: ATAC_t → RNA_t
-            ssr_full = np.sum(residuals_full ** 2)
+            # NumPy has already squared and summed the residual vector.
+            ssr_full = float(np.sum(residuals_full))
             df_full = n_valid_pairs - 2
         else:
-            # Standard Granger: Y(t) ~ Y(t-1) + X(t-1)
+            # 标准 Granger: Y(t) ~ Y(t-1) + X(t-1)
             x_col = _atac_lag_mats[0][:, peak_idx]
             if np.var(x_col) < 1e-6:
                 continue
@@ -769,7 +738,8 @@ def granger_test(
                 YX_lag_const, Y_t, rcond=None
             )
             atac_coef = float(coeffs[2])  # β₂: ATAC_{t-1} → RNA_t
-            ssr_full = np.sum(residuals_full ** 2)
+            # NumPy has already squared and summed the residual vector.
+            ssr_full = float(np.sum(residuals_full))
             df_full = n_valid_pairs - 3
 
         if ssr_full < 1e-10 or df_full <= 0:
@@ -781,10 +751,10 @@ def granger_test(
             continue
 
         f_stat = f_num / f_den
-        p_value = 1 - stats.f.cdf(f_stat, 1, df_full)
+        p_value = stats.f.sf(f_stat, 1, df_full)
         delta_r2 = 1 - ssr_full / ssr_reduced
 
-        # Pearson r: X vs Y — used for direction judgment (standard mode=lagged, ablation mode=contemporaneous)
+        # Pearson r: X vs Y — 用于方向判断 (标准模式=lagged, 消融模式=contemporaneous)
         pearson_r = float(np.corrcoef(x_col, Y_t)[0, 1]) if np.std(x_col) > 1e-6 else 0.0
 
         results.append({
@@ -794,7 +764,7 @@ def granger_test(
             "peak_start": int(atac_start_arr[peak_idx]),
             "peak_end": int(atac_end_arr[peak_idx]),
             "gene_chr": rna_chr_arr[gene_idx],
-            "gene_tss": int(rna_start_arr[gene_idx]),
+            "gene_tss": int(rna_tss_arr[gene_idx]),
             "F_statistic": f_stat,
             "p_value": p_value,
             "delta_r2": delta_r2,
@@ -804,30 +774,30 @@ def granger_test(
 
         if (i + 1) % log_interval == 0:
             pct = (i + 1) / total * 100
-            mode_label = "ablation" if ablation_mode else "Granger"
-            logger.info(f"  {mode_label} test progress: {i+1}/{total} ({pct:.0f}%), "
-                        f"{sum(1 for r in results if r['p_value'] < 0.05)} significant pairs found so far")
+            mode_label = "消融" if ablation_mode else "Granger"
+            logger.info(f"  {mode_label} 检验进度: {i+1}/{total} ({pct:.0f}%), "
+                        f"已发现 {sum(1 for r in results if r['p_value'] < 0.05)} 个显著对")
 
     if len(results) == 0:
-        mode_label = "ablation" if ablation_mode else "Granger"
-        logger.warning(f"The {mode_label} test produced no valid results")
+        mode_label = "消融" if ablation_mode else "Granger"
+        logger.warning(f"{mode_label} 检验未产生任何有效结果")
         return pd.DataFrame()
 
     results_df = pd.DataFrame(results)
 
-    # --- Step 4: multiple-testing correction (FDR) ---
+    # --- 步骤4: 多重检验校正 (FDR) ---
     _, p_adj, _, _ = multipletests(
         results_df["p_value"].values,
         method=cfg["correction_method"],
     )
     results_df["p_adj"] = p_adj
 
-    # --- Step 5: causality determination ---
+    # --- 步骤5: 因果性判定 ---
     sig_threshold = cfg["significance_threshold"]
     min_effect = cfg["min_effect_size"]
 
-    # Degrees-of-freedom correction: few bins → few observations → inflated ΔR² (~6x @23bin)
-    # correction = (df_ref / df_actual)², a quadratic penalty that is stricter for clusters with few bins
+    # 自由度校正: 少 bin → 少观测 → ΔR² 虚高 (~6x @23bin)
+    # correction = (df_ref / df_actual)², 二次惩罚对少 bin 簇更严格
     n_ref_bins = cfg.get("reference_bins", 50)
     df_ref = n_ref_bins - 3
     df_actual = max(n_valid_pairs - 3, 1)
@@ -835,16 +805,16 @@ def granger_test(
     corrected_sig = sig_threshold / correction
     corrected_effect = min_effect * correction
     logger.info(
-        f"Granger degrees-of-freedom correction: n_bins={n_bins}, "
+        f"Granger 自由度校正: n_bins={n_bins}, "
         f"df_actual={df_actual}, "
         f"correction={correction:.3f}, p_threshold={sig_threshold:.4f}→{corrected_sig:.4f}, "
         f"effect_threshold={min_effect:.3f}→{corrected_effect:.3f}"
     )
 
-    # Composite score (always computed, exported to the results table)
-    # p_score: the smaller p_adj is → the closer to 1
+    # 复合分数 (始终计算，输出到结果表)
+    # p_score: p_adj 越小 → 越接近 1
     p_score = np.clip(1.0 - results_df["p_adj"].values / corrected_sig, 0, 1)
-    # effect_score: the larger delta_r2 is → the closer to 1
+    # effect_score: delta_r2 越大 → 越接近 1
     effect_score = np.clip(
         results_df["delta_r2"].values / max(corrected_effect, 1e-10), 0, 2
     ) / 2.0
@@ -855,7 +825,7 @@ def granger_test(
         min_score = cfg.get("min_composite_score", 0.3)
         results_df["is_causal"] = results_df["composite_score"] >= min_score
         logger.info(
-            f"Using soft-threshold filtering (min_composite_score={min_score})"
+            f"使用软阈值过滤 (min_composite_score={min_score})"
         )
     else:
         results_df["is_causal"] = (
@@ -865,7 +835,7 @@ def granger_test(
 
     n_causal = results_df["is_causal"].sum()
     logger.info(
-        f"Granger test complete: {n_causal}/{len(results_df)} pairs passed the causality filter "
+        f"Granger 检验完成: {n_causal}/{len(results_df)} 对通过因果筛选 "
         f"(p_adj < {corrected_sig:.2e}, "
         f"Delta R2 > {corrected_effect:.3f}, "
         f"df_correction={correction:.2f})"
@@ -875,14 +845,21 @@ def granger_test(
 
 
 def _bin_expression(adata, pseudotime_df, n_bins: int,
-                    smooth: str = "hard", min_cells_per_bin: int = 15) -> np.ndarray:
-    """Aggregate each gene/peak's expression/accessibility over pseudotime bins.
+                    smooth: str = "hard", min_cells_per_bin: int = 15,
+                    *, bin_plan=None) -> np.ndarray:
+    """将每个基因/peak 的表达/可及性在伪时间 bin 上聚合。
 
-    smooth="hard": hard binning; take the mean over cells within each bin (original behavior)
-    smooth="gaussian": Gaussian-kernel weighted smoothing; each bin shares information
-                       from neighboring bins, reducing the noise of small-cluster bin means;
-                       min_cells_per_bin controls sigma
+    smooth="hard": 硬分箱，bin 内细胞取均值（原始行为）
+    smooth="gaussian": 高斯核加权平滑，每个 bin 共享邻 bin 信息，
+                       降低小簇 bin 均值噪声，min_cells_per_bin 控制 sigma
     """
+    if bin_plan is not None:
+        from .binning_adapter import aggregate_with_plan, validate_bin_plan
+        if n_bins != bin_plan.n_bins:
+            raise ValueError("n_bins must equal the supplied bin_plan.n_bins")
+        validate_bin_plan(bin_plan, pseudotime_df, adata.obs_names)
+        result = aggregate_with_plan(bin_plan, adata.X, cell_ids=adata.obs_names)
+        return result.toarray() if issparse(result) else np.asarray(result)
     mat = adata.X.toarray() if issparse(adata.X) else np.array(adata.X)
 
     if smooth == "hard":
@@ -904,7 +881,7 @@ def _bin_expression(adata, pseudotime_df, n_bins: int,
     avg_cells_per_bin = n_cells / max(n_bins, 1)
     base_sigma = pseudo_span / n_bins
 
-    # Adaptive sigma: increase sigma for small clusters so they can borrow information from neighboring bins
+    # 自适应 sigma: 小簇增大 sigma 以从邻 bin 借信息
     if avg_cells_per_bin >= min_cells_per_bin:
         sigma = base_sigma
     else:
@@ -924,16 +901,17 @@ def _generate_candidate_pairs(
     rna_adata, atac_adata, distance_thresh: int
 ) -> List[tuple]:
     """
-    Generate candidate peak-gene pairs based on genomic distance.
+    基于基因组距离生成候选 peak-gene 对。
 
-    Optimization: use np.searchsorted over the sorted gene TSSs to do an
-    interval search, avoiding building a full (n_peaks × n_genes) distance matrix.
+    优化: 使用 np.searchsorted 在排序后的基因 TSS 上做区间搜索，
+    避免构造全量 (n_peaks × n_genes) 距离矩阵。
     """
     pairs = []
     atac_chr = atac_adata.var["chr"].values
     atac_mid = ((atac_adata.var["start"] + atac_adata.var["end"]) / 2).values
     rna_chr = rna_adata.var["chr"].values
-    rna_tss = rna_adata.var["start"].values.astype(float)
+    from .gene_identity import gene_tss_coordinates
+    rna_tss = gene_tss_coordinates(rna_adata)
 
     for chrom in np.unique(atac_chr):
         atac_mask = atac_chr == chrom
@@ -946,13 +924,13 @@ def _generate_candidate_pairs(
         rna_tsss = rna_tss[rna_mask]
         rna_names = rna_adata.var_names[rna_mask]
 
-        # Sort by TSS to enable interval search
+        # 按 TSS 排序便于区间搜索
         sort_idx = np.argsort(rna_tsss)
         sorted_tss = rna_tsss[sort_idx]
         sorted_names = rna_names[sort_idx]
 
         for pi, peak_mid in enumerate(atac_mids):
-            # Use searchsorted to find genes within the interval [mid - thresh, mid + thresh]
+            # 用 searchsorted 找到 [mid - thresh, mid + thresh] 区间内的基因
             left = np.searchsorted(sorted_tss, peak_mid - distance_thresh)
             right = np.searchsorted(sorted_tss, peak_mid + distance_thresh)
             for gi in range(left, right):
@@ -962,16 +940,15 @@ def _generate_candidate_pairs(
 
 
 # ============================================================================
-# Causal GRN construction
+# 因果 GRN 构建
 # ============================================================================
 
 def build_causal_grn(granger_results: pd.DataFrame) -> pd.DataFrame:
     """
-    Extract causal peak-gene edges from the Granger test results as the base layer of the GRN.
+    从 Granger 检验结果提取因果 peak-gene 边，作为 GRN 的基础层。
 
-    The returned causal edges will be expanded by the kinetics module into the
-    full TF→peak→gene network.
+    返回的因果边将在 kinetics 模块中被扩展为完整的 TF→peak→gene 网络。
     """
     causal_edges = granger_results[granger_results["is_causal"]].copy()
-    logger.info(f"Building the GRN base layer from {len(causal_edges)} causal peak-gene edges")
+    logger.info(f"基于 {len(causal_edges)} 条因果 peak-gene 边构建 GRN 基础层")
     return causal_edges

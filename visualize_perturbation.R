@@ -12,6 +12,242 @@
 #   Rscript visualize_perturbation.R /path/to/results/ --genes RASSF2,CBWD2,CDH1
 # =============================================================================
 
+# ==============================================================================
+# 用户配置 / Configuration — modify these variables directly before running
+# 优先级：命令行 > 环境变量 > 下方手动配置。
+# ==============================================================================
+script_file <- grep("^--file=", commandArgs(), value = TRUE)
+PROJECT_DIR <- if (length(script_file)) dirname(normalizePath(sub("^--file=", "", script_file[1]))) else getwd()
+
+# 输入结果目录：保留适配前的 test_2/D3 默认值；可改为任意一次运行的目录。
+RESULT_DIR <- "/home/huangtao/Desktop/huangchengqi/code_1/CausalBridge/results/test/KLF1_test/"
+# 输出图片目录：NULL 表示使用最终输入目录下的 figures_R；也可填写独立路径。
+OUTPUT_DIR <- NULL  # e.g. "/path/to/my_figures"
+
+# 通路图下游基因：NULL → 自动按 |delta_rna_signed| 取前 TOP_PATHWAY_N 个。
+# 手动选择示例：PATHWAY_GENES <- c("RASSF2", "CBWD2", "CDH1")
+# 支持稳定 gene ID 或显示名称；同名基因请用 ID 区分。
+# --genes 或 CAUSALBRIDGE_PATHWAY_GENES 可覆盖；__AUTO__ 切换回自动选择。
+PATHWAY_GENES <- NULL
+TOP_PATHWAY_N <- 5
+
+# TF 层级图：按上下游联合贡献选择 TF，再按下游贡献的绝对值选择基因。
+# 这些参数只控制展示，不改变模型或保存的扰动结果。
+TOP_TF_N <- 5
+TOP_DOWNSTREAM_N <- 4
+MIN_EFFECT_TF <- 0.005  # 去掉 |effect| 不超过此值的下游基因
+
+# Source only these adapters with CAUSALBRIDGE_VIS_ADAPTERS_ONLY=1.
+VIS_LABELS <- new.env(parent = emptyenv())
+vis_label <- function(ids) vapply(as.character(ids), function(id) {
+  if (is.na(id)) return(NA_character_)
+  if (exists(id, envir = VIS_LABELS, inherits = FALSE)) get(id, envir = VIS_LABELS) else id
+}, character(1), USE.NAMES = FALSE)
+
+vis_identity <- function(df, roles) {
+  for (role in intersect(roles, names(df))) {
+    label <- if (paste0(role, "_name") %in% names(df)) df[[paste0(role, "_name")]] else df[[role]]
+    if (paste0(role, "_id") %in% names(df)) {
+      ids <- df[[paste0(role, "_id")]]
+      use <- !is.na(ids) & nzchar(ids)
+      df[[role]][use] <- ids[use]
+    }
+    df[[paste0(role, "_label")]] <- label
+    for (i in seq_len(nrow(df))) if (!is.na(df[[role]][i]) && !is.na(label[i]))
+      assign(as.character(df[[role]][i]), as.character(label[i]), envir = VIS_LABELS)
+  }
+  df
+}
+
+vis_targets <- function(df) {
+  if (!nrow(df)) return(list(ids = character(), names = character()))
+  if ("target_gene_ids_json" %in% names(df) && !is.na(df$target_gene_ids_json[1])) {
+    if (!requireNamespace("jsonlite", quietly = TRUE)) stop("JSON target arrays require R package jsonlite")
+    ids <- jsonlite::fromJSON(df$target_gene_ids_json[1])
+    labels <- if ("target_gene_names_json" %in% names(df))
+      jsonlite::fromJSON(df$target_gene_names_json[1]) else vis_label(ids)
+    if (!is.character(ids) || !is.character(labels) || length(ids) != length(labels))
+      stop("Target JSON arrays must contain matching gene IDs and names")
+    return(list(ids = ids, names = labels))
+  }
+  ids <- unique(trimws(unlist(strsplit(as.character(df$target_gene[1]), "[,+]"))))
+  ids <- ids[nzchar(ids)]
+  list(ids = ids, names = vis_label(ids))
+}
+
+vis_effects <- function(df, merged = FALSE) {
+  df <- vis_identity(df, c("target_gene", "affected_gene"))
+  candidates <- c(if (merged) "delta_rna_signed", "endpoint_delta_rna_log2fc",
+    "delta_rna_log2fc", "delta_log1p_rna_log1p_cp10k", "delta_rna_signed", "delta_rna")
+  column <- intersect(candidates, names(df))[1]
+  if (is.na(column)) stop("No supported RNA effect column")
+  df$plot_delta <- as.numeric(df[[column]])
+  unit <- "RNA effect (legacy units)"
+  if ((merged && column == "delta_rna_signed") || column %in% c("endpoint_delta_rna_log2fc", "delta_rna_log2fc")) {
+    unit <- "log2FC (display)"
+  } else if (column == "delta_log1p_rna_log1p_cp10k") {
+    unit <- "Δ log1p RNA (CP10k)"
+  } else if (all(c("control_mean_cp10k", "perturbed_mean_cp10k") %in% names(df))) {
+    unit <- "log2FC (CP10k endpoint)"
+  } else if (all(c("control_mean_l1", "perturbed_mean_l1") %in% names(df))) {
+    unit <- "log2FC (RNA state endpoint)"
+  } else if ("native_effect_unit" %in% names(df)) {
+    units <- unique(na.omit(df$native_effect_unit))
+    if (length(units) == 1) unit <- units
+  }
+  df$effect_unit <- rep(unit, nrow(df))
+  valid <- is.finite(df$plot_delta)
+  if ("status" %in% names(df)) valid <- valid & !is.na(df$status) & df$status == "ok"
+  if ("aggregation_scope" %in% names(df)) valid <- valid & (is.na(df$aggregation_scope) | df$aggregation_scope != "unavailable")
+  df$plot_available <- valid
+  # Aliases for existing plots, never reconstructed global effects.
+  df$delta_rna <- ifelse(valid, df$plot_delta, NA_real_)
+  if (merged) df$delta_rna_signed <- df$delta_rna
+  df
+}
+
+vis_note <- function(df, gene = NULL) {
+  if (!is.null(gene)) df <- df[df$affected_gene == gene, , drop = FALSE]
+  fields <- intersect(c("aggregation_scope", "aggregation_cell_fraction",
+    "aggregation_used_contexts", "aggregation_total_contexts", "aggregation_context_exclusions",
+    "display_clipped", "status"), names(df))
+  paste(vapply(fields, function(f) paste0(f, "=", paste(unique(df[[f]]), collapse = ",")), character(1)), collapse = "; ")
+}
+
+vis_pathways <- function(df) {
+  df <- vis_identity(df, c("target_gene", "tf_name", "affected_gene"))
+  # Saturating links have no allocated RNA effect. Peak-input contributions
+  # cannot be substituted for missing RNA pathway contributions.
+  aliases <- list(r2_score_first = c("train_r2", "r2_score"),
+    tf_lag_first = c("source_tf_lag", "tf_lag"),
+    delta_r_raw_sum = c("delta_r_raw"),
+    delta_rna_log2fc = c("endpoint_delta_rna_log2fc"))
+  for (field in names(aliases)) if (!field %in% names(df)) {
+    source <- intersect(aliases[[field]], names(df))[1]
+    df[[field]] <- if (!is.na(source)) df[[source]] else rep(NA_real_, nrow(df))
+  }
+  valid <- is.finite(df$delta_r_raw_sum)
+  if ("pathway_allocation_status" %in% names(df))
+    valid <- valid & !is.na(df$pathway_allocation_status) & df$pathway_allocation_status != "unavailable"
+  if ("status" %in% names(df)) valid <- valid & !is.na(df$status) & df$status == "ok"
+  df$delta_r_raw_sum[!valid] <- NA_real_
+  df$pathway_plot_available <- valid
+  df
+}
+
+vis_join_pathways <- function(pathways, tf_weights, peak_gene_edges) {
+  # Canonical IDs are installed by vis_identity before any grouping or join.
+  for (field in c("atac_coef", "pearson_r")) if (!field %in% names(peak_gene_edges))
+    peak_gene_edges[[field]] <- rep(NA_real_, nrow(peak_gene_edges))
+  if (!"cluster" %in% names(pathways) && !nrow(pathways)) pathways$cluster <- character()
+  for (field in c("tf_name", "affected_gene", "peak_id"))
+    if (!field %in% names(pathways) && !nrow(pathways)) pathways[[field]] <- character()
+  pathways$cluster <- as.character(pathways$cluster)
+  tf_weights$cluster <- as.character(tf_weights$cluster)
+  peak_gene_edges$cluster <- as.character(peak_gene_edges$cluster)
+  # Event-link exports use cluster_0 while fitted edges / RNA use 0. Align
+  # only to an existing reference ID, and reject ambiguous mixed spellings.
+  original_cluster <- pathways$cluster
+  reference_clusters <- union(tf_weights$cluster, peak_gene_edges$cluster)
+  short_cluster <- sub("^cluster_", "", original_cluster)
+  remap <- !is.na(original_cluster) & grepl("^cluster_[0-9]+$", original_cluster) &
+    !original_cluster %in% reference_clusters & short_cluster %in% reference_clusters
+  pathways$cluster[remap] <- short_cluster[remap]
+  cluster_map <- unique(data.frame(original = original_cluster, canonical = pathways$cluster))
+  if (anyDuplicated(cluster_map$canonical))
+    stop("Ambiguous pathway cluster IDs: both prefixed and unprefixed labels refer to one cluster")
+  if (any(remap)) pathways$cluster_source_label <- original_cluster
+  finite_mean <- function(x) if (any(is.finite(x))) mean(x[is.finite(x)]) else NA_real_
+  tf <- dplyr::summarise(dplyr::group_by(tf_weights, tf_gene, peak_id, cluster),
+    tf_peak_weight = finite_mean(weight),
+    tf_lag_joined = if ("tf_lag" %in% names(tf_weights)) finite_mean(tf_lag) else NA_real_,
+    .groups = "drop")
+  names(tf)[names(tf) == "tf_gene"] <- "tf_name"
+  pg <- dplyr::summarise(dplyr::group_by(peak_gene_edges, peak_id, gene, cluster),
+    peak_gene_coef = finite_mean(atac_coef), peak_gene_pearson_r = finite_mean(pearson_r),
+    .groups = "drop")
+  names(pg)[names(pg) == "gene"] <- "affected_gene"
+  pathways <- dplyr::left_join(pathways, tf, by = c("tf_name", "peak_id", "cluster"))
+  pathways <- dplyr::left_join(pathways, pg, by = c("peak_id", "affected_gene", "cluster"))
+  pathways$tf_lag <- if ("tf_lag_first" %in% names(pathways))
+    dplyr::coalesce(as.numeric(pathways$tf_lag_first), pathways$tf_lag_joined) else pathways$tf_lag_joined
+  pathways
+}
+
+# Adapt saved contributions for the original plotting geometry only. A hybrid
+# temporal link carries a shared peak→RNA response, not a TF-allocated response.
+# Keep both original allocation columns untouched, including their missingness.
+vis_layout_pathways <- function(df) {
+  df$plot_pathway_weight <- df$delta_r_raw_sum
+  df$plot_hierarchy_weight <- if ("delta_r_total" %in% names(df))
+    df$delta_r_total else df$delta_r_raw_sum
+  df$plot_shared_peak_response <- rep(FALSE, nrow(df))
+  fields <- c("pathway_type", "shared_peak_contribution",
+    "peak_input_contribution_mean", "peak_input_unit")
+  if (all(fields %in% names(df))) {
+    shared <- !is.finite(df$delta_r_raw_sum) &
+      !is.na(df$pathway_type) & df$pathway_type == "temporal_event_link" &
+      tolower(as.character(df$shared_peak_contribution)) %in% c("true", "1") &
+      is.finite(df$peak_input_contribution_mean) &
+      !is.na(df$peak_input_unit) &
+      df$peak_input_unit == "delta_log1p_rna_log1p_cp10k"
+    if ("status" %in% names(df)) shared <- shared & !is.na(df$status) & df$status == "ok"
+    df$plot_pathway_weight[shared] <- df$peak_input_contribution_mean[shared]
+    df$plot_hierarchy_weight[shared] <- df$peak_input_contribution_mean[shared]
+    df$plot_shared_peak_response[shared] <- TRUE
+  }
+  df
+}
+
+vis_config <- function(args = commandArgs(trailingOnly = TRUE),
+                       result_dir = RESULT_DIR, output_dir = OUTPUT_DIR,
+                       pathway_genes = PATHWAY_GENES) {
+  # Resolve overrides without creating directories or loading plotting packages.
+  result_dir <- Sys.getenv("CAUSALBRIDGE_RESULT_DIR", unset = result_dir)
+  output_env <- Sys.getenv("CAUSALBRIDGE_OUTPUT_DIR", unset = "")
+  if (nzchar(output_env)) output_dir <- output_env
+  genes_env <- Sys.getenv("CAUSALBRIDGE_PATHWAY_GENES", unset = "")
+  parse_genes <- function(x) if (identical(x, "__AUTO__")) NULL else trimws(strsplit(x, ",")[[1]])
+  if (nzchar(genes_env)) pathway_genes <- parse_genes(genes_env)
+  positional <- character()
+  result_arg <- NULL
+  i <- 1
+  while (i <= length(args)) {
+    if (args[i] %in% c("--result-dir", "--output-dir", "--genes")) {
+      if (i == length(args)) stop(paste("Missing value for", args[i]))
+      if (args[i] == "--result-dir") result_arg <- args[i + 1]
+      if (args[i] == "--output-dir") output_dir <- args[i + 1]
+      if (args[i] == "--genes") pathway_genes <- parse_genes(args[i + 1])
+      i <- i + 2
+    } else {
+      if (!startsWith(args[i], "--")) positional <- c(positional, args[i])
+      i <- i + 1
+    }
+  }
+  if (length(positional)) result_dir <- positional[1]
+  if (!is.null(result_arg)) result_dir <- result_arg
+  if (is.null(output_dir)) output_dir <- file.path(result_dir, "figures_R")
+  list(result_dir = result_dir, output_dir = output_dir, pathway_genes = pathway_genes)
+}
+
+vis_select_pathway_genes <- function(merged, specified = NULL, top_n = TOP_PATHWAY_N) {
+  if (!is.null(specified)) {
+    valid <- merged$affected_gene[merged$affected_gene %in% specified |
+      vis_label(merged$affected_gene) %in% specified]
+    invalid <- setdiff(specified, c(valid, vis_label(valid)))
+    if (length(invalid)) warning(paste("genes not found in data:", paste(invalid, collapse = ", ")))
+    if (!length(valid)) stop("None of the specified genes were found in perturbation_merged.csv")
+    # Preserve manual selection even when its saved effect is unavailable.
+    selected <- dplyr::filter(merged, affected_gene %in% valid)
+    return(dplyr::pull(dplyr::arrange(selected, dplyr::desc(abs(delta_rna_signed))), affected_gene))
+  }
+  if (length(top_n) != 1 || !is.finite(top_n) || top_n < 1 || top_n != as.integer(top_n))
+    stop("TOP_PATHWAY_N must be a positive integer")
+  available <- dplyr::filter(merged, is.finite(delta_rna_signed))
+  dplyr::pull(dplyr::slice_max(available, order_by = abs(delta_rna_signed), n = top_n), affected_gene)
+}
+
+if (!identical(Sys.getenv("CAUSALBRIDGE_VIS_ADAPTERS_ONLY"), "1")) {
 suppressPackageStartupMessages({
   library(ggplot2)
   library(dplyr)
@@ -26,57 +262,13 @@ suppressPackageStartupMessages({
 HAS_ANNDATA <- requireNamespace("anndata", quietly = TRUE)
 
 # ==============================================================================
-# Configuration — modify these variables directly before running
+# 应用配置 / Apply environment and command-line overrides to the settings above
 # ==============================================================================
 
-# Default result directory (can be overridden by command-line argument)
-RESULT_DIR <- Sys.getenv(
-  "CAUSALBRIDGE_RESULT_DIR",
-  unset = "/home/huangtao/Desktop/huangchengqi/code_1/CausalBridge/results/test_2/D3/"
-)
-
-# Genes to draw pathway schematics for.
-#   NULL         → auto-select top 5 by |delta_rna_signed|
-#   c("A","B")   → draw specified genes only
-# Can be overridden by:  --genes GENE1,GENE2,...
-pathway_genes_env <- Sys.getenv("CAUSALBRIDGE_PATHWAY_GENES", unset = "")
-PATHWAY_GENES <- if (identical(pathway_genes_env, "__AUTO__")) {
-  NULL
-} else if (nzchar(pathway_genes_env)) {
-  trimws(strsplit(pathway_genes_env, ",")[[1]])
-} else {
-  NULL
-  }
-
-# ==============================================================================
-# Parse command-line arguments (override config above)
-# ==============================================================================
-args <- commandArgs(trailingOnly = TRUE)
-
-specified_genes <- PATHWAY_GENES
-positional <- character(0)
-i <- 1
-while (i <= length(args)) {
-  if (args[i] == "--genes" && i < length(args)) {
-    specified_genes <- strsplit(args[i + 1], ",")[[1]]
-    specified_genes <- trimws(specified_genes)
-    i <- i + 2
-  } else if (!startsWith(args[i], "--")) {
-    positional <- c(positional, args[i])
-    i <- i + 1
-  } else {
-    i <- i + 1
-  }
-}
-
-if (length(positional) > 0) {
-  RESULT_DIR <- positional[1]
-}
-
-OUTPUT_DIR <- Sys.getenv(
-  "CAUSALBRIDGE_OUTPUT_DIR",
-  unset = file.path(RESULT_DIR, "figures_R")
-)
+resolved_config <- vis_config()
+RESULT_DIR <- resolved_config$result_dir
+OUTPUT_DIR <- resolved_config$output_dir
+specified_genes <- resolved_config$pathway_genes
 dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
 
 # ==============================================================================
@@ -84,22 +276,22 @@ dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
 # ==============================================================================
 
 COLORS <- list(
-  up       = "#E74C3C",      # Dark red, activation
-  down     = "#3498DB",      # Dark blue, inhibition
-  stable   = "#BDC3C7",      # Gray, stable
-  ink      = "#2C3E50",      # Dark text
-  muted    = "#7F8C8D",      # Light text
-  grid     = "#ECF0F1",      # Grid lines
-  panel    = "#FFFFFF",      # Panel background
-  peak     = "#F8F9FA",      # Peak node background
-  target   = "#F39C12",      # Target node (orange)
-  target_2 = "#E67E22",      # Target border
-  tf       = "#9B59B6",      # TF node (purple)
-  tf_bg    = "#F5EEF8",      # TF node background
-  gene     = "#27AE60",      # Gene node (green)
-  gene_bg  = "#EAFAF1",      # Gene node background
-  edge_pos = "#E74C3C",      # Positive edge (red)
-  edge_neg = "#3498DB"       # Negative edge (blue)
+  up       = "#E74C3C",      # 深红色，激活
+  down     = "#3498DB",      # 深蓝色，抑制
+  stable   = "#BDC3C7",      # 灰色，稳定
+  ink      = "#2C3E50",      # 深色文字
+  muted    = "#7F8C8D",      # 浅色文字
+  grid     = "#ECF0F1",      # 网格线
+  panel    = "#FFFFFF",      # 面板背景
+  peak     = "#F8F9FA",      # Peak 节点背景
+  target   = "#F39C12",      # Target 节点（橙色）
+  target_2 = "#E67E22",      # Target 边框
+  tf       = "#9B59B6",      # TF 节点（紫色）
+  tf_bg    = "#F5EEF8",      # TF 节点背景
+  gene     = "#27AE60",      # Gene 节点（绿色）
+  gene_bg  = "#EAFAF1",      # Gene 节点背景
+  edge_pos = "#E74C3C",      # 正向边（红色）
+  edge_neg = "#3498DB"       # 负向边（蓝色）
 )
 
 theme_pub <- function(base_size = 14) {
@@ -130,82 +322,38 @@ if (!is.null(specified_genes)) {
 # ==============================================================================
 cat("\n--- Loading data ---\n")
 
-pert_res <- read.csv(file.path(RESULT_DIR, "perturbation_results.csv"))
+pert_res <- vis_effects(read.csv(file.path(RESULT_DIR, "perturbation_results.csv")))
 cat(sprintf("perturbation_results: %d rows, %d unique genes\n",
             nrow(pert_res), length(unique(pert_res$affected_gene))))
 
-pert_merged <- read.csv(file.path(RESULT_DIR, "perturbation_merged.csv"))
+pert_merged <- vis_effects(read.csv(file.path(RESULT_DIR, "perturbation_merged.csv")), merged = TRUE)
 cat(sprintf("perturbation_merged: %d rows\n", nrow(pert_merged)))
 
-pathways <- read.csv(file.path(RESULT_DIR, "perturbation_pathways.csv"))
+pathways <- vis_pathways(read.csv(file.path(RESULT_DIR, "perturbation_pathways.csv")))
 cat(sprintf("pathways: %d rows\n", nrow(pathways)))
 
 # Load TF→peak weights to get lag information (per TF, per peak, per cluster)
-tf_weights <- read.csv(file.path(RESULT_DIR, "tf_peak_weights.csv"))
+tf_weights <- vis_identity(read.csv(file.path(RESULT_DIR, "tf_peak_weights.csv")), "tf_gene")
 cat(sprintf("tf_peak_weights: %d rows\n", nrow(tf_weights)))
 
 # Load Peak→Gene causal edges (atac_coef per peak, gene, cluster)
-peak_gene_edges <- read.csv(file.path(RESULT_DIR, "causal_peak_gene_edges.csv"))
+peak_gene_edges <- vis_identity(read.csv(file.path(RESULT_DIR, "causal_peak_gene_edges.csv")), "gene")
+for (field in c("atac_coef", "pearson_r")) if (!field %in% names(peak_gene_edges))
+  peak_gene_edges[[field]] <- rep(NA_real_, nrow(peak_gene_edges))
 cat(sprintf("peak_gene_edges: %d rows\n", nrow(peak_gene_edges)))
 
-# Join TF→Peak weight into pathways (match on tf_name=tf_gene, peak_id, cluster)
-# Dedup first to avoid many-to-many joins
-tf_weights_dedup <- tf_weights %>%
-  group_by(tf_gene, peak_id, cluster) %>%
-  summarise(tf_peak_weight = mean(weight, na.rm = TRUE), .groups = "drop") %>%
-  rename(tf_name = tf_gene)
-
-pathways <- pathways %>%
-  left_join(tf_weights_dedup, by = c("tf_name", "peak_id", "cluster"))
-
-# Join Peak→Gene atac_coef into pathways (match on peak_id, affected_gene=gene, cluster)
-pg_dedup <- peak_gene_edges %>%
-  group_by(peak_id, gene, cluster) %>%
-  summarise(
-    peak_gene_coef = mean(atac_coef, na.rm = TRUE),
-    peak_gene_pearson_r = if (all(is.na(pearson_r))) NA_real_ else
-      mean(pearson_r, na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
-  rename(affected_gene = gene)
-
-pathways <- pathways %>%
-  left_join(pg_dedup, by = c("peak_id", "affected_gene", "cluster"))
-
-cat(sprintf("Joined tf_peak_weight + peak_gene_coef + peak_gene_pearson_r into pathways\n"))
-
-# Join tf_lag from tf_weights into pathways (match on tf_name=tf_gene, peak_id, cluster)
-if ("tf_lag_first" %in% colnames(pathways)) {
-  # New pipeline output already has tf_lag
-  cat("Using tf_lag from perturbation_pathways.csv\n")
-  # Rename for downstream compatibility
-  pathways$tf_lag <- pathways$tf_lag_first
-} else {
-  # Backward compat: join from tf_peak_weights
-  lag_info <- tf_weights %>%
-    select(tf_gene, peak_id, tf_lag, cluster) %>%
-    rename(tf_name = tf_gene) %>%
-    mutate(cluster = as.integer(cluster))
-
-  pathways <- pathways %>%
-    left_join(lag_info, by = c("tf_name", "peak_id", "cluster"),
-              relationship = "many-to-many")
-
-  n_with_lag <- sum(!is.na(pathways$tf_lag))
-  cat(sprintf("Joined tf_lag: %d/%d rows have lag info\n", n_with_lag, nrow(pathways)))
-}
+pathways <- vis_join_pathways(pathways, tf_weights, peak_gene_edges)
+cat("Joined canonical TF/peak/gene weights and lag into pathways\n")
 
 # Auto-detect one or more jointly perturbed TFs. Combined-KO outputs encode the
 # intervention as a comma- or plus-delimited string (for example KLF1,GATA1),
 # while pathway tf_name values remain individual gene symbols.
-target_gene_raw <- unique(pert_merged$target_gene)[1]
-target_gene_names <- trimws(unlist(strsplit(target_gene_raw, "[,+]")))
-target_gene_names <- unique(target_gene_names[nzchar(target_gene_names)])
-target_gene_name <- paste(target_gene_names, collapse = " + ")
+target_gene_names <- vis_targets(pert_merged)$ids
+target_gene_name <- paste(vis_targets(pert_merged)$names, collapse = " + ")
 
 if (identical(Sys.getenv("CAUSALBRIDGE_REQUIRE_MULTI_TF"), "1") &&
     length(target_gene_names) < 2) {
-  stop("The joint KO visualization script requires target_gene to contain at least two TFs")
+  stop("联合 KO 可视化脚本要求 target_gene 至少包含两个 TF")
 }
 
 cat(sprintf("Target gene%s: %s\n",
@@ -217,14 +365,9 @@ cat(sprintf("Target gene%s: %s\n",
 # ==============================================================================
 cat("\n--- Computing volcano data ---\n")
 
-# Per-gene mean delta_rna from perturbation_results (per-cluster average)
-delta_df <- pert_res %>%
-  group_by(affected_gene) %>%
-  summarise(
-    mean_delta = mean(delta_rna),
-    n_clusters = n(),
-    .groups    = "drop"
-  )
+# The saved merged endpoint is authoritative, including partial coverage.
+delta_df <- pert_merged %>% filter(plot_available) %>%
+  select(affected_gene, mean_delta = delta_rna_signed)
 
 # Per-gene mean R² from pathway edges (ATAC→RNA transfer function fit quality)
 r2_df <- pathways %>%
@@ -236,7 +379,7 @@ r2_df <- pathways %>%
   )
 
 # Join
-volcano_df <- inner_join(delta_df, r2_df, by = "affected_gene") %>%
+volcano_df <- left_join(delta_df, r2_df, by = "affected_gene") %>%
   mutate(
     change = case_when(
       mean_delta > 1   ~ "Up",
@@ -247,7 +390,7 @@ volcano_df <- inner_join(delta_df, r2_df, by = "affected_gene") %>%
     # Joint label priority: large perturbation with strong model support.
     label_score = abs(mean_delta) * pmax(mean_r2, 0),
     label = ifelse(abs(mean_delta) > 1 & rank(-label_score) <= 15,
-                   affected_gene, "")
+                   vis_label(affected_gene), "")
   )
 
 n_up   <- sum(volcano_df$change == "Up")
@@ -259,7 +402,7 @@ cat(sprintf("Mean R² range: %.3f – %.3f, median: %.3f\n",
             median(volcano_df$mean_r2)))
 
 # Effect–fit quality plot: x = log2FC, y = mean R²
-x_max <- max(abs(volcano_df$mean_delta), na.rm = TRUE) * 1.1
+x_max <- max(c(1, abs(volcano_df$mean_delta)), na.rm = TRUE) * 1.1
 
 p_volcano <- ggplot(volcano_df, aes(x = mean_delta, y = mean_r2)) +
   geom_point(aes(color = change), alpha = 0.72, size = 1.9, stroke = 0) +
@@ -285,7 +428,7 @@ p_volcano <- ggplot(volcano_df, aes(x = mean_delta, y = mean_r2)) +
   scale_y_continuous(limits = c(0, 1)) +
   labs(
     title = paste0(target_gene_name, " KO: Perturbation Effect vs Model Fit"),
-    x = expression(Delta * " RNA (log"[2] * " fold change)"),
+    x = unique(pert_merged$effect_unit)[1],
     y = expression("Mean " * italic(R)^2 * " (ATAC→RNA fit quality)")
   ) +
   theme_pub(base_size = 18) +
@@ -309,954 +452,19 @@ cat(sprintf("[OK] Effect–fit plot saved: %s\n", file.path(OUTPUT_DIR, "volcano
 # ==============================================================================
 cat("\n--- Drawing pathway schematics ---\n")
 
-# Determine genes to plot
-if (!is.null(specified_genes)) {
-  # Validate specified genes
-  valid_genes <- specified_genes[specified_genes %in% pert_merged$affected_gene]
-  invalid_genes <- setdiff(specified_genes, valid_genes)
-  if (length(invalid_genes) > 0) {
-    cat(sprintf("WARNING: genes not found in data: %s\n",
-                paste(invalid_genes, collapse = ", ")))
-  }
-  if (length(valid_genes) == 0) {
-    stop("None of the specified genes were found in perturbation_merged.csv")
-  }
-  # Order by |delta_rna_signed|
-  gene_order <- pert_merged %>%
-    filter(affected_gene %in% valid_genes) %>%
-    arrange(desc(abs(delta_rna_signed)))
-  pathway_genes <- gene_order$affected_gene
-  cat(sprintf("Specified genes: %s\n", paste(pathway_genes, collapse = ", ")))
-} else {
-  # Default: top 5 by |delta_rna_signed|
-  pathway_genes <- pert_merged %>%
-    slice_max(order_by = abs(delta_rna_signed), n = 5) %>%
-    pull(affected_gene)
-  cat(sprintf("Top 5 genes (auto): %s\n", paste(pathway_genes, collapse = ", ")))
-}
-
-# ---- Single pathway plot function (Target → Intermediate TF → Peak → Gene) ----
-plot_single_pathway <- function(gene_name, pw_df, merged_df,
-                                show_main_title = TRUE, cluster_filter = NULL,
-                                cluster_effect = NULL, panel_title = NULL) {
-  target_gene_raw <- unique(merged_df$target_gene)[1]
-  target_gene_names <- unique(trimws(unlist(strsplit(target_gene_raw, "[,+]"))))
-  target_gene_names <- target_gene_names[nzchar(target_gene_names)]
-  target_gene_name <- paste(target_gene_names, collapse = " + ")
-  delta_total <- merged_df$delta_rna_signed[merged_df$affected_gene == gene_name]
-  if (length(delta_total) == 0) delta_total <- 0
-  # Cluster panels use the observed cluster perturbation; the unfiltered plot
-  # continues to use the merged response.
-  displayed_gene_delta <- if (!is.null(cluster_filter) &&
-                              length(cluster_effect) && is.finite(cluster_effect[1])) {
-    cluster_effect[1]
-  } else delta_total[1]
-
-  # All pathway edges for this affected gene
-  gene_pw <- pw_df %>% filter(affected_gene == !!gene_name)
-  if (!is.null(cluster_filter)) {
-    gene_pw <- gene_pw %>% filter(as.character(cluster) == as.character(cluster_filter))
-  }
-
-  # Exclude clusters where the affected gene had zero perturbation effect
-  # (delta_rna_log2fc == 0 means the gene wasn't perturbed in that cluster,
-  #  so those edges are noise — they don't contribute to the actual effect)
-  gene_pw <- gene_pw %>% filter(abs(delta_rna_log2fc) > 1e-10)
-
-  # Will be recomputed after aggregation from displayed edges
-  gene_pathway_sum <- 0
-
-  if (nrow(gene_pw) == 0) {
-    p <- ggplot() +
-      annotate("text", x = 0.5, y = 0.5, size = 8.5, color = "grey40",
-               label = paste(gene_name, "\n(no pathway data)")) +
-      theme_void()
-    return(p)
-  }
-
-  shorten_peak <- function(pid) NULL  # Chromatin coordinates are no longer shown; retain the function signature for compatibility
-
-  # --- Split edges by membership in the joint-KO target set ---
-  direct_pw <- gene_pw %>% filter(tf_name %in% target_gene_names)
-  indirect_pw <- gene_pw %>% filter(!tf_name %in% target_gene_names)
-
-  # Identify intermediate TFs (non-target TFs that regulate this gene)
-  intermediate_tfs <- unique(indirect_pw$tf_name)
-
-  # For each intermediate TF, find target→TF connections
-  # (edges where target binds peaks and the affected_gene is the intermediate TF)
-  target_to_tf_pw <- pw_df %>%
-    filter(tf_name %in% target_gene_names,
-           affected_gene %in% intermediate_tfs,
-           !affected_gene %in% target_gene_names)
-  if (!is.null(cluster_filter)) {
-    target_to_tf_pw <- target_to_tf_pw %>%
-      filter(as.character(cluster) == as.character(cluster_filter))
-  }
-
-  # --- Cluster consistency filtering ---
-  # For each intermediate TF, retain only downstream edges whose cluster
-  # matches the cluster of an upstream regulated edge.
-  if (nrow(target_to_tf_pw) > 0 && "cluster" %in% colnames(target_to_tf_pw)) {
-    # Upstream: (TF, cluster) pair set
-    upstream_pairs <- target_to_tf_pw %>%
-      select(affected_gene, cluster) %>%
-      distinct() %>%
-      rename(tf_name = affected_gene)
-
-    # Retain only downstream edges whose cluster matches an upstream cluster.
-    if (nrow(indirect_pw) > 0 && "cluster" %in% colnames(indirect_pw)) {
-      indirect_pw <- indirect_pw %>%
-        semi_join(upstream_pairs, by = c("tf_name", "cluster"))
-    }
-  }
-
-  # =========================================================================
-  # Build 5-row layout (vertical, top to bottom):
-  #   Target
-  #   Peak_A
-  #   Intermediate TF
-  #   Peak_B
-  #   Affected Gene
-  # =========================================================================
-  y_target   <- 0.93
-  y_peak_a   <- 0.72
-  y_tf_mid   <- 0.50
-  y_peak_b   <- 0.30
-  y_gene     <- 0.10
-
-  x_spread <- function(n) {
-    if (n <= 1) return(0.5)
-    seq(0.25, 0.95, length.out = n)
-  }
-
-  # Unweighted cross-cluster coefficient means can reverse a displayed edge
-  # even when the clusters with the largest pathway contributions agree.
-  weighted_reg_direction <- function(coefficient, contribution) {
-    usable <- is.finite(coefficient) & is.finite(contribution)
-    if (!any(usable)) return(NA_real_)
-    weights <- abs(contribution[usable])
-    if (sum(weights) <= 0) return(NA_real_)
-    direction <- weighted.mean(coefficient[usable], w = weights)
-    if (!is.finite(direction) || abs(direction) <= 1e-8) NA_real_ else direction
-  }
-
-  weighted_reg_weight <- function(coefficient, contribution) {
-    usable <- is.finite(coefficient) & is.finite(contribution)
-    if (!any(usable)) 0 else sum(abs(contribution[usable]))
-  }
-
-  # --- Aggregate direct edges: Target → Peak_B → Gene ---
-  #   Aggregate the effects of the same peak across all clusters without
-  #   manually filtering by positive or negative direction.
-  if (nrow(direct_pw) > 0) {
-    direct_agg <- direct_pw %>%
-      group_by(peak_id) %>%
-      summarise(
-        total_effect = sum(delta_r_raw_sum, na.rm = TRUE),
-        tf_peak_weight = weighted_reg_direction(tf_peak_weight, delta_r_raw_sum),
-        tf_peak_direction_weight = weighted_reg_weight(tf_peak_weight, delta_r_raw_sum),
-        peak_gene_pearson_r = weighted_reg_direction(peak_gene_pearson_r, delta_r_raw_sum),
-        peak_gene_direction_weight = weighted_reg_weight(peak_gene_pearson_r, delta_r_raw_sum),
-        r2_mean = if ("r2_score_first" %in% colnames(direct_pw))
-                  mean(r2_score_first) else NA_real_,
-        tf_lag_mean = if ("tf_lag" %in% colnames(direct_pw))
-                      round(mean(tf_lag, na.rm = TRUE), 1) else NA_real_,
-        clusters = if ("cluster" %in% colnames(direct_pw))
-                   paste(sort(unique(cluster)), collapse = ",") else "",
-        .groups = "drop"
-      ) %>%
-      arrange(desc(abs(total_effect)))
-  } else {
-    direct_agg <- data.frame(
-      peak_id = character(0), total_effect = numeric(0),
-      r2_mean = numeric(0), tf_lag_mean = numeric(0),
-      clusters = character(0), stringsAsFactors = FALSE
-    )
-  }
-
-  # --- Aggregate indirect edges: TF → Peak_B → Gene ---
-  #   Aggregate the effects of the same (TF, peak) across all clusters without
-  #   manually filtering by positive or negative direction.
-  if (nrow(indirect_pw) > 0) {
-    indirect_agg <- indirect_pw %>%
-      group_by(tf_name, peak_id) %>%
-      summarise(
-        total_effect = sum(delta_r_raw_sum, na.rm = TRUE),
-        tf_peak_weight = weighted_reg_direction(tf_peak_weight, delta_r_raw_sum),
-        tf_peak_direction_weight = weighted_reg_weight(tf_peak_weight, delta_r_raw_sum),
-        peak_gene_pearson_r = weighted_reg_direction(peak_gene_pearson_r, delta_r_raw_sum),
-        peak_gene_direction_weight = weighted_reg_weight(peak_gene_pearson_r, delta_r_raw_sum),
-        r2_mean = if ("r2_score_first" %in% colnames(indirect_pw))
-                  mean(r2_score_first) else NA_real_,
-        tf_lag_mean = if ("tf_lag" %in% colnames(indirect_pw))
-                      round(mean(tf_lag, na.rm = TRUE), 1) else NA_real_,
-        clusters = if ("cluster" %in% colnames(indirect_pw))
-                   paste(sort(unique(cluster)), collapse = ",") else "",
-        .groups = "drop"
-      ) %>%
-      ungroup() %>%
-      arrange(desc(abs(total_effect)))
-  } else {
-    indirect_agg <- data.frame(
-      tf_name = character(0), peak_id = character(0),
-      total_effect = numeric(0), r2_mean = numeric(0),
-      tf_lag_mean = numeric(0), clusters = character(0),
-      stringsAsFactors = FALSE
-    )
-  }
-
-  # --- Aggregate target→TF edges: Target → Peak_A → Intermediate TF ---
-  #   Aggregate the effects of the same (TF, peak) across all clusters without
-  #   manually filtering by positive or negative direction.
-  if (nrow(target_to_tf_pw) > 0 && length(intermediate_tfs) > 0) {
-    t2tf_agg <- target_to_tf_pw %>%
-      group_by(affected_gene, peak_id) %>%
-      summarise(
-        total_effect = sum(delta_r_raw_sum, na.rm = TRUE),
-        tf_peak_weight = weighted_reg_direction(tf_peak_weight, delta_r_raw_sum),
-        tf_peak_direction_weight = weighted_reg_weight(tf_peak_weight, delta_r_raw_sum),
-        peak_gene_pearson_r = weighted_reg_direction(peak_gene_pearson_r, delta_r_raw_sum),
-        peak_gene_direction_weight = weighted_reg_weight(peak_gene_pearson_r, delta_r_raw_sum),
-        clusters = if ("cluster" %in% colnames(target_to_tf_pw))
-                   paste(sort(unique(cluster)), collapse = ",") else "",
-        .groups = "drop"
-      ) %>%
-      ungroup()
-  } else {
-    t2tf_agg <- data.frame(
-      affected_gene = character(0), peak_id = character(0),
-      total_effect = numeric(0), stringsAsFactors = FALSE
-    )
-  }
-
-  # --- Determine which nodes to show (limit for readability) ---
-  # Only keep intermediate TFs that have BOTH:
-  #   (a) a finite regulatory effect on this gene
-  #   (b) verified target→TF connection (target regulates this TF)
-  valid_tfs <- intersect(unique(indirect_agg$tf_name), unique(t2tf_agg$affected_gene))
-  # Rank TFs by their joint upstream and downstream contribution.  The
-  # geometric mean favors TFs that are strong on both target→TF and TF→gene,
-  # instead of allowing one large side to dominate the ordering.
-  tf_joint_rank <- full_join(
-    t2tf_agg %>%
-      filter(affected_gene %in% valid_tfs) %>%
-      group_by(tf_name = affected_gene) %>%
-      summarise(upstream_contribution = sum(abs(total_effect)), .groups = "drop"),
-    indirect_agg %>%
-      filter(tf_name %in% valid_tfs) %>%
-      group_by(tf_name) %>%
-      summarise(downstream_contribution = sum(abs(total_effect)), .groups = "drop"),
-    by = "tf_name"
-  ) %>%
-    mutate(
-      upstream_contribution = coalesce(upstream_contribution, 0),
-      downstream_contribution = coalesce(downstream_contribution, 0),
-      joint_contribution = sqrt(upstream_contribution * downstream_contribution)
-    ) %>%
-    arrange(desc(joint_contribution), tf_name)
-  # Keep at most three indirect routes so complete paths remain legible.
-  top_tfs <- head(tf_joint_rank$tf_name, 3)
-
-  # Top peaks from direct edges (by absolute effect magnitude)
-  direct_peaks <- direct_agg %>%
-    slice_max(order_by = abs(total_effect), n = 3, with_ties = FALSE) %>%
-    pull(peak_id)
-
-  # Top peaks from indirect edges (take the top 1 for each TF to cover all TFs)
-  indirect_peaks <- indirect_agg %>%
-    filter(tf_name %in% top_tfs) %>%
-    group_by(tf_name) %>%
-    slice_max(order_by = abs(total_effect), n = 1, with_ties = FALSE) %>%
-    ungroup() %>%
-    pull(peak_id) %>% unique()
-
-  # Top peaks from target→TF edges (take the top 1 for each TF so every TF has
-  # at least one upstream edge)
-  t2tf_peaks <- t2tf_agg %>%
-    filter(affected_gene %in% top_tfs) %>%
-    group_by(affected_gene) %>%
-    slice_max(order_by = abs(total_effect), n = 1, with_ties = FALSE) %>%
-    ungroup() %>%
-    pull(peak_id) %>% unique()
-
-  all_peak_b <- unique(c(direct_peaks, indirect_peaks))
-  all_peak_a <- t2tf_peaks
-
-  # If no intermediate TFs, use simplified 3-column layout
-  has_indirect <- length(top_tfs) > 0
-  has_direct   <- nrow(direct_agg) > 0
-
-  if (!has_indirect && !has_direct) {
-    p <- ggplot() +
-      annotate("text", x = 0.5, y = 0.5, size = 8.5, color = "grey40",
-               label = paste(gene_name, "\n(no valid edges)")) +
-      theme_void()
-    return(p)
-  }
-
-  # --- Node positions (vertical layout) ---
-  # Target and gene stay at fixed positions; intermediate nodes spread
-  # horizontally.
-  target_x <- 0.55
-  gene_x   <- 0.55
-
-  if (has_direct && has_indirect) {
-    n_tf <- length(top_tfs)
-
-    # Separate lanes: indirect routes on the left, direct routes on the right.
-    n_dir <- length(direct_peaks)
-    direct_pk_x <- setNames(
-      seq(0.66, 0.90, length.out = max(n_dir, 1)),
-      direct_peaks
-    )
-
-    # Give intermediate-TF labels enough horizontal breathing room while
-    # keeping the direct-peak lane clear. This is intentionally wider than
-    # the old 0.20–0.46 lane for three long pathway labels.
-    tf_x_vals <- setNames(seq(0.14, 0.54, length.out = max(n_tf, 1)), top_tfs)
-
-    # Peak_A follows the sector of its connected TF.
-    peak_a_x_vals <- sapply(all_peak_a, function(pk) {
-      tfs <- unique(t2tf_agg$affected_gene[t2tf_agg$peak_id == pk])
-      tfs <- intersect(tfs, names(tf_x_vals))
-      if (length(tfs) > 0) mean(tf_x_vals[tfs]) else 0.5
-    })
-
-    # Indirect Peak_B follows the sector of its connected TF.
-    indirect_pk_b_ids <- setdiff(all_peak_b, direct_peaks)
-    indirect_pk_b_x <- sapply(indirect_pk_b_ids, function(pk) {
-      tfs <- unique(indirect_agg$tf_name[indirect_agg$peak_id == pk])
-      tfs <- intersect(tfs, names(tf_x_vals))
-      if (length(tfs) > 0) mean(tf_x_vals[tfs]) else 0.34
-    })
-
-    tf_x     <- tf_x_vals
-    peak_a_x <- peak_a_x_vals
-    peak_b_x <- unlist(c(direct_pk_x, indirect_pk_b_x), use.names = TRUE)
-
-  } else if (has_direct && !has_indirect) {
-    # --- Direct only: spread evenly across the middle ---
-    tf_x     <- numeric(0)
-    peak_a_x <- numeric(0)
-    peak_b_x <- setNames(
-      seq(0.30, 0.92, length.out = max(length(all_peak_b), 1)),
-      all_peak_b
-    )
-
-  } else {
-    # --- Indirect only: establish vertical channels by TF to avoid crossings
-    #     caused by independent sorting. ---
-    tf_positions <- if (length(top_tfs) == 1) 0.55 else
-      seq(0.22, 0.78, length.out = length(top_tfs))
-    tf_x <- setNames(tf_positions, top_tfs)
-
-    # Upstream peaks follow the intermediate TFs they regulate; shared peaks
-    # are placed at the midpoint of the related TFs.
-    peak_a_x <- setNames(sapply(all_peak_a, function(pk) {
-      connected_tfs <- t2tf_agg$affected_gene[t2tf_agg$peak_id == pk]
-      connected_tfs <- intersect(unique(connected_tfs), names(tf_x))
-      if (length(connected_tfs) > 0) mean(tf_x[connected_tfs]) else 0.55
-    }), all_peak_a)
-
-    # Downstream peaks likewise follow their source TF, keeping TF→peak paths
-    # essentially vertical.
-    peak_b_x <- setNames(sapply(all_peak_b, function(pk) {
-      connected_tfs <- indirect_agg$tf_name[indirect_agg$peak_id == pk]
-      connected_tfs <- intersect(unique(connected_tfs), names(tf_x))
-      if (length(connected_tfs) > 0) mean(tf_x[connected_tfs]) else 0.55
-    }), all_peak_b)
-  }
-
-  # --- Per-node net effect for up/down arrow annotation ---
-  arrow_up   <- " ▲"
-  arrow_down <- " ▼"
-
-  # Target KO: always down (loss of function)
-  target_arrow <- arrow_down
-
-  # Keep the displayed contribution summary consistent with the subset of edges
-  # drawn below. This is a pathway magnitude, not the source of node direction.
-  direct_display <- direct_agg %>%
-    filter(peak_id %in% direct_peaks)
-  indirect_display <- indirect_agg %>%
-    filter(tf_name %in% top_tfs, peak_id %in% indirect_peaks)
-  gene_pathway_sum <- sum(direct_display$total_effect, na.rm = TRUE) +
-    sum(indirect_display$total_effect, na.rm = TRUE)
-  # Node direction is the final merged RNA response, not the truncated pathway
-  # subset. The same value is printed in the gene log2FC label below.
-  gene_arrow <- if (is.finite(displayed_gene_delta) && displayed_gene_delta > 1e-10) arrow_up else
-    if (is.finite(displayed_gene_delta) && displayed_gene_delta < -1e-10) arrow_down else ""
-
-  # The intermediate-TF node reports the actual signed contribution of its
-  # displayed Target → Peak_A → TF paths, not a synthetic sign product.
-  displayed_route_response <- t2tf_agg %>%
-    filter(affected_gene %in% top_tfs, peak_id %in% all_peak_a) %>%
-    group_by(affected_gene) %>%
-    summarise(pathway_delta = sum(total_effect, na.rm = TRUE), .groups = "drop")
-
-  # Per-peak net effect for Peak_A (target peaks: sum effects going through each peak)
-  peak_a_net <- if (nrow(t2tf_agg) > 0) {
-    t2tf_agg %>%
-      group_by(peak_id) %>%
-      summarise(net_effect = sum(total_effect), .groups = "drop")
-  } else {
-    data.frame(peak_id = character(0), net_effect = numeric(0))
-  }
-  peak_a_arrow <- setNames(
-    rep("", nrow(peak_a_net)),
-    peak_a_net$peak_id
-  )
-
-  # Per-peak net effect for Peak_B (combined direct + indirect effects to gene)
-  peak_b_effects <- data.frame(
-    peak_id = character(0), total_effect = numeric(0),
-    peak_gene_pearson_r = numeric(0),
-    peak_gene_direction_weight = numeric(0)
-  )
-  if (has_direct && nrow(direct_agg) > 0) {
-    peak_b_effects <- rbind(peak_b_effects,
-      direct_agg %>% select(peak_id, total_effect, peak_gene_pearson_r,
-                            peak_gene_direction_weight))
-  }
-  if (has_indirect && nrow(indirect_agg) > 0) {
-    peak_b_effects <- rbind(peak_b_effects,
-      indirect_agg %>% select(peak_id, total_effect, peak_gene_pearson_r,
-                              peak_gene_direction_weight))
-  }
-  peak_b_net <- if (nrow(peak_b_effects) > 0) {
-    peak_b_effects %>%
-      group_by(peak_id) %>%
-      summarise(
-        net_effect = sum(total_effect, na.rm = TRUE),
-        peak_gene_pearson_r = weighted_reg_direction(
-          peak_gene_pearson_r, peak_gene_direction_weight
-        ),
-        .groups = "drop"
-      )
-  } else {
-    data.frame(
-      peak_id = character(0), net_effect = numeric(0),
-      peak_gene_pearson_r = numeric(0)
-    )
-  }
-  peak_b_arrow <- setNames(
-    rep("", nrow(peak_b_net)),
-    peak_b_net$peak_id
-  )
-
-  # =========================================================================
-  # Build edge dataframes (vertical layout)
-  # =========================================================================
-
-  # --- Edge set 1: Target → Peak_A (TF→Peak edge) ---
-  edge_t_pa <- list()
-  if (length(all_peak_a) > 0) {
-    for (j in seq_len(nrow(t2tf_agg))) {
-      e <- t2tf_agg[j, ]
-      pk <- e$peak_id
-      if (!pk %in% names(peak_a_x)) next
-      edge_t_pa[[length(edge_t_pa) + 1]] <- data.frame(
-        x_from = target_x, y_from = y_target,
-        x_to   = peak_a_x[[pk]], y_to   = y_peak_a,
-        effect = e$total_effect,
-        reg_direction = e$tf_peak_weight,
-        clusters = if (!is.null(e$clusters)) e$clusters else "",
-        edge_type = "target_to_peak",
-        stringsAsFactors = FALSE
-      )
-    }
-  }
-
-  # --- Edge set 2: Peak_A → Intermediate TF ---
-  edge_pa_tf <- list()
-  if (length(all_peak_a) > 0 && length(top_tfs) > 0) {
-    for (j in seq_len(nrow(t2tf_agg))) {
-      e <- t2tf_agg[j, ]
-      pk <- e$peak_id
-      tf <- as.character(e$affected_gene)
-      if (!pk %in% names(peak_a_x) || !tf %in% names(tf_x)) next
-      edge_pa_tf[[length(edge_pa_tf) + 1]] <- data.frame(
-        x_from = peak_a_x[[pk]], y_from = y_peak_a,
-        x_to   = tf_x[[tf]], y_to   = y_tf_mid,
-        effect = e$total_effect,
-        reg_direction = e$peak_gene_pearson_r,
-        clusters = if (!is.null(e$clusters)) e$clusters else "",
-        edge_type = "peak_to_tf",
-        stringsAsFactors = FALSE
-      )
-    }
-  }
-
-  # --- Edge set 3: Intermediate TF → Peak_B ---
-  edge_tf_pb <- list()
-  if (has_indirect) {
-    for (j in seq_len(nrow(indirect_agg))) {
-      e <- indirect_agg[j, ]
-      tf <- e$tf_name
-      pk <- e$peak_id
-      if (!tf %in% names(tf_x) || !pk %in% names(peak_b_x)) next
-      edge_tf_pb[[length(edge_tf_pb) + 1]] <- data.frame(
-        x_from = tf_x[[tf]], y_from = y_tf_mid,
-        x_to   = peak_b_x[[pk]], y_to   = y_peak_b,
-        effect = e$total_effect,
-        reg_direction = e$tf_peak_weight,
-        r2     = e$r2_mean,
-        tf_lag = if (!is.null(e$tf_lag_mean) && !is.na(e$tf_lag_mean))
-                 e$tf_lag_mean else NA_real_,
-        clusters = if (!is.null(e$clusters)) e$clusters else "",
-        edge_type = "tf_to_peak",
-        stringsAsFactors = FALSE
-      )
-    }
-  }
-
-  # --- Edge set 4: Target → Peak_B (direct, skip intermediate TF) ---
-  edge_t_pb <- list()
-  if (has_direct) {
-    for (j in seq_len(nrow(direct_agg))) {
-      e <- direct_agg[j, ]
-      pk <- e$peak_id
-      if (!pk %in% names(peak_b_x)) next
-      edge_t_pb[[length(edge_t_pb) + 1]] <- data.frame(
-        x_from = target_x, y_from = y_target,
-        x_to   = peak_b_x[[pk]], y_to   = y_peak_b,
-        effect = e$total_effect,
-        reg_direction = e$tf_peak_weight,
-        r2     = e$r2_mean,
-        tf_lag = if (!is.null(e$tf_lag_mean) && !is.na(e$tf_lag_mean))
-                 e$tf_lag_mean else NA_real_,
-        clusters = if (!is.null(e$clusters)) e$clusters else "",
-        edge_type = "target_to_peak_direct",
-        stringsAsFactors = FALSE
-      )
-    }
-  }
-
-  # --- Edge set 5: Peak_B → Affected Gene ---
-  edge_pb_g <- list()
-  for (pk in all_peak_b) {
-    # Sum effects from both direct and indirect contributions
-    pk_eff <- 0
-    if (has_direct) {
-      pk_eff <- pk_eff + sum(direct_agg$total_effect[direct_agg$peak_id == pk])
-    }
-    if (has_indirect) {
-      pk_eff <- pk_eff + sum(indirect_agg$total_effect[indirect_agg$peak_id == pk])
-    }
-    edge_pb_g[[length(edge_pb_g) + 1]] <- data.frame(
-      x_from = peak_b_x[[pk]], y_from = y_peak_b,
-      x_to   = gene_x, y_to   = y_gene,
-      effect = pk_eff,
-      reg_direction = peak_b_net$peak_gene_pearson_r[
-        match(pk, peak_b_net$peak_id)
-      ],
-      edge_type = "peak_to_gene",
-      stringsAsFactors = FALSE
-    )
-  }
-
-  empty_edge_df <- data.frame(
-    x_from = numeric(0), y_from = numeric(0),
-    x_to = numeric(0), y_to = numeric(0),
-    effect = numeric(0), reg_direction = numeric(0),
-    r2 = numeric(0), tf_lag = numeric(0),
-    clusters = character(0), edge_type = character(0),
-    edge_color = character(0), edge_alpha = numeric(0), edge_lw = numeric(0),
-    stringsAsFactors = FALSE
-  )
-
-  # Combine all edges
-  edge_t_pa_df   <- if (length(edge_t_pa) > 0)   do.call(rbind, edge_t_pa)   else empty_edge_df
-  edge_pa_tf_df  <- if (length(edge_pa_tf) > 0)  do.call(rbind, edge_pa_tf)  else empty_edge_df
-  edge_tf_pb_df  <- if (length(edge_tf_pb) > 0)  do.call(rbind, edge_tf_pb)  else empty_edge_df
-  edge_t_pb_df   <- if (length(edge_t_pb) > 0)   do.call(rbind, edge_t_pb)   else empty_edge_df
-  edge_pb_g_df   <- if (length(edge_pb_g) > 0)   do.call(rbind, edge_pb_g)   else empty_edge_df
-
-  # Stop arrow tips at node boundaries instead of drawing through node centers.
-  trim_edge_ends <- function(df, start_pad = 0.010, end_pad = 0.016) {
-    if (is.null(df) || nrow(df) == 0) return(df)
-    dx <- df$x_to - df$x_from
-    dy <- df$y_to - df$y_from
-    distance <- pmax(sqrt(dx^2 + dy^2), 1e-6)
-    df$x_from <- df$x_from + dx / distance * start_pad
-    df$y_from <- df$y_from + dy / distance * start_pad
-    df$x_to <- df$x_to - dx / distance * end_pad
-    df$y_to <- df$y_to - dy / distance * end_pad
-    df
-  }
-
-  edge_t_pa_df  <- trim_edge_ends(edge_t_pa_df, 0.018, 0.020)
-  edge_pa_tf_df <- trim_edge_ends(edge_pa_tf_df, 0.016, 0.022)
-  edge_tf_pb_df <- trim_edge_ends(edge_tf_pb_df, 0.022, 0.020)
-  edge_t_pb_df  <- trim_edge_ends(edge_t_pb_df, 0.018, 0.022)
-  edge_pb_g_df  <- trim_edge_ends(edge_pb_g_df, 0.012, 0.022)
-
-  # Collect all effects for scaling
-  all_effects <- c(
-    if (!is.null(edge_t_pa_df))  edge_t_pa_df$effect  else 0,
-    if (!is.null(edge_pa_tf_df)) edge_pa_tf_df$effect else 0,
-    if (!is.null(edge_tf_pb_df)) edge_tf_pb_df$effect else 0,
-    if (!is.null(edge_t_pb_df))  edge_t_pb_df$effect  else 0,
-    if (!is.null(edge_pb_g_df))  edge_pb_g_df$effect  else 0
-  )
-  abs_max <- max(abs(all_effects), 1e-6)
-
-  style_edges <- function(df) {
-    if (is.null(df) || nrow(df) == 0) return(empty_edge_df)
-    df %>%
-      mutate(
-        edge_color = case_when(
-          !is.na(reg_direction) & reg_direction > 1e-8 ~ COLORS$edge_pos,
-          !is.na(reg_direction) & reg_direction < -1e-8 ~ COLORS$edge_neg,
-          TRUE ~ "#9CA3AF"
-        ),
-        edge_alpha = pmin(0.72, pmax(0.28, sqrt(abs(effect) / abs_max) * 0.72)),
-        edge_lw    = pmax(0.7, pmin(3.0, sqrt(abs(effect) / abs_max) * 3.0))
-      )
-  }
-
-  edge_t_pa_df  <- style_edges(edge_t_pa_df)
-  edge_pa_tf_df <- style_edges(edge_pa_tf_df)
-  edge_tf_pb_df <- style_edges(edge_tf_pb_df)
-  edge_t_pb_df  <- style_edges(edge_t_pb_df)
-  edge_pb_g_df  <- style_edges(edge_pb_g_df)
-
-  # =========================================================================
-  # Node dataframes (vertical layout)
-  # =========================================================================
-  node_target <- data.frame(
-    x = target_x, y = y_target,
-    label = paste0(target_gene_name, " (KO)", target_arrow),
-    stringsAsFactors = FALSE
-  )
-  response_fill <- function(value) {
-    ifelse(!is.finite(value) | abs(value) <= 1e-10, "#E5E7EB",
-           ifelse(value > 0, "#FADBD8", "#D5E5F2"))
-  }
-
-  node_tfs <- if (length(top_tfs) > 0) {
-    tf_labels <- names(tf_x)
-    # The intermediate-TF node describes only the displayed upstream pathway,
-    # not the TF's global KO response. Use the direction-consistent route
-    # response computed from the per-cluster pathway rows above.
-    tf_pathway_delta <- setNames(
-      sapply(tf_labels, function(tf) {
-        val <- displayed_route_response$pathway_delta[
-          displayed_route_response$affected_gene == tf
-        ]
-        if (length(val) > 0) val[1] else NA_real_
-      }),
-      tf_labels
-    )
-    tf_arrow <- setNames(
-      ifelse(tf_pathway_delta > 0, arrow_up,
-             ifelse(tf_pathway_delta < 0, arrow_down, "")),
-      tf_labels
-    )
-    tf_label_text <- paste0(tf_labels, tf_arrow[tf_labels],
-                            "\ndisplayed path ΔRNA = ",
-                            ifelse(is.na(tf_pathway_delta[tf_labels]),
-                                   "—",
-                                   sprintf("%+.3f", tf_pathway_delta[tf_labels])))
-    # Place labels above the nodes, beyond the incoming edge endpoints. Raise
-    # alternating labels when several TFs share the row to avoid collisions.
-    tf_label_y <- y_tf_mid + 0.09 +
-      ifelse(length(tf_labels) > 1 & seq_along(tf_labels) %% 2 == 0, 0.055, 0)
-    tf_center <- mean(unname(tf_x))
-    tf_label_x <- ifelse(
-      unname(tf_x) < tf_center, unname(tf_x) - 0.075,
-      ifelse(unname(tf_x) > tf_center, unname(tf_x) + 0.075,
-             unname(tf_x) + 0.10)
-    )
-    data.frame(
-      x = unname(tf_x), y = y_tf_mid,
-      label_x = tf_label_x, label_y = tf_label_y,
-      label = tf_label_text,
-      fill = unname(response_fill(ifelse(is.na(tf_pathway_delta),
-                                         0, tf_pathway_delta))),
-      stringsAsFactors = FALSE
-    )
-  } else NULL
-
-  node_peak_a <- if (length(all_peak_a) > 0) {
-    pk_labels <- names(peak_a_x)
-    peak_effect <- abs(peak_a_net$net_effect[match(pk_labels, peak_a_net$peak_id)])
-    peak_effect[is.na(peak_effect)] <- 0
-    data.frame(
-      x = unname(peak_a_x), y = y_peak_a,
-      label = rep("", length(pk_labels)),
-      node_size = 3.2 + 3.0 * sqrt(peak_effect / abs_max),
-      stringsAsFactors = FALSE
-    )
-  } else NULL
-
-  node_peak_b <- if (length(all_peak_b) > 0) {
-    pk_labels <- names(peak_b_x)
-    peak_effect <- abs(peak_b_net$net_effect[match(pk_labels, peak_b_net$peak_id)])
-    peak_effect[is.na(peak_effect)] <- 0
-    data.frame(
-      x = unname(peak_b_x), y = y_peak_b,
-      label = rep("", length(pk_labels)),
-      node_size = 3.2 + 3.0 * sqrt(peak_effect / abs_max),
-      stringsAsFactors = FALSE
-    )
-  } else NULL
-
-  node_gene <- data.frame(
-    x = gene_x, y = y_gene,
-    label = if (is.null(cluster_filter)) {
-      sprintf("%s%s\nglobal KO log2FC = %+.2f", gene_name, gene_arrow, delta_total)
-    } else {
-      sprintf("%s%s\nCluster %s ΔRNA = %+.2f", gene_name, gene_arrow,
-              cluster_filter, ifelse(is.null(cluster_effect), NA_real_, cluster_effect))
-    },
-    # Response fill is the cluster RNA effect, not intrinsic edge direction.
-    fill  = response_fill(displayed_gene_delta),
-    stringsAsFactors = FALSE
-  )
-
-  # =========================================================================
-  # Draw (vertical layout)
-  # =========================================================================
-  # Row background rects
-  rects <- list(
-    annotate("rect", xmin = 0.03, xmax = 0.97, ymin = 0.87, ymax = 0.99,
-             fill = "white", color = NA),
-    annotate("rect", xmin = 0.03, xmax = 0.97, ymin = 0.66, ymax = 0.78,
-             fill = "white", color = NA),
-    annotate("rect", xmin = 0.03, xmax = 0.97, ymin = 0.42, ymax = 0.58,
-             fill = "white", color = NA),
-    annotate("rect", xmin = 0.03, xmax = 0.97, ymin = 0.22, ymax = 0.34,
-             fill = "white", color = NA),
-    annotate("rect", xmin = 0.03, xmax = 0.97, ymin = 0.01, ymax = 0.13,
-             fill = "white", color = NA)
-  )
-
-  p <- ggplot() +
-    rects +
-    # --- Edges: Target → Peak_A ---
-    geom_segment(
-      data = edge_t_pa_df,
-      aes(x = x_from, y = y_from, xend = x_to, yend = y_to,
-          color = edge_color, linewidth = edge_lw, alpha = edge_alpha),
-      arrow = arrow(length = unit(0.06, "inches"), type = "closed"),
-      lineend = "round",
-      show.legend = FALSE
-    ) +
-    # --- Edges: Peak_A → Intermediate TF ---
-    geom_segment(
-      data = edge_pa_tf_df,
-      aes(x = x_from, y = y_from, xend = x_to, yend = y_to,
-          color = edge_color, linewidth = edge_lw, alpha = edge_alpha),
-      arrow = arrow(length = unit(0.06, "inches"), type = "closed"),
-      lineend = "round",
-      show.legend = FALSE
-    ) +
-    # --- Edges: Target → Peak_B (direct, dashed to distinguish) ---
-    geom_segment(
-      data = edge_t_pb_df,
-      aes(x = x_from, y = y_from, xend = x_to, yend = y_to,
-          color = edge_color, linewidth = edge_lw, alpha = edge_alpha),
-      arrow = arrow(length = unit(0.06, "inches"), type = "closed"),
-      lineend = "round", show.legend = FALSE
-    ) +
-    # --- Edges: Intermediate TF → Peak_B ---
-    geom_segment(
-      data = edge_tf_pb_df,
-      aes(x = x_from, y = y_from, xend = x_to, yend = y_to,
-          color = edge_color, linewidth = edge_lw, alpha = edge_alpha),
-      arrow = arrow(length = unit(0.06, "inches"), type = "closed"),
-      lineend = "round",
-      show.legend = FALSE
-    ) +
-    # --- Edges: Peak_B → Gene (arrow) ---
-    geom_segment(
-      data = edge_pb_g_df,
-      aes(x = x_from, y = y_from, xend = x_to, yend = y_to,
-          color = edge_color, linewidth = edge_lw, alpha = edge_alpha),
-      arrow = arrow(length = unit(0.07, "inches"), type = "closed"),
-      lineend = "round",
-      show.legend = FALSE
-    ) +
-    scale_color_identity() +
-    scale_alpha_identity() +
-    scale_linewidth_identity() +
-    scale_size_identity() +
-    scale_fill_identity()
-
-  # --- Target node (KO target gene) ---
-  p <- p +
-    geom_point(
-      data = node_target, aes(x, y), size = 10,
-      shape = 21, fill = COLORS$target, color = COLORS$target_2,
-      stroke = 1.3, show.legend = FALSE
-    ) +
-    geom_label(
-      data = node_target, aes(x, y, label = label),
-      size = 4.4, fontface = "bold", color = COLORS$ink,
-      fill = scales::alpha("white", 0.90), linewidth = 0,
-      label.r = unit(0.14, "lines"), label.padding = unit(0.10, "lines"),
-      nudge_y = 0.045, lineheight = 0.85
-    )
-
-  # --- Intermediate TF nodes ---
-  if (!is.null(node_tfs) && nrow(node_tfs) > 0) {
-    p <- p +
-      geom_point(
-        data = node_tfs, aes(x, y, fill = fill), size = 7.0,
-        shape = 21, color = COLORS$tf,
-        stroke = 1.0, show.legend = FALSE
-      ) +
-      geom_label(
-        data = node_tfs, aes(label_x, label_y, label = label),
-        size = if (nrow(node_tfs) > 2) 3.5 else 3.8,
-        fontface = "italic", color = COLORS$ink,
-        fill = scales::alpha("white", 0.88), linewidth = 0,
-        label.r = unit(0.10, "lines"), label.padding = unit(0.055, "lines"),
-        hjust = 0.5
-      )
-  }
-
-  # --- Peak A nodes (target-regulated peaks) ---
-  if (!is.null(node_peak_a) && nrow(node_peak_a) > 0) {
-    p <- p +
-      geom_point(
-        data = node_peak_a, aes(x, y, size = node_size),
-        shape = 21, fill = COLORS$peak, color = "#95A5A6",
-        stroke = 0.70, show.legend = FALSE
-      )
-  }
-
-  # --- Peak B nodes (TF-regulated peaks) ---
-  if (!is.null(node_peak_b) && nrow(node_peak_b) > 0) {
-    p <- p +
-      geom_point(
-        data = node_peak_b, aes(x, y, size = node_size),
-        shape = 21, fill = COLORS$peak, color = "#95A5A6",
-        stroke = 0.70, show.legend = FALSE
-      )
-  }
-
-  # --- Affected gene node ---
-  p <- p +
-    geom_label(
-      data = node_gene, aes(x, y, label = label, fill = fill),
-      size = 4.6, fontface = "bold", color = COLORS$ink,
-      linewidth = 0.40,
-      label.r = unit(0.16, "lines"),
-      label.padding = unit(0.18, "lines"), lineheight = 0.9,
-      show.legend = FALSE
-    )
-
-  # --- Row headers (vertical layout) ---
-  # Keep headers in a real left gutter, outside even the widest intermediate
-  # TF/peak lane. The expanded x range prevents text clipping at export.
-  header_x <- -0.20
-  p <- p +
-    annotate("text", x = header_x, y = y_target, label = "KO Target",
-             fontface = "bold", size = 5.0, color = COLORS$muted, hjust = 0) +
-    annotate("text", x = header_x, y = y_peak_a, label = "Target Peak",
-             fontface = "bold", size = 5.0, color = COLORS$muted, hjust = 0) +
-    annotate("text", x = header_x, y = y_tf_mid, label = "Intermediate TF",
-             fontface = "bold", size = 5.0, color = COLORS$muted, hjust = 0) +
-    annotate("text", x = header_x, y = y_peak_b, label = "TF Peak",
-             fontface = "bold", size = 5.0, color = COLORS$muted, hjust = 0) +
-    annotate("text", x = header_x, y = y_gene,   label = "Affected Gene",
-             fontface = "bold", size = 5.0, color = COLORS$muted, hjust = 0)
-
-  if (has_direct && has_indirect) {
-    p <- p +
-      annotate("segment", x = 0.57, xend = 0.57, y = 0.18, yend = 0.84,
-               linewidth = 0.35, linetype = "dotted", color = COLORS$grid)
-  }
-
-  # --- Place the legend at the bottom center ---
-  p <- p +
-    annotate("point", x = 0.35, y = 0.02, size = 2.0, color = COLORS$edge_pos) +
-    annotate("text", x = 0.38, y = 0.02, label = "Positive",
-             size = 3.5, color = COLORS$edge_pos, hjust = 0) +
-    annotate("point", x = 0.55, y = 0.02, size = 2.0, color = COLORS$edge_neg) +
-    annotate("text", x = 0.58, y = 0.02, label = "Negative",
-             size = 3.5, color = COLORS$edge_neg, hjust = 0) +
-    annotate("point", x = 0.76, y = 0.02, size = 2.0, color = "#9CA3AF") +
-    annotate("text", x = 0.79, y = 0.02, label = "Uncertain",
-             size = 3.5, color = "#6B7280", hjust = 0)
-
-  p <- p +
-    xlim(-0.25, 1) + ylim(0, 1) +
-    labs(
-      title = if (show_main_title) {
-        if (is.null(panel_title)) paste0(target_gene_name, " KO — Regulatory Pathway: ", gene_name)
-        else panel_title
-      } else {
-        NULL
-      },
-      subtitle = paste(
-        "Edge color = intrinsic regulatory direction;",
-        "intermediate labels = displayed-path contributions;",
-        "final gene = global merged RUNX1-KO RNA response"
-      )
-    ) +
-    theme_void() +
-    theme(
-      plot.title    = element_text(face = "bold", size = 20,
-                                   hjust = 0.5, color = COLORS$ink, margin = margin(b = 4)),
-
-      plot.subtitle = element_text(size = 11, hjust = 0.5, color = COLORS$muted),
-	      plot.background = element_rect(fill = "white", color = NA, linewidth = 0),
-	      plot.margin   = margin(8, 12, 8, 28)
-	    )
-
-  return(p)
-}
-
-# Compose the original vertical pathway plot once per cluster, followed by a
-# compact global result card; the familiar pathway diagram remains unchanged.
-plot_cluster_pathway_figure <- function(gene_name, pw_df, cluster_res, merged_df) {
-  effects <- cluster_res %>% filter(affected_gene == gene_name, is.finite(delta_rna)) %>%
-    mutate(cluster = as.character(cluster)) %>% group_by(cluster) %>%
-    summarise(cluster_effect = mean(delta_rna), .groups = "drop")
-  available <- pw_df %>% filter(affected_gene == gene_name, !is.na(cluster),
-    is.finite(delta_r_raw_sum), abs(delta_rna_log2fc) > 1e-10) %>%
-    mutate(cluster = as.character(cluster)) %>% pull(cluster) %>% unique()
-  clusters <- sort(intersect(effects$cluster, available))
-  if (!length(clusters)) clusters <- sort(effects$cluster)
-  panels <- lapply(clusters, function(cl) {
-    effect <- effects$cluster_effect[match(cl, effects$cluster)]
-    plot_single_pathway(gene_name, pw_df, merged_df, show_main_title = TRUE,
-      cluster_filter = cl, cluster_effect = effect,
-      panel_title = paste0(target_gene_name, " KO — Cluster ", cl,
-                           " Regulatory Pathway: ", gene_name))
-  })
-  global_value <- merged_df$delta_rna_signed[merged_df$affected_gene == gene_name]
-  global_label <- paste0(gene_name, "\nperturbation_merged.csv\nΔRNA = ",
-    if (length(global_value) && is.finite(global_value[1]))
-      sprintf("%+.2f", global_value[1]) else "—")
-  global_panel <- ggplot() +
-    annotate("text", .5, .78, label = "GLOBAL WEIGHTED OUTCOME",
-      size = 5.0, fontface = "bold", color = COLORS$ink) +
-    annotate("text", .5, .45, label = global_label, size = 4.6,
-      fontface = "bold", color = COLORS$ink, lineheight = .92) +
-    annotate("text", .5, .10,
-      label = "Weighted merged result from perturbation_merged.csv",
-      size = 3.2, color = COLORS$muted) +
-    coord_cartesian(xlim = c(0, 1), ylim = c(0, 1), clip = "off") +
-    theme_void() + theme(plot.background = element_rect(fill = "#D5E5F2", color = NA),
-                          plot.margin = margin(8, 12, 8, 12))
-  wrap_plots(c(panels, list(global_panel)), ncol = 1,
-             heights = c(rep(1, length(panels)), .48))
-}
+# 手动指定或按保存的有符号效应绝对值自动选择；内部始终使用稳定 ID。
+pathway_genes <- vis_select_pathway_genes(pert_merged, specified_genes)
+cat(sprintf("%s genes: %s\n", if (is.null(specified_genes)) "Auto-selected" else "Specified",
+            paste(pathway_genes, collapse = ", ")))
 
 # Explicit Cartesian radial hierarchy. Angles are used only to construct
 # annular polygons; this deliberately does not use coord_polar().
 plot_radial_cluster_pathway <- function(gene_name, pw_df, cluster_res, merged_df,
                                          max_routes_per_cluster = 3) {
+  pw_df <- vis_layout_pathways(pw_df)
   epsilon <- 1e-10
-  target <- unique(merged_df$target_gene)[1]
-  target_names <- unique(trimws(unlist(strsplit(target, "[,+]"))))
-  target_names <- target_names[nzchar(target_names)]
-  target_label <- paste(target_names, collapse = " + ")
+  target_names <- vis_targets(merged_df)$ids
+  target_label <- paste(vis_targets(merged_df)$names, collapse = " + ")
   response_fill <- function(x) {
     if (!is.finite(x) || abs(x) <= epsilon) "#E5E7EB" else
       if (x > 0) "#FADBD8" else "#D5E5F2"
@@ -1289,17 +497,17 @@ plot_radial_cluster_pathway <- function(gene_name, pw_df, cluster_res, merged_df
   # coefficients retained for intrinsic direction coloring.
   edge_summary <- function(df, by) {
     df %>% group_by(across(all_of(by))) %>% summarise(
-      effect = sum(delta_r_raw_sum, na.rm = TRUE),
-      contribution = sum(abs(delta_r_raw_sum), na.rm = TRUE),
-      tf_coef = weighted_direction(tf_peak_weight, delta_r_raw_sum),
-      gene_coef = weighted_direction(peak_gene_pearson_r, delta_r_raw_sum),
+      effect = sum(plot_pathway_weight, na.rm = TRUE),
+      contribution = sum(abs(plot_pathway_weight), na.rm = TRUE),
+      tf_coef = weighted_direction(tf_peak_weight, plot_pathway_weight),
+      gene_coef = weighted_direction(peak_gene_pearson_r, plot_pathway_weight),
       .groups = "drop") %>% filter(is.finite(effect), is.finite(contribution))
   }
   target_edges <- pw_df %>% filter(tf_name %in% target_names,
-    affected_gene != gene_name, !is.na(cluster), is.finite(delta_r_raw_sum)) %>%
+    affected_gene != gene_name, !is.na(cluster), is.finite(plot_pathway_weight)) %>%
     mutate(cluster = as.character(cluster), tf_name = as.character(tf_name))
   direct <- pw_df %>% filter(affected_gene == gene_name,
-    tf_name %in% target_names, !is.na(cluster), is.finite(delta_r_raw_sum)) %>%
+    tf_name %in% target_names, !is.na(cluster), is.finite(plot_pathway_weight)) %>%
     mutate(cluster = as.character(cluster)) %>%
     edge_summary(c("cluster", "peak_id")) %>% mutate(
       tf_name = target_names[1], direct = TRUE, upstream_tf_coef = tf_coef,
@@ -1310,7 +518,7 @@ plot_radial_cluster_pathway <- function(gene_name, pw_df, cluster_res, merged_df
            upstream_effect = effect, upstream_contribution = contribution,
            upstream_tf_coef = tf_coef, upstream_gene_coef = gene_coef)
   downstream <- pw_df %>% filter(affected_gene == gene_name,
-    !tf_name %in% target_names, !is.na(cluster), is.finite(delta_r_raw_sum)) %>%
+    !tf_name %in% target_names, !is.na(cluster), is.finite(plot_pathway_weight)) %>%
     mutate(cluster = as.character(cluster), tf_name = as.character(tf_name)) %>%
     edge_summary(c("cluster", "tf_name", "peak_id")) %>%
     rename(intermediate = tf_name, peak_b = peak_id,
@@ -1466,17 +674,8 @@ plot_radial_cluster_pathway <- function(gene_name, pw_df, cluster_res, merged_df
       match(cl, cluster_effects$cluster)]
     has_route <- cl %in% routes$cluster
     if (!length(eff) || !is.finite(eff)) {
-      # A retained route is evidence of a modeled terminal even when the
-      # observed delta_rna result is unavailable; render that terminal at
-      # ordinary near-zero rather than labeling it Missing.
-      if (has_route) {
-        eff <- 0
-        fill <- response_fill(eff); border <- COLORS$ink
-        status <- "near-zero"
-      } else {
-        fill <- "white"; border <- COLORS$muted
-        status <- "missing"
-      }
+      fill <- "white"; border <- COLORS$muted
+      status <- "missing"
       terminal_r0 <- layer_inner(cl, "terminal"); outer_r <- layer_outer(cl, "terminal")
     } else {
       if (abs(eff) <= epsilon) {
@@ -1579,7 +778,7 @@ plot_radial_cluster_pathway <- function(gene_name, pw_df, cluster_res, merged_df
   canonical_nodes <- canonical_nodes %>% left_join(id_table,
     by = c("node_type", "full_id"))
   canonical_nodes$label <- ifelse(canonical_nodes$node_type == "intermediate_tf",
-    canonical_nodes$full_id, canonical_nodes$display_id)
+    vis_label(canonical_nodes$full_id), canonical_nodes$display_id)
   canonical_nodes$lookup <- node_key(canonical_nodes$cluster,
     canonical_nodes$node_type, canonical_nodes$full_id)
   canonical_lookup <- split(seq_len(nrow(canonical_nodes)), canonical_nodes$lookup)
@@ -1734,7 +933,7 @@ plot_radial_cluster_pathway <- function(gene_name, pw_df, cluster_res, merged_df
     all(node_labels$label_chars * .0065 * node_labels$label_size <= node_labels$safe_arc + 1e-9),
     all(node_labels$label_lines * .012 * node_labels$label_size <= node_labels$safe_radial + 1e-9),
     all(ifelse(node_labels$node_type == "intermediate_tf",
-      node_labels$label == node_labels$full_id,
+      node_labels$label == vis_label(node_labels$full_id),
       node_labels$label == node_labels$display_id)),
     all(node_labels$label_chars * .0065 * node_labels$label_size <=
       (node_labels$a1 - node_labels$a0) * node_labels$label_r + 1e-9),
@@ -1764,7 +963,7 @@ plot_radial_cluster_pathway <- function(gene_name, pw_df, cluster_res, merged_df
   bus_y <- cy - body_outer_r - .16
   card_top <- bus_y - .04
   card_label_lines <- c("GLOBAL WEIGHTED OUTCOME",
-    paste0("ΔRNA = ", if (is.na(global)) "—" else sprintf("%+.2f", global)))
+    paste0(unique(merged_df$effect_unit)[1], " = ", if (is.na(global)) "—" else sprintf("%+.2f", global)))
   # Size the rectangle from the actual multiline content. The conservative
   # glyph-width and line-step constants are in plot data units for the fixed
   # ggsave device; wrapping is deterministic so a future source/explanation
@@ -1786,7 +985,6 @@ plot_radial_cluster_pathway <- function(gene_name, pw_df, cluster_res, merged_df
   side_x_abs <- body_outer_r + .16
   port_span <- min(.40, max(.20, .055 * max(nrow(observed_terminals), 1)))
   legend_y <- card_bottom - .055
-  response_note_y <- card_bottom - .145
   legend_x_pos <- -body_outer_r
   legend_x_neg <- legend_x_pos + .36
   legend_x_unc <- legend_x_neg + .36
@@ -1885,8 +1083,6 @@ plot_radial_cluster_pathway <- function(gene_name, pw_df, cluster_res, merged_df
     annotate("point", legend_x_unc, legend_y, size = 2.1, color = COLORS$muted) +
     annotate("text", legend_x_unc + .04, legend_y, label = "Uncertain", hjust = 0,
              size = 3.2, color = COLORS$muted) +
-    annotate("text", body_outer_r, response_note_y, label = "terminal/card fill = actual RNA response",
-             hjust = 1, size = 2.9, color = COLORS$muted) +
     scale_color_manual(values = c(Positive = COLORS$edge_pos,
       Negative = COLORS$edge_neg, Uncertain = COLORS$muted,
       `#2C3E50` = COLORS$ink, `#7F8C8D` = COLORS$muted,
@@ -1895,8 +1091,7 @@ plot_radial_cluster_pathway <- function(gene_name, pw_df, cluster_res, merged_df
     scale_size_identity() +
     coord_fixed(xlim = c(-body_outer_r - .20, body_outer_r + .20),
                  ylim = c(card_bottom - .20, cy + max_body_r + .10), clip = "off") +
-    labs(title = paste0(target_label, " KO — Radial Cluster Pathway: ", gene_name),
-         subtitle = "Direct KO→gene propagation uses curved edges; intrinsic direction is separate from cluster RNA response") +
+    labs(title = paste0(target_label, " KO — Radial Cluster Pathway: ", vis_label(gene_name))) +
     theme_void() + theme(plot.title = element_text(face = "bold", size = 20,
       hjust = .5, color = COLORS$ink), plot.subtitle = element_text(size = 11,
       hjust = .5, color = COLORS$muted), plot.margin = margin(10, 14, 12, 14),
@@ -1904,7 +1099,7 @@ plot_radial_cluster_pathway <- function(gene_name, pw_df, cluster_res, merged_df
   legend_df <- id_table %>% filter(node_type != "intermediate_tf") %>% transmute(
     id = display_id,
     y = rev(seq_len(n())),
-    label = paste0(display_id, "  ", role, " · ", full_id))
+    label = paste0(display_id, "  ", role, " · ", vis_label(full_id)))
   if (!nrow(legend_df)) legend_df <- data.frame(id = character(), y = numeric(), label = character())
   legend_plot <- ggplot(legend_df, aes(x = 0, y = y, label = label)) +
     geom_text(hjust = 0, vjust = .5, size = 2.9, color = COLORS$ink) +
@@ -1927,7 +1122,7 @@ n_genes <- length(pathway_plots)
 p_pathways <- wrap_plots(pathway_plots, ncol = 1, nrow = n_genes)
 
 pathway_file <- file.path(OUTPUT_DIR,
-  if (is.null(specified_genes)) "pathway_top5.png" else "pathway_specified.png")
+  if (is.null(specified_genes)) paste0("pathway_top", TOP_PATHWAY_N, ".png") else "pathway_specified.png")
 
 ggsave(
   pathway_file,
@@ -2169,6 +1364,7 @@ mat_melt$delta_capped <- pmax(-cap_val, pmin(cap_val, mat_melt$delta_rna))
 
 p_heat <- ggplot(mat_melt, aes(x = cluster, y = gene, fill = delta_capped)) +
   geom_tile(color = "white", linewidth = 0.45) +
+  scale_y_discrete(labels = vis_label) +
   scale_fill_gradient2(
     low = COLORS$down, mid = "white", high = COLORS$up,
     midpoint = 0, limits = c(-cap_val, cap_val), oob = scales::squish,
@@ -2178,6 +1374,7 @@ p_heat <- ggplot(mat_melt, aes(x = cluster, y = gene, fill = delta_capped)) +
   ) +
   labs(
     title = paste0(target_gene_name, " KO: Cross-Cluster Differential Effects"),
+    subtitle = unique(pert_res$effect_unit)[1],
     x = NULL, y = NULL
   ) +
   theme_pub(base_size = 14) +
@@ -2213,7 +1410,7 @@ if (!file.exists(atac_changes_path)) {
   atac_changes <- read.csv(atac_changes_path, stringsAsFactors = FALSE)
   required_atac_cols <- c(
     "peak_id", "chr", "start", "end", "delta_accessibility_signed",
-    "delta_accessibility", "n_clusters_observed", "z_score", "is_significant"
+    "delta_accessibility", "n_clusters_observed", "z_score"
   )
   missing_atac_cols <- setdiff(required_atac_cols, names(atac_changes))
 
@@ -2338,53 +1535,80 @@ if (!file.exists(atac_changes_path)) {
       mutate(
         delta_accessibility_signed = as.numeric(delta_accessibility_signed),
         change = case_when(
-          delta_accessibility_signed > 0.01 ~ "Open",
-          delta_accessibility_signed < -0.01 ~ "Close",
+          is.na(delta_accessibility_signed) ~ "Missing",
+          is.finite(delta_accessibility_signed) &
+            delta_accessibility_signed > 0.01 ~ "Open",
+          is.finite(delta_accessibility_signed) &
+            delta_accessibility_signed < -0.01 ~ "Close",
           TRUE ~ "Stable"
         ),
-        change = factor(change, levels = c("Open", "Close", "Stable"))
+        change = factor(change, levels = c("Open", "Close", "Stable", "Missing"))
       )
-    atac_counts <- atac_distribution %>% count(change, .drop = FALSE)
+    # Share the exact plotting rules and styling between all and significant peaks.
+    save_atac_distribution <- function(atac_distribution, output_filename, title) {
+    atac_counts <- atac_distribution %>%
+      filter(change %in% c("Open", "Close", "Stable")) %>%
+      mutate(change = factor(change, levels = c("Open", "Close", "Stable"))) %>%
+      count(change, .drop = FALSE)
     cat(sprintf(
       "ATAC peak counts: Open=%d, Close=%d, Stable=%d\n",
       atac_counts$n[atac_counts$change == "Open"],
       atac_counts$n[atac_counts$change == "Close"],
       atac_counts$n[atac_counts$change == "Stable"]
     ))
-    atac_median <- median(
-      atac_distribution$delta_accessibility_signed, na.rm = TRUE
-    )
+
+    # Stable peaks do not participate in the left histogram; missing and
+    # non-finite signed effects are excluded there. Compress the excluded stable
+    # interval only for plotting so Open/Close effects meet around zero.
+    atac_hist_data <- atac_distribution %>%
+      filter(
+        change %in% c("Open", "Close"),
+        is.finite(delta_accessibility_signed)
+      ) %>%
+      mutate(
+        hist_effect = sign(delta_accessibility_signed) *
+          (abs(delta_accessibility_signed) - 0.01)
+      )
+    atac_median <- if (nrow(atac_hist_data) > 0) {
+      median(atac_hist_data$hist_effect)
+    } else {
+      NA_real_
+    }
 
     p_atac_hist <- ggplot(
-      atac_distribution,
-      aes(x = delta_accessibility_signed)
+      atac_hist_data,
+      aes(x = hist_effect)
     ) +
-      geom_histogram(
-        aes(fill = after_stat(x >= 0)), bins = 80,
-        color = "white", alpha = 0.88
-      ) +
-      scale_fill_manual(
-        values = c(`TRUE` = COLORS$up, `FALSE` = COLORS$down),
-        guide = "none"
-      ) +
-      geom_vline(xintercept = 0, linewidth = 0.5, color = COLORS$ink) +
-      geom_vline(
-        xintercept = atac_median,
-        linetype = "dashed", color = COLORS$up, linewidth = 0.8
-      ) +
-      annotate("text", x = 0, y = Inf, label = "zero", vjust = 1.4,
-               hjust = 1.15, size = 3.4, color = COLORS$ink) +
-      annotate(
-        "text", x = atac_median, y = Inf,
-        label = sprintf("median = %.3f", atac_median),
-        vjust = 2.8, hjust = -0.08, size = 3.4, color = COLORS$up
-      ) +
       labs(
         x = expression(Delta * " ATAC accessibility (signed)"),
         y = "Number of peaks"
       ) +
       theme_pub(base_size = 16) +
       theme(panel.grid.major.x = element_blank())
+
+    if (nrow(atac_hist_data) > 0) {
+      p_atac_hist <- p_atac_hist +
+        geom_histogram(
+          aes(fill = after_stat(x >= 0)), bins = 80,
+          color = "white", alpha = 0.88
+        ) +
+        scale_fill_manual(
+          values = c(`TRUE` = COLORS$up, `FALSE` = COLORS$down),
+          guide = "none"
+        )
+    }
+    if (is.finite(atac_median)) {
+      p_atac_hist <- p_atac_hist +
+        geom_vline(
+          xintercept = atac_median,
+          linetype = "dashed", color = COLORS$up, linewidth = 0.8
+        ) +
+        annotate(
+          "text", x = atac_median, y = Inf,
+          label = sprintf("median = %.3f", atac_median),
+          vjust = 2.8, hjust = -0.08, size = 3.4, color = COLORS$up
+        )
+    }
 
     p_atac_bar <- atac_counts %>%
       ggplot(aes(x = change, y = n, fill = change)) +
@@ -2408,8 +1632,7 @@ if (!file.exists(atac_changes_path)) {
     p_atac_distribution <- p_atac_hist + p_atac_bar +
       plot_layout(widths = c(2, 1)) +
       plot_annotation(
-        title = paste0(target_gene_name,
-                       " KO: ATAC Accessibility Effect Distribution"),
+        title = title,
         theme = theme(
           plot.title = element_text(
             face = "bold", size = 18, hjust = 0.5, color = COLORS$ink
@@ -2417,13 +1640,39 @@ if (!file.exists(atac_changes_path)) {
         )
       )
 
-    atac_distribution_file <- file.path(OUTPUT_DIR, "atac_distribution.png")
+    atac_distribution_file <- file.path(OUTPUT_DIR, output_filename)
     ggsave(
       atac_distribution_file, p_atac_distribution,
       width = 14, height = 5.5, dpi = 320, bg = "white"
     )
     cat(sprintf("[OK] ATAC distribution plot saved: %s\n",
                 atac_distribution_file))
+    }
+
+    save_atac_distribution(
+      atac_distribution, "atac_distribution.png",
+      paste0(target_gene_name, " KO: ATAC Accessibility Effect Distribution")
+    )
+
+    if (!"is_significant" %in% names(atac_distribution)) {
+      warning("ATAC accessibility file is missing is_significant; skipping significant ATAC distribution plot")
+    } else {
+      # read.csv may infer logical, character, or numeric flags. Missing and
+      # unrecognized values are not significant; preserve the source column.
+      significant_rows <- tolower(trimws(as.character(
+        atac_distribution$is_significant
+      ))) %in% c("true", "1", "yes")
+      cat(sprintf(
+        "Significant ATAC peaks: %d of %d source rows\n",
+        sum(significant_rows), nrow(atac_distribution)
+      ))
+      save_atac_distribution(
+        atac_distribution[significant_rows, , drop = FALSE],
+        "atac_distribution_significant.png",
+        paste0(target_gene_name,
+               " KO: Significant ATAC Accessibility Effect Distribution")
+      )
+    }
   }
 }
 
@@ -2432,17 +1681,18 @@ if (!file.exists(atac_changes_path)) {
 cat("\n--- TF regulatory hierarchy ---\n")
 
 # Identify intermediate TFs: affected_genes that also act as TFs
+hierarchy_pathways <- vis_layout_pathways(pathways)
 all_tfs <- unique(tf_weights$tf_gene)
-pathways_tf <- pathways %>%
+pathways_tf <- hierarchy_pathways %>%
   filter(tf_name %in% all_tfs | affected_gene %in% all_tfs)
 
 # target → intermediate TF: aggregate across all clusters
-target_to_tf <- pathways %>%
+target_to_tf <- hierarchy_pathways %>%
   filter(tf_name %in% target_gene_names, affected_gene %in% all_tfs,
          !affected_gene %in% target_gene_names) %>%
   group_by(affected_gene) %>%
   summarise(
-    total_effect = sum(delta_r_total),
+    total_effect = sum(plot_hierarchy_weight),
     n_peaks      = n_distinct(peak_id),
     mean_r2      = mean(r2_score_first),
     .groups      = "drop"
@@ -2451,11 +1701,11 @@ target_to_tf <- pathways %>%
 
 # Rank intermediate TFs by joint target→TF and TF→gene contribution.
 # First aggregate every candidate TF's downstream effects, before truncating to top N.
-downstream_contribution <- pathways %>%
+downstream_contribution <- hierarchy_pathways %>%
   filter(tf_name %in% target_to_tf$affected_gene,
          !affected_gene %in% target_gene_names) %>%
   group_by(tf_name, affected_gene) %>%
-  summarise(gene_effect = sum(delta_r_total), .groups = "drop") %>%
+  summarise(gene_effect = sum(plot_hierarchy_weight), .groups = "drop") %>%
   group_by(tf_name) %>%
   summarise(
     downstream_contribution = sum(abs(gene_effect)),
@@ -2476,7 +1726,6 @@ target_to_tf <- target_to_tf %>%
 
 # Keeping only the strongest joint contributors prevents tiny sunburst sectors
 # from becoming unreadable.
-TOP_TF_N <- 5
 top_tfs <- target_to_tf %>% head(TOP_TF_N)
 
 cat(sprintf("Top %d intermediate TFs by joint contribution: %s\n", TOP_TF_N,
@@ -2484,20 +1733,19 @@ cat(sprintf("Top %d intermediate TFs by joint contribution: %s\n", TOP_TF_N,
                           top_tfs$joint_contribution), collapse = ", ")))
 
 # For each top TF, get its top downstream genes
-MIN_EFFECT_TF <- 0.005  # remove downstream genes with negligible effect
 downstream <- lapply(seq_len(nrow(top_tfs)), function(i) {
   tf <- top_tfs$affected_gene[i]
-  pathways %>%
+  hierarchy_pathways %>%
     filter(tf_name == tf, !affected_gene %in% target_gene_names) %>%
     group_by(affected_gene) %>%
     summarise(
-      total_effect = sum(delta_r_total),
+      total_effect = sum(plot_hierarchy_weight),
       mean_r2      = mean(r2_score_first),
       .groups      = "drop"
     ) %>%
     filter(abs(total_effect) > MIN_EFFECT_TF) %>%   # drop negligible-effect genes
     arrange(desc(abs(total_effect))) %>%
-    head(4) %>%
+    head(TOP_DOWNSTREAM_N) %>%
     mutate(source_tf = tf)
 })
 
@@ -2531,7 +1779,9 @@ GENE_LABEL_MIN_ARC <- 0.050
 
 if (nrow(top_tfs) == 0 || nrow(downstream_df) == 0) {
   p_net <- ggplot() +
-    annotate("text", x = 0.5, y = 0.5, label = "No TF hierarchy after filtering",
+    annotate("text", x = 0.5, y = 0.5, label = if (!any(is.finite(pathways$delta_r_raw_sum)))
+               "No saved RNA pathway or shared peak response contributions"
+             else "No TF hierarchy after filtering",
              size = 8, color = COLORS$muted, fontface = "bold") +
     labs(title = paste0(target_gene_name, " KO — TF Regulatory Hierarchy")) +
     theme_void() +
@@ -2582,7 +1832,7 @@ if (nrow(top_tfs) == 0 || nrow(downstream_df) == 0) {
 	      xmin = 1.22,
 	      xmax = 2.05,
 	      fill = make_color(tf_effect),
-	      label = sprintf("%s\nJ=%.2f", source_tf, tf_joint),
+	      label = sprintf("%s\nJ=%.2f", vis_label(source_tf), tf_joint),
 	      angle = 0,
 	      hjust = 0.5,
 	      label_size = pmax(3.0, pmin(5.0, 5.0 * sqrt(arc / 0.10)))
@@ -2604,7 +1854,7 @@ if (nrow(top_tfs) == 0 || nrow(downstream_df) == 0) {
 	      xmax = 3.05,
 	      fill = lighten_color(make_color(gene_effect), 0.42),
 	      arc = ymax - ymin,
-	      label = ifelse(shared_target, paste0(affected_gene, "*"), affected_gene),
+	      label = ifelse(shared_target, paste0(vis_label(affected_gene), "*"), vis_label(affected_gene)),
 	      angle = 0,
 	      hjust = 0.5,
 	      label_size = pmax(2.0, pmin(3.2, 3.2 * sqrt(arc / 0.035)))
@@ -2678,7 +1928,7 @@ pseudotime_path <- file.path(RESULT_DIR, "intermediate", "pseudotime.csv")
 if (file.exists(rna_h5ad_path) && file.exists(pseudotime_path)) {
   if (!HAS_ANNDATA) {
     stop(
-      "The UMAP effect plot requires the R package anndata. After installation, set RETICULATE_PYTHON to an environment containing Python anndata."
+      "UMAP effect 图需要 R 包 anndata。安装后请设置 RETICULATE_PYTHON 指向包含 Python anndata 的环境。"
     )
   }
   adata <- anndata::read_h5ad(rna_h5ad_path)
@@ -2693,7 +1943,7 @@ if (file.exists(rna_h5ad_path) && file.exists(pseudotime_path)) {
     }
   }
   if (is.null(umap_key)) {
-    stop("UMAP coordinates were not found in rna_clustered.h5ad")
+    stop("rna_clustered.h5ad 中未找到 UMAP 坐标")
   }
 
   umap_coords <- adata$obsm[[umap_key]][, 1:2]
@@ -2727,7 +1977,7 @@ if (file.exists(rna_h5ad_path) && file.exists(pseudotime_path)) {
     }
   }
   if (is.null(cluster_col)) {
-    stop("Could not reliably align the pseudotime cluster with an h5ad obs cluster column")
+    stop("无法将 pseudotime cluster 与 h5ad obs 聚类列可靠对齐")
   }
 
   obs_cluster <- as.character(obs_df[[cluster_col]])
@@ -2743,7 +1993,7 @@ if (file.exists(rna_h5ad_path) && file.exists(pseudotime_path)) {
       cell_idx <- which(obs_cluster == cl)
       if (length(pt_idx) != length(cell_idx)) {
         stop(sprintf(
-          "The pseudotime row count for cluster %s (%d) does not match the h5ad cell count (%d)",
+          "cluster %s 的 pseudotime 行数 (%d) 与 h5ad 细胞数 (%d) 不一致",
           cl, length(pt_idx), length(cell_idx)
         ))
       }
@@ -2759,14 +2009,14 @@ if (file.exists(rna_h5ad_path) && file.exists(pseudotime_path)) {
   } else if ("delta_r_raw" %in% names(pathways)) {
     "delta_r_raw"
   } else {
-    stop("perturbation_pathways.csv is missing the delta_r_raw(_sum) column")
+    stop("perturbation_pathways.csv 缺少 delta_r_raw(_sum) 列")
   }
   pathway_bin_col <- if ("bin_min" %in% names(pathways)) {
     "bin_min"
   } else if ("bin" %in% names(pathways)) {
     "bin"
   } else {
-    stop("perturbation_pathways.csv is missing the bin_min/bin column")
+    stop("perturbation_pathways.csv 缺少 bin_min/bin 列")
   }
 
   cluster_bins <- pseudotime_cells %>%
@@ -2950,7 +2200,7 @@ if (file.exists(rna_h5ad_path) && file.exists(pseudotime_path)) {
   rm(adata, umap_coords)
   gc()
 } else {
-  warning("rna_clustered.h5ad or intermediate/pseudotime.csv is missing; cannot generate the UMAP effect plot")
+  warning("缺少 rna_clustered.h5ad 或 intermediate/pseudotime.csv，无法生成 UMAP effect 图")
 }
 
 # ==============================================================================
@@ -2961,7 +2211,7 @@ if (file.exists(rna_h5ad_path) && file.exists(pseudotime_path)) {
 projection_file <- file.path(RESULT_DIR, "perturbation_cell_projection.csv")
 if (!file.exists(projection_file)) {
   warning(sprintf(
-    "%s is missing; skipping the projection overview plot",
+    "缺少 %s，跳过 projection overview 图",
     projection_file
   ))
 } else {
@@ -2975,7 +2225,7 @@ if (!file.exists(projection_file)) {
 
   if (length(missing_projection_cols) > 0) {
     warning(sprintf(
-      "The projection overview is missing columns (%s); skipping the plot",
+      "projection overview 缺少列 (%s)，跳过该图",
       paste(missing_projection_cols, collapse = ", ")
     ))
   } else {
@@ -2985,7 +2235,7 @@ if (!file.exists(projection_file)) {
         projection_df$projection_status
       )
     } else {
-      warning("The projection_status column does not exist; filtering only by numeric columns and source_context")
+      warning("projection_status 列不存在；将仅按数值列和 source_context 过滤")
       projection_df$projection_status <- "ok"
     }
     projection_df <- projection_df %>%
@@ -3013,10 +2263,10 @@ if (!file.exists(projection_file)) {
       )
 
     if (nrow(projection_df) == 0) {
-      warning("No valid projection rows; skipping the projection overview plot")
+      warning("没有有效 projection rows，跳过 projection overview 图")
     } else {
       if (!"cell_id" %in% names(projection_df)) {
-        warning("The projection overview is missing cell_id and cannot be aligned with UMAP coordinates; skipping the plot")
+        warning("projection overview 缺少 cell_id，无法与 UMAP 坐标对齐；跳过该图")
       } else {
         # Reuse the embedding made by the existing UMAP section when present.
         # If that section was skipped, load only the coordinates needed here.
@@ -3057,7 +2307,7 @@ if (!file.exists(projection_file)) {
 
         if (is.null(projection_umap)) {
           warning(
-            "No usable UMAP coordinates (umap_df or UMAP in rna_clustered.h5ad is required); skipping the projection overview plot"
+            "缺少可用 UMAP 坐标（需要 umap_df 或 rna_clustered.h5ad 中的 UMAP），跳过 projection overview 图"
           )
         } else {
           projection_umap <- projection_umap %>%
@@ -3076,7 +2326,7 @@ if (!file.exists(projection_file)) {
           ))
 
           if (nrow(projection_df) == 0) {
-            warning("No projection rows with matching UMAP coordinates; skipping the plot")
+            warning("没有 projection rows with matching UMAP coordinates，跳过该图")
           } else {
       context_labels <- projection_df %>%
         group_by(source_context) %>%
@@ -3294,16 +2544,12 @@ if (!file.exists(projection_file)) {
           title = "Perturbation Projection on UMAP",
           subtitle = "Full embedding; colour shows projected pseudotime − source pseudotime",
           x = "UMAP 1",
-          y = "UMAP 2",
-          caption = "Clean UMAP view; colour encodes projected pseudotime − source pseudotime"
+          y = "UMAP 2"
         ) +
         theme_pub(base_size = 15) +
         theme(
           plot.title = element_text(size = 18, hjust = 0.5),
           plot.subtitle = element_text(color = COLORS$muted, size = 11),
-          plot.caption = element_text(
-            color = COLORS$muted, size = 9, hjust = 0
-          ),
           panel.grid = element_blank(),
           axis.text = element_blank(),
           axis.ticks = element_blank(),
@@ -3326,9 +2572,6 @@ if (!file.exists(projection_file)) {
 
       # A separate ordered view makes the trajectory variable explicit without
       # implying that pseudotime displacement is a geometric UMAP vector.
-      # Lane order is frozen by cluster id: ordering by the number of valid
-      # (non-OOD) cells made each KO produce a different row order, because
-      # each KO excludes a different number of out-of-distribution cells.
       context_ids <- unique(as.character(projection_df$source_context))
       context_num <- suppressWarnings(as.numeric(
         sub("^[^0-9]*([0-9]+)$", "\\1", context_ids)
@@ -3337,10 +2580,7 @@ if (!file.exists(projection_file)) {
       ordered_df <- projection_df %>%
         mutate(
           context = factor(source_context, levels = rev(context_order)),
-          context_y = as.numeric(context)
-        ) %>%
-        arrange(context, source_pseudotime) %>%
-        mutate(
+          context_y = as.numeric(context),
           lane_y = context_y + ((seq_len(n()) %% 7) - 3) / 24
         )
       ordered_lanes <- ordered_df %>%
@@ -3389,17 +2629,15 @@ if (!file.exists(projection_file)) {
           expand = c(0, 0)
         ) +
         labs(
-          title = "Perturbation Projection",
-          subtitle = "Rows are ordered by cluster ID; arrowheads mark increasing source pseudotime",
+          title = "Perturbation Projection Ordered by Source Pseudotime",
+          subtitle = "Cells are arranged by source context; arrowheads mark increasing source pseudotime",
           x = "Source pseudotime",
-          y = "Cluster",
-          caption = "Ordered trajectory view, not UMAP geometry; rows ordered by cluster ID; colour encodes projected − source pseudotime"
+          y = "Source context"
         ) +
         theme_pub(base_size = 14) +
         theme(
           plot.title = element_text(size = 18, hjust = 0.5),
           plot.subtitle = element_text(color = COLORS$muted, size = 11),
-          plot.caption = element_text(color = COLORS$muted, size = 9, hjust = 0),
           panel.grid.major.y = element_blank(),
           panel.grid.minor = element_blank(),
           axis.text.y = element_text(face = "bold"),
@@ -3426,3 +2664,4 @@ if (!file.exists(projection_file)) {
 }
 
 cat(sprintf("\nAll figures saved to: %s/\n", OUTPUT_DIR))
+}

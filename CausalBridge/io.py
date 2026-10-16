@@ -1,10 +1,11 @@
 """
-CausalBridge I/O module: configuration parsing, data loading, and result saving
+CausalBridge I/O 模块：配置文件解析、数据加载、结果保存
 
-Unified entry point for all input/output operations, ensuring that the entire pipeline uses consistent file formats.
+所有输入/输出操作的统一入口，确保整个 pipeline 使用一致的文件格式。
 """
 
 import yaml
+import json
 import logging
 import pandas as pd
 import numpy as np
@@ -43,34 +44,38 @@ def normalize_anndata_string_metadata(adata: ad.AnnData) -> ad.AnnData:
 
 
 # ============================================================================
-# Configuration loading
+# 配置加载
 # ============================================================================
 
 def load_config(config_path: str) -> Dict[str, Any]:
     """
-    Load a YAML configuration file and supplement it with default values.
+    加载 YAML 配置文件，补充默认值。
 
-    The user only needs to provide key parameters (such as input paths); the remaining
-    parameters use built-in defaults (kept in sync with config.yaml). This function
-    first loads the user configuration and then merges it with the defaults (user values take precedence).
+    用户只需提供关键参数（如输入路径），其余参数使用内置默认值
+    （与 config.yaml 同步）。此函数先加载用户配置，再与默认值合并（用户值优先）。
 
     Parameters
     ----------
     config_path : str
-        Path to the user's YAML configuration file
+        用户 YAML 配置文件的路径
 
     Returns
     -------
     config : dict
-        Complete configuration dictionary containing all parameters
+        包含所有参数的完整配置字典
     """
-    # Read the user configuration
+    # 读取用户配置
     with open(config_path, "r") as f:
         user_config = yaml.safe_load(f)
 
-    # Defaults (ensuring that all required fields are present)
+    from .saturating_hybrid import HybridConfig
+    from .spline_hybrid import SplineConfig
+    # 默认值（确保所有必需字段存在）
     defaults = {
+        "input": {"gene_identity_mode": "legacy", "annotation_gtf": None,
+                  "rna_gene_id_column": "gene_ids"},
         "preprocess": {
+            "atac_depth_normalization": {"enabled": False, "target_sum": 10000., "output_cap_expansion": .25},
             "rna": {"min_cells_per_gene": 50, "min_umi_per_cell": 500,
                     "n_highly_variable_genes": 3000},
             "atac": {"min_cells_per_peak": 10, "min_peaks_per_cell": 1000,
@@ -83,6 +88,9 @@ def load_config(config_path: str) -> Dict[str, Any]:
             "ablation_shuffle_pseudotime": False,
             "root_cell_method": "cytotrace",
             "cytotrace_n_top_genes": 200,
+            "adaptive_binning": {"enabled": False, "state_modality": "joint", "embedding": {
+                "n_components": 5, "max_features": 512,
+                "max_dense_elements": 2_000_000, "random_seed": 42}},
         },
         "granger": {
             "distance_thresh": 1_000_000,
@@ -93,18 +101,27 @@ def load_config(config_path: str) -> Dict[str, Any]:
             "ablation_lag0": False,
         },
         "atac_to_rna": {
-            "min_observations": 5,
+            "model_mode": "saturating_hybrid",
+            "response_model": "saturation",
+            "nn_response": {"hidden_width": 4, "epochs": 300, "lr": .01, "l2": .01, "seed": 42, "restarts": 1},
+            "spline_response": SplineConfig().to_dict(),
+            "saturating_hybrid": HybridConfig().to_dict(),
             "log_normalize_rna": True,
         },
         "rna_to_atac": {
+            "response_model": "saturation",
+            "nn_response": {"hidden_width": 4, "epochs": 300, "lr": .01, "l2": .01, "seed": 42, "restarts": 1},
+            "spline_response": SplineConfig().to_dict(),
             "motif_db": "jaspar2024", "motif_pval_threshold": 1e-4,
+            "motif_scan_workers": 1,
             "max_tfs_per_peak": 5,
-            "tf_peak_pvalue_threshold": 0.05,  # TF→peak edge significance filter
-            "time_lag": True,  # Adaptive lag: dynamically determine the number of steps from the cluster's transcriptional change rate
-            "tf_expression_filter": True,  # TF expression filter: verify that gene names are present in the RNA matrix
-            "max_lag": 0,  # 0=automatic: max(3, min(n_bins//4, 12))
+            "tf_peak_pvalue_threshold": 0.05,  # TF→peak 边显著性过滤
+            "time_lag": True,  # 自适应 lag: 根据簇的转录变化速率动态确定步数
+            "tf_expression_filter": True,  # TF 表达过滤: 验证基因名是否在 RNA 矩阵中
+            "max_lag": 0,  # 0=自动: max(3, min(n_bins//4, 12))
         },
         "perturbation": {
+            "aggregation_policy": "strict_complete",  # Output aggregation only; preserve library default.
             "ko_strength": 1.0,
             "subnetwork_depth": "unlimited",
             "min_lag_per_peak_filter": True,
@@ -137,14 +154,14 @@ def load_config(config_path: str) -> Dict[str, Any]:
         },
     }
 
-    # Recursive merge: user values override defaults
+    # 递归合并：用户值覆盖默认值
     config = _deep_merge(defaults, user_config)
     _validate_config(config)
     return config
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
-    """Recursively merge two dictionaries, with values in override taking precedence."""
+    """递归合并两个字典，override 中的值优先。"""
     result = base.copy()
     for key, value in override.items():
         if key in result and isinstance(result[key], dict) and isinstance(value, dict):
@@ -155,41 +172,114 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 
 def _validate_config(config: dict):
-    """Check that required fields are present in the configuration and are reasonable."""
+    """检查配置中必需字段是否存在且合理。"""
+    policy = config.get("perturbation", {}).get("aggregation_policy", "strict_complete")
+    if policy not in ("strict_complete", "valid_cell_means"):
+        raise ValueError("perturbation.aggregation_policy must be 'strict_complete' or "
+                         f"'valid_cell_means'; got {policy!r}")
+    from .atac_normalization import validate_atac_depth_config
+    validate_atac_depth_config(config)
+    _gene_identity_enabled(config)
+    from .kinetics import _validate_motif_scan_workers
+    from ._wt_aggregation import validate_model_mode
+    validate_model_mode(config)
+    if config.get("atac_to_rna", {}).get("model_mode") == "saturating_hybrid":
+        from .saturating_transfer import validate_saturating_config
+        validate_saturating_config(config)
+        if config.get("pseudotime", {}).get("ablation_shuffle_pseudotime", False):
+            raise ValueError("saturating_hybrid does not support shuffled pseudotime")
+    _validate_motif_scan_workers(config.get("rna_to_atac", {}).get("motif_scan_workers", 1))
+    from .binning_adapter import _selector, _embedding_settings
+    from .adaptive_binning import BinningConfig
+    settings = _selector(config)
+    _embedding_settings(settings.get("embedding", {}))
+    BinningConfig(**{k: v for k, v in settings.items() if k not in {"enabled", "embedding", "state_modality"}})
+    if settings.get("enabled", False) and config["pseudotime"].get("ablation_shuffle_pseudotime", False):
+        raise ValueError("adaptive binning does not support shuffled pseudotime")
     required_inputs = ["rna_h5ad", "atac_h5ad"]
     for key in required_inputs:
         if key not in config.get("input", {}):
-            raise ValueError(f"Configuration is missing required field: input.{key}")
+            raise ValueError(f"配置缺少必需字段: input.{key}")
 
     rna_path = Path(config["input"]["rna_h5ad"])
     atac_path = Path(config["input"]["atac_h5ad"])
     if not rna_path.exists():
-        raise FileNotFoundError(f"RNA file does not exist: {rna_path}")
+        raise FileNotFoundError(f"RNA 文件不存在: {rna_path}")
     if not atac_path.exists():
-        raise FileNotFoundError(f"ATAC file does not exist: {atac_path}")
+        raise FileNotFoundError(f"ATAC 文件不存在: {atac_path}")
 
-    # Check that parameter ranges are reasonable
+    # 检查参数范围合理性
     gr = config["granger"]
     if gr["significance_threshold"] <= 0 or gr["significance_threshold"] >= 1:
-        raise ValueError("significance_threshold must lie in (0, 1)")
+        raise ValueError("significance_threshold 应在 (0, 1) 之间")
     if gr["distance_thresh"] < 0:
-        raise ValueError("distance_thresh cannot be negative")
+        raise ValueError("distance_thresh 不能为负数")
 
-    logger.info("Configuration validation passed")
+    logger.info("配置验证通过")
+
+
+def _gene_identity_enabled(config):
+    settings = config.get("input", {})
+    mode = settings.get("gene_identity_mode", "legacy")
+    if mode not in ("legacy", "gtf_gene_id"):
+        raise ValueError("input.gene_identity_mode must be legacy or gtf_gene_id")
+    if mode == "gtf_gene_id":
+        if not settings.get("annotation_gtf") or not Path(settings["annotation_gtf"]).is_file():
+            raise ValueError("gtf_gene_id requires an existing input.annotation_gtf")
+        if not isinstance(settings.get("rna_gene_id_column", "gene_ids"), str) or not settings.get("rna_gene_id_column", "gene_ids"):
+            raise ValueError("input.rna_gene_id_column must be a nonempty column name")
+    return mode == "gtf_gene_id"
+
+
+def save_hvg_genes(rna, config):
+    """Export actual selected model HVG flags; missing flags are not all-genes HVG."""
+    if "highly_variable" not in rna.var:
+        logger.warning("RNA lacks highly_variable flags; hvg_genes.csv was not exported")
+        return None
+    flags = rna.var["highly_variable"]
+    if not pd.api.types.is_bool_dtype(flags.dtype) or flags.isna().any():
+        raise ValueError("highly_variable must contain nonmissing boolean flags for HVG export")
+    selected = rna.var.loc[flags].copy()
+    identity = _gene_identity_enabled(config)
+    frame = pd.DataFrame({
+        "gene_id": selected.index.astype(str),
+        "gene_name": (selected["gene_name"].astype(str).to_numpy()
+                      if "gene_name" in selected else selected.index.astype(str)),
+    })
+    if not identity:
+        # Legacy names are the modeling axis; prefer input IDs when available.
+        column = config.get("input", {}).get("rna_gene_id_column", "gene_ids")
+        if column in selected:
+            frame["gene_id"] = selected[column].to_numpy()
+    if "original_var_name" in selected:
+        frame["original_var_name"] = selected.original_var_name.to_numpy()
+    directory = Path(config["output"]["dir"])
+    directory.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(directory / "hvg_genes.csv", index=False)
+    logger.info("模型 HVG 列表已保存: %s (%d genes)", directory / "hvg_genes.csv", len(frame))
+    return frame
+
+
+def _gene_identity_runtime_config(config):
+    """Validate identity settings on a copy, preserving configured output roots."""
+    import copy
+    result = copy.deepcopy(config)
+    _gene_identity_enabled(result)
+    return result
 
 
 # ============================================================================
-# Data loading
+# 数据加载
 # ============================================================================
 
 def load_data(config: dict) -> Tuple[ad.AnnData, ad.AnnData]:
     """
-    Load the RNA and ATAC AnnData files and perform basic validation.
+    加载 RNA 和 ATAC 两个 AnnData 文件，做基础校验。
 
-    Validation includes:
-    1. Whether both files can be read successfully
-    2. Whether cell barcodes match one-to-one
-    3. Whether .var contains genomic coordinate information (chr, start, end)
+    校验内容：
+    1. 两个文件是否可正常读取
+    2. 细胞 barcode 是否一一匹配
+    3. .var 是否包含基因组坐标信息（chr, start, end）
 
     Returns
     -------
@@ -198,73 +288,76 @@ def load_data(config: dict) -> Tuple[ad.AnnData, ad.AnnData]:
     rna_path = config["input"]["rna_h5ad"]
     atac_path = config["input"]["atac_h5ad"]
 
-    logger.info(f"Loading RNA data: {rna_path}")
+    logger.info(f"加载 RNA 数据: {rna_path}")
     rna_adata = ad.read_h5ad(rna_path)
 
-    logger.info(f"Loading ATAC data: {atac_path}")
+    logger.info(f"加载 ATAC 数据: {atac_path}")
     atac_adata = ad.read_h5ad(atac_path)
 
-    # --- Validate genomic coordinate columns ---
+    # --- 校验基因组坐标列 ---
     for label, adata in [("RNA", rna_adata), ("ATAC", atac_adata)]:
+        if label == "RNA" and _gene_identity_enabled(config):
+            # The GTF adapter supplies authoritative RNA spans before QC.
+            continue
         for col in ["chr", "start", "end"]:
             if col not in adata.var.columns:
                 raise KeyError(
-                    f"{label} AnnData .var is missing the '{col}' column."
-                    f"Please add genomic coordinate information. Current columns: {list(adata.var.columns)}"
+                    f"{label} AnnData 的 .var 缺少 '{col}' 列。"
+                    f"请添加基因组坐标信息。当前列: {list(adata.var.columns)}"
                 )
 
-    # --- Validate cell matching ---
+    # --- 校验细胞匹配 ---
     rna_cells = set(rna_adata.obs_names)
     atac_cells = set(atac_adata.obs_names)
     common = rna_cells & atac_cells
 
     if len(common) == 0:
         raise ValueError(
-            "RNA and ATAC data have no shared cell barcodes, "
-            "please confirm that both files come from the same set of cells in a multi-omics assay."
+            "RNA 和 ATAC 数据没有共享的细胞 barcode，"
+            "请确认两个文件来自同一组细胞的多组学测序。"
         )
 
     if len(common) < len(rna_cells) or len(common) < len(atac_cells):
         logger.warning(
-            f"Cell sets do not fully match: RNA={len(rna_cells)}, ATAC={len(atac_cells)}, "
-            f"shared={len(common)}. Only shared cells will be retained."
+            f"细胞不完全匹配: RNA={len(rna_cells)}, ATAC={len(atac_cells)}, "
+            f"共有={len(common)}。将只保留共有细胞。"
         )
         rna_adata = rna_adata[list(common)].copy()
         atac_adata = atac_adata[list(common)].copy()
 
-    # --- Ensure consistent cell order ---
+    # --- 确保细胞顺序一致 ---
     if not np.array_equal(rna_adata.obs_names, atac_adata.obs_names):
         atac_adata = atac_adata[rna_adata.obs_names].copy()
 
-    logger.info(f"Data loading complete: {rna_adata.n_obs} cells, "
-                f"{rna_adata.n_vars} genes, {atac_adata.n_vars} peaks")
+    logger.info(f"数据加载完成: {rna_adata.n_obs} 个细胞, "
+                f"{rna_adata.n_vars} 个基因, {atac_adata.n_vars} 个 peak")
     return rna_adata, atac_adata
 
 
 def load_target_genes(path: str) -> Tuple[List[str], Dict[str, str]]:
     """
-    Load the knockout target gene list and gene-type annotations.
+    加载敲除目标基因列表及基因类型标注。
 
-    Three formats are supported:
-    1. Two-column format: each line is "gene_name  gene_type" (gene_type = TF or target)
-    2. Single-column format (backward compatible): one gene symbol per line, with gene_type = "TF" by default
-    3. Whole-genome mode: the file content is "ALL" or "ALL_EXPRESSED"
+    支持三种格式：
+    1. 双列格式：每行 "gene_name  gene_type"（gene_type = TF 或 target）
+    2. 单列格式（向后兼容）：每行一个基因符号，默认 gene_type = "TF"
+    3. 全基因组模式：文件内容为 "ALL" 或 "ALL_EXPRESSED"
 
     Returns
     -------
     genes : list of str
     gene_types : dict {gene_name: gene_type}
-        gene_type is "TF" or "target"
-        Defaults to "TF" when a gene has no annotation
+        gene_type 为 "TF" 或 "target"
+        当基因不在标注中时，默认 "TF"
     """
     with open(path, "r") as f:
         raw = [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
 
     if len(raw) == 0:
-        raise ValueError(f"Target gene file is empty: {path}")
+        raise ValueError(f"目标基因文件为空: {path}")
 
     if raw[0].upper().startswith("ALL"):
-        logger.info("Using whole-genome mode (all expressed genes can serve as KO targets)")
+        logger.info("将使用全基因组模式（所有表达基因均可作为 KO 目标）")
         return ["__ALL__"], {}
 
     genes = []
@@ -281,46 +374,147 @@ def load_target_genes(path: str) -> Tuple[List[str], Dict[str, str]]:
                 gene_types[gene] = gtype
             else:
                 logger.warning(
-                    f"Unknown gene_type '{parts[1]}' (expected TF or target); "
-                    f"gene {gene} will fall back to 'TF'"
+                    f"未知 gene_type '{parts[1]}' (应为 TF 或 target)，"
+                    f"基因 {gene} 回退为 'TF'"
                 )
                 gene_types[gene] = "TF"
         else:
-            gene_types[gene] = "TF"  # Default
+            gene_types[gene] = "TF"  # 默认
 
     n_tf = sum(1 for t in gene_types.values() if t == "TF")
     n_target = sum(1 for t in gene_types.values() if t == "TARGET")
     logger.info(
-        f"Loaded {len(genes)} target genes "
+        f"加载了 {len(genes)} 个目标基因 "
         f"(TF: {n_tf}, target: {n_target})"
     )
     return genes, gene_types
 
 
 # ============================================================================
-# Result saving
+# 结果保存
 # ============================================================================
 
-def save_results(results: dict, config: dict):
-    """
-    Save all output results to the specified directory.
+def _present_gene_frame(frame, gene_identity):
+    """Copy explicit output roles only; never alter model feature arrays."""
+    from .gene_identity import annotate_gene_columns
+    result = frame.copy(deep=True)
+    for column in ("gene", "affected_gene", "target_gene", "tf_gene", "tf_name", "source_tf", "intermediate_tf"):
+        if column not in result:
+            continue
+        fields = [key for key in result if key == column or key.startswith(column + "_")]
+        values = result[fields].reset_index(drop=True).copy()
+        sentinel = values[column].map(lambda value: isinstance(value, str) and (
+            value.startswith("PEAK:") or value in ("unknown", "joint_vector") or (column == "tf_name" and value == "peak")))
+        if column + "_id" in values:
+            from .gene_identity import normalize_gene_id
+            biological_id = values[column + "_id"].map(lambda value: isinstance(value, str)
+                and normalize_gene_id(value) in gene_identity.by_id)
+            sentinel &= ~biological_id
+        chunks = []
+        for mask, role in ((~sentinel, "genes" if column == "target_gene" else "gene"),
+                           (sentinel, "gene_or_sentinel")):
+            if mask.any():
+                chunks.append(annotate_gene_columns(values.loc[mask], gene_identity, columns={column: role}))
+        if chunks:
+            annotated = pd.concat(chunks).sort_index()
+            for key in annotated:
+                result[key] = annotated[key].to_numpy()
+    if "unavailable_origins" in result:
+        labels, bases = [], []
+        for value in result["unavailable_origins"]:
+            if pd.isna(value):
+                labels.append(value)
+                bases.append(value)
+                continue
+            origins = json.loads(value)
+            display_origins, base_origins = [], []
+            for origin in origins:
+                gene_id, separator, status = origin.partition(":")
+                if gene_id not in gene_identity.by_id:
+                    raise ValueError(f"unknown gene ID in unavailable origin: {gene_id}")
+                display_origins.append(gene_identity.display_labels[gene_id] + separator + status)
+                base_origins.append(gene_identity.by_id[gene_id].gene_name + separator + status)
+            labels.append(json.dumps(display_origins))
+            bases.append(json.dumps(base_origins))
+        result["unavailable_origins_display_json"] = labels
+        result["unavailable_origins_names_json"] = bases
+    return result
 
-    Results include:
-    - perturbation_results.csv: core results table (transcriptomic + chromatin shifts for each KO, net effect per gene)
-    - perturbation_pathways.csv: pathway-level edge records (independent TF→peak→gene contributions, including TF proportion attribution)
-    - causal_peak_gene_edges.csv: causal peak→gene edges
-    - tf_peak_weights.csv: TF→peak regulatory weights
-    - Detailed results for each KO (such as network propagation paths)
+
+def _present_gene_results(results, gene_identity):
+    result = dict(results)
+    for key, value in results.items():
+        if isinstance(value, pd.DataFrame) and key not in ("gene_identity", "gene_filter_report", "gene_target_resolution"):
+            result[key] = _present_gene_frame(value, gene_identity)
+    if "cluster_results" in results:
+        result["cluster_results"] = [_present_gene_results(v, gene_identity) for v in results["cluster_results"]]
+    return result
+
+
+def save_results(results: dict, config: dict, *, gene_identity=None):
+    """
+    保存所有输出结果到指定目录。
+
+    结果包括：
+    - perturbation_results.csv：核心结果表（每个 KO 的转录组+染色质偏移，net effect per gene）
+    - perturbation_pathways.csv：路径记录（saturating 模式为时间事件链接，无独立 TF 归因）
+    - causal_peak_gene_edges.csv：因果 peak→gene 边
+    - tf_peak_weights.csv：TF→peak 调控权重
+    - 各 KO 的详细结果（如网络传播路径）
 
     Parameters
     ----------
     results : dict
-        Results dictionary produced by the pipeline modules
+        pipeline 各模块产出的结果字典
     config : dict
-        Configuration dictionary (used to obtain output paths)
+        配置字典（用于获取输出路径）
     """
+    config = _gene_identity_runtime_config(config)
+    if _gene_identity_enabled(config):
+        if gene_identity is None:
+            raise ValueError("gtf_gene_id output requires the runtime gene_identity index")
+        from .kinetics import _resource_file_identity
+        if _resource_file_identity(config["input"]["annotation_gtf"])["sha256"] != gene_identity.metadata["reference_sha256"]:
+            raise ValueError("output gene identity differs from configured GTF content")
+        expected = {"schema": gene_identity.metadata["schema"], "fingerprint": gene_identity.fingerprint,
+                    "reference_sha256": gene_identity.metadata["reference_sha256"]}
+        metadata = results.get("gene_identity_metadata")
+        if metadata is not None and any(metadata.get(k) != v for k, v in expected.items()):
+            raise ValueError("output results have mismatched gene identity provenance")
+        results = _present_gene_results(results, gene_identity)
     out_dir = Path(config["output"]["dir"])
+    from ._wt_aggregation import validate_model_mode
+    validate_model_mode(config)
+    saturation = config.get("atac_to_rna", {}).get("model_mode") == "saturating_hybrid"
+    from .atac_normalization import validate_atac_depth_config
+    validate_atac_depth_config(config)
     out_dir.mkdir(parents=True, exist_ok=True)
+    if saturation:
+        for key in ("saturating_gene_metrics", "saturating_tf_metrics", "saturating_response_weights",
+                    "saturating_support_diagnostics", "saturating_gates", "saturating_response_curves",
+                    "saturating_endpoints", "saturating_aggregation_diagnostics",
+                    "saturating_peak_attributions", "saturating_tf_peak_contributions", "l1_floor_diagnostics",
+                    "atac_changes", "saturating_pathways"):
+            frame = results.get(key)
+            if isinstance(frame, pd.DataFrame):
+                frame.to_csv(out_dir / f"{key}.csv", index=False)
+        evidence = results.get("saturating_context_metadata", [])
+        if isinstance(evidence, dict):
+            evidence = [evidence]
+        (out_dir / "saturating_contexts.json").write_text(
+            json.dumps(evidence, indent=2, allow_nan=False), encoding="utf-8")
+    for key in ("gene_identity", "gene_filter_report", "gene_target_resolution"):
+        if isinstance(results.get(key), pd.DataFrame):
+            results[key].to_csv(out_dir / f"{key}.csv", index=False)
+    if "gene_identity_metadata" in results:
+        (out_dir / "gene_identity_metadata.json").write_text(
+            json.dumps(results["gene_identity_metadata"], indent=2, allow_nan=False), encoding="utf-8")
+    # Primitive per-context references only: never pickle plans or membership.
+    contexts = results.get("cluster_results", [results])
+    metadata = [entry["binning_metadata"] for entry in contexts if "binning_metadata" in entry]
+    if metadata:
+        (out_dir / "binning_contexts.json").write_text(
+            json.dumps(metadata, indent=2, sort_keys=True, allow_nan=False), encoding="utf-8")
 
     # Opt-in, bounded cell-level projection outputs.  The projection core's
     # full cell-by-gene states are intentionally never persisted here.
@@ -337,85 +531,83 @@ def save_results(results: dict, config: dict):
             if isinstance(frame, pd.DataFrame) and not frame.empty:
                 frame.to_csv(out_dir / filename, index=False)
 
-    # --- Causal regulatory edges ---
+    # --- 因果调控边 ---
     if "causal_edges" in results:
         results["causal_edges"].to_csv(
             out_dir / "causal_peak_gene_edges.csv", index=False
         )
-        logger.info(f"Causal edges saved: {len(results['causal_edges'])}")
+        logger.info(f"因果边已保存: {len(results['causal_edges'])} 条")
 
-    # --- TF→peak weights ---
+    # --- TF→peak 权重 ---
     if "tf_peak_weights" in results:
         results["tf_peak_weights"].to_csv(
             out_dir / "tf_peak_weights.csv", index=False
         )
 
-    # --- Perturbation results ---
+    # --- 扰结果 ---
     if "perturbation_results" in results:
         pert = results["perturbation_results"]
         if not pert.empty and "delta_rna" in pert.columns:
-            pert = pert.sort_values(
-                ["cluster", "delta_rna"],
-                ascending=[True, False],
-            )
+            columns = (["cluster"] if "cluster" in pert else []) + ["delta_rna"]
+            pert = pert.sort_values(columns, ascending=([True] if "cluster" in pert else []) + [False])
         pert.to_csv(out_dir / "perturbation_results.csv", index=False)
 
-    # --- Weighted-average perturbation results (merged across clusters) ---
+    # --- 加权平均扰动结果 (跨簇合并) ---
     if "perturbation_merged" in results:
         pm = results["perturbation_merged"]
         if not pm.empty and "delta_rna" in pm.columns:
             pm = pm.sort_values("delta_rna", ascending=False)
         pm.to_csv(out_dir / "perturbation_merged.csv", index=False)
-        logger.info(f"Weighted-average perturbation results saved: {len(pm)}")
+        logger.info(f"加权平均扰动结果已保存: {len(pm)} 条")
 
-    # --- Pathway-level edge records (TF→peak→gene, for cancellation analysis and regulatory-chain tracing) ---
-    if "pathway_edges" in results:
-        pw = results["pathway_edges"]
-        if not pw.empty:
+    # --- 路径级边记录 (TF→peak→gene, 用于抵消分析与调控链追踪) ---
+    if "pathway_edges" in results or (saturation and "saturating_pathways" in results):
+        pw = results["saturating_pathways"] if saturation and "saturating_pathways" in results else results["pathway_edges"]
+        if not pw.empty or (saturation and "saturating_pathways" in results):
             pw.to_csv(out_dir / "perturbation_pathways.csv", index=False)
-            logger.info(f"Pathway edges saved: {len(pw)}")
+            logger.info(f"路径边已保存: {len(pw)} 条")
 
-    # --- Aggregated TF→peak edges (including window-validation flip information) ---
+    # --- 聚合后的 TF→peak 边 (含窗口验证翻转信息) ---
     if "aggregated_tf_peak_edges" in results:
         ae = results["aggregated_tf_peak_edges"]
         if not ae.empty:
             ae.to_csv(out_dir / "aggregated_tf_peak_edges.csv", index=False)
             n_flipped = ae["flipped"].sum() if "flipped" in ae.columns else 0
-            logger.info(f"Aggregated TF→peak edges saved: {len(ae)} (including {n_flipped} flipped)")
+            logger.info(f"聚合 TF→peak 边已保存: {len(ae)} 条 (其中翻转 {n_flipped} 条)")
 
 
-    # --- ATAC changes (BED format, viewable in IGV) ---
+    # --- ATAC 变化 (BED 格式，可用 IGV 可视化) ---
     if "atac_changes" in results:
         atac_df = results["atac_changes"]
         if not atac_df.empty:
             _save_atac_bed(atac_df, out_dir / "atac_changes.bed")
-            # Significant ATAC changes: |z_score| >= threshold (z-score computed from the WT null distribution)
+            # 显著 ATAC 变化: |z_score| >= 阈值 (z-score 由 WT 零分布计算)
             if "is_significant" in atac_df.columns:
-                sig_df = atac_df[atac_df["is_significant"]].copy()
+                sig_df = atac_df[_significant_mask(atac_df["is_significant"])].copy()
                 if not sig_df.empty:
                     _save_atac_bed(sig_df, out_dir / "atac_changes_significant.bed")
                     logger.info(
-                        f"Significant ATAC changes (|z| threshold): {len(sig_df)} peaks → "
+                        f"显著 ATAC 变化 (|z| 阈值): {len(sig_df)} peaks → "
                         f"atac_changes_significant.bed"
                     )
 
-    # --- ATAC changes (weighted average across clusters, aligned with perturbation_merged logic) ---
+    # --- ATAC 变化 (跨簇加权平均, 对齐 perturbation_merged 逻辑) ---
     if "atac_changes_merged" in results:
         acm = results["atac_changes_merged"]
         if acm is not None and not acm.empty:
             acm.to_csv(out_dir / "atac_changes_merged.csv", index=False)
             _save_atac_bed(acm, out_dir / "atac_changes_merged.bed")
             if "is_significant" in acm.columns:
-                sig_m = acm[acm["is_significant"]].copy()
+                sig_m = acm[_significant_mask(acm["is_significant"])].copy()
                 if not sig_m.empty:
                     _save_atac_bed(sig_m, out_dir / "atac_changes_significant_merged.bed")
                     logger.info(
-                        f"Weighted-average significant ATAC changes across clusters: {len(sig_m)} peaks → "
+                        f"跨簇加权平均 ATAC 显著变化: {len(sig_m)} peaks → "
                         f"atac_changes_significant_merged.bed"
                     )
-            logger.info(f"Weighted-average ATAC changes across clusters saved: {len(acm)} peaks")
+            logger.info(f"跨簇加权平均 ATAC 变化已保存: {len(acm)} peaks")
 
-    # --- Peak perturbation output (knockout_type=peak mode) ---
+    # --- Peak 扰动输出 (knockout_type=peak 模式) ---
     if "perturbation_results" in results:
         pert_all = results["perturbation_results"]
         if not pert_all.empty and "target_gene" in pert_all.columns:
@@ -424,13 +616,13 @@ def save_results(results: dict, config: dict):
             ].copy()
             if not peak_res.empty:
                 peak_res.to_csv(out_dir / "peak_perturbation_results.csv", index=False)
-                logger.info(f"Peak perturbation results saved: {len(peak_res)} → peak_perturbation_results.csv")
+                logger.info(f"Peak 扰动结果已保存: {len(peak_res)} 条 → peak_perturbation_results.csv")
 
     if "upstream_tfs" in results and results["upstream_tfs"] is not None \
             and not results["upstream_tfs"].empty:
         results["upstream_tfs"].to_csv(out_dir / "peak_upstream_tfs.csv", index=False)
         logger.info(
-            f"Upstream TF attribution saved: {len(results['upstream_tfs'])} → peak_upstream_tfs.csv"
+            f"上游 TF 归因已保存: {len(results['upstream_tfs'])} 条 → peak_upstream_tfs.csv"
         )
 
     if "upstream_tfs_merged" in results and results["upstream_tfs_merged"] is not None \
@@ -439,14 +631,14 @@ def save_results(results: dict, config: dict):
             out_dir / "peak_upstream_tfs_merged.csv", index=False
         )
         logger.info(
-            f"Upstream TF weighted merge across clusters saved: {len(results['upstream_tfs_merged'])} "
+            f"上游 TF 跨簇加权合并已保存: {len(results['upstream_tfs_merged'])} 条 "
             f"→ peak_upstream_tfs_merged.csv"
         )
 
     if results.get("peak_summary") is not None and not results["peak_summary"].empty:
         _write_peak_report(results["peak_summary"], out_dir / "peak_perturbation_report.txt")
 
-    # --- Intermediate files ---
+    # --- 中间文件 ---
     if config["output"]["save_intermediate"]:
         inter_dir = out_dir / "intermediate"
         inter_dir.mkdir(exist_ok=True)
@@ -455,7 +647,7 @@ def save_results(results: dict, config: dict):
             if isinstance(df, pd.DataFrame) and not key.endswith("_saved"):
                 df.to_csv(inter_dir / f"{key}.csv", index=False)
 
-        # Save perturbation results for each cluster
+        # 按簇保存各自的扰动结果
         if "cluster_results" in results:
             for i, cl_res in enumerate(results["cluster_results"]):
                 pert = cl_res.get("perturbation_results")
@@ -463,43 +655,55 @@ def save_results(results: dict, config: dict):
                     cluster_label = pert["cluster"].iloc[0] if "cluster" in pert.columns else f"cl_{i}"
                     pert.to_csv(inter_dir / f"perturbation_{cluster_label}.csv", index=False)
 
-    logger.info(f"All results saved to: {out_dir.resolve()}")
+    logger.info(f"所有结果已保存至: {out_dir.resolve()}")
 
 
 def _save_atac_bed(atac_changes: pd.DataFrame, path: Path):
-    """Output predicted ATAC changes in standard BED format, viewable in IGV.
+    """将预测的 ATAC 变化输出为标准 BED 格式，可用 IGV 可视化。
 
     Parameters
     ----------
     atac_changes : DataFrame
-        Columns must include chr, start, end, peak_id, delta_accessibility
+        列需包含 chr, start, end, peak_id, delta_accessibility
     path : Path
-        Output .bed file path
+        输出 .bed 文件路径
     """
     bed_cols = ["chr", "start", "end", "peak_id", "delta_accessibility"]
     if not all(c in atac_changes.columns for c in bed_cols[:3]):
-        logger.warning("ATAC change data is missing BED columns (chr/start/end); skipping BED export")
+        logger.warning("ATAC 变化数据缺少 BED 列 (chr/start/end)，跳过 BED 导出")
         return
 
     with open(path, "w") as f:
         f.write('# track name="CausalBridge predicted ATAC changes"\n')
         f.write('# itemRgb="On"\n')
         for _, row in atac_changes.iterrows():
+            if not np.isfinite(row.get("delta_accessibility", 0)):
+                continue
             score = int(np.clip(abs(row.get("delta_accessibility", 0)) * 1000, 0, 1000))
             f.write(f"{row['chr']}\t{int(row['start'])}\t{int(row['end'])}\t"
                     f"{row.get('peak_id', '.')}\t{score}\n")
-    logger.info(f"ATAC BED track saved: {path}")
+    logger.info(f"ATAC BED track 已保存: {path}")
+
+
+def _significant_mask(values):
+    """CSV-like strings must not become truthy boolean significance flags."""
+    if pd.api.types.is_bool_dtype(values.dtype):
+        return values.fillna(False)
+    normalized = values.map(lambda v: str(v).strip().lower() if pd.notna(v) else "false")
+    if not normalized.isin(["true", "false", "1", "0"]).all():
+        raise ValueError("is_significant must contain boolean values")
+    return normalized.isin(["true", "1"])
 
 
 def _write_peak_report(peak_summary: pd.DataFrame, path: Path):
-    """Generate a four-section human-readable peak perturbation report (A perturbed peak / B upstream TF / C direct effect / D propagation summary)."""
+    """生成 peak 扰动四段式人读报告 (A 扰动peak / B 上游TF / C 直接效应 / D 传播摘要)."""
 
     def _i(v):
         return int(v) if v is not None else 0
 
     lines = [
         "=" * 64,
-        "Peak Perturbation Report (CausalBridge v1.39, peak KO mode)",
+        "Peak Perturbation Report (CausalBridge v1.40, peak KO mode)",
         "=" * 64,
     ]
     for _, row in peak_summary.iterrows():
@@ -513,9 +717,9 @@ def _write_peak_report(peak_summary: pd.DataFrame, path: Path):
         lines.append(f"     peak→gene edges fired : {_i(row.get('n_affected_edges'))}")
         if _i(row.get('n_upstream_tfs')) > 0:
             lines.append(f"  B. upstream TF candidates : {_i(row.get('n_upstream_tfs'))} "
-                         f"(see peak_upstream_tfs.csv)")
+                         f"(详见 peak_upstream_tfs.csv)")
         else:
             lines.append(f"  B. upstream TF candidates : no confident upstream TF identified "
-                         f"(an incomplete motif database, low TF expression, or failure to pass the Pearson test may each be responsible)")
+                         f"(motif 数据库不完整 / TF 低表达 / Pearson 检验未通过均可能导致)")
     path.write_text("\n".join(lines), encoding="utf-8")
-    logger.info(f"Peak perturbation report saved: {path}")
+    logger.info(f"Peak 扰动报告已保存: {path}")

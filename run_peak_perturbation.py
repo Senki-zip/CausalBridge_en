@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""CausalBridge peak KO quick-run CLI: reuse an existing checkpoint and change peak/strength/depth in seconds.
+"""CausalBridge peak KO 快速试跑 CLI: 复用已有 checkpoint, 秒级换 peak/强度/深度.
 
-Usage:
+用法:
     python run_peak_perturbation.py --config config.yaml \
         --peak chr3:123400-123900 --strength -1.0 --depth 1 \
         [--state all] [--match exact] [--out-dir results/test/MY_PEAK]
 
-Principle: derive a peak-mode config from the base config (knockout_type=peak,
-the peak_ko section, an isolated output.dir, and checkpoint reuse from the
-original directory), then pass it to run_pipeline — Steps 4-6 load from the
-checkpoint, while only Steps 1-3 (data loading/preprocessing/clustering/
-pseudotime) and Step 8 (peak perturbation) are recomputed.
+原理: 在基础 config 上派生一份 peak 模式 config (knockout_type=peak +
+peak_ko 段 + 隔离 output.dir + checkpoint 指向原目录复用), 交给
+run_pipeline 执行 — Step 4-6 从 checkpoint 加载, 只重算 Step 1-3
+(数据加载/预处理/聚类/伪时间) 与 Step 8 (peak 扰动)。
 """
 import argparse
 import sys
@@ -20,20 +19,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 def main():
-    ap = argparse.ArgumentParser(description="CausalBridge peak KO quick run (reuse checkpoint)")
-    ap.add_argument("--config", required=True, help="Path to the base config.yaml")
-    ap.add_argument("--peak", required=True, help="Target peak, e.g. chr3:123400-123900")
+    ap = argparse.ArgumentParser(description="CausalBridge peak KO 快速试跑 (复用 checkpoint)")
+    ap.add_argument("--config", required=True, help="基础 config.yaml 路径")
+    ap.add_argument("--peak", required=True, help="目标 peak, 如 chr3:123400-123900")
     ap.add_argument("--strength", type=float, default=-1.0,
-                     help="Perturbation strength s∈[-1,1]: -1=fully closed, -0.5=50%% reduction, +0.5=enhanced")
+                    help="扰动强度 s∈[-1,1]: -1=完全关闭, -0.5=降50%%, +0.5=增强")
     ap.add_argument("--mode", choices=["relative", "absolute"], default="relative",
-                     help="relative: A'=A(1+s) | absolute: A'=s (raw [0,1] target value)")
+                    help="relative: A'=A(1+s) | absolute: A'=s (raw [0,1] 目标值)")
     ap.add_argument("--depth", type=int, default=1,
-                     help="Propagation depth: 1=direct (default) | 2/3=cascade propagation")
-    ap.add_argument("--state", default="all", help="Leiden cluster label or all (default)")
+                    help="传播深度: 1=direct (默认) | 2/3=级联传播")
+    ap.add_argument("--state", default="all", help="Leiden 簇标签 或 all (默认)")
     ap.add_argument("--match", choices=["exact", "overlap", "nearest"], default=None,
-                     help="Peak matching strategy (default: use peak_ko.match from config.yaml)")
+                    help="peak 匹配策略 (默认: 沿用 config.yaml 的 peak_ko.match)")
     ap.add_argument("--out-dir", default=None,
-                     help="Output directory (default: <base output.dir>/PEAK_<short_peak>_d<depth>)")
+                    help="输出目录 (默认: 沿用配置的 output.dir)")
     args = ap.parse_args()
 
     import yaml
@@ -49,37 +48,32 @@ def main():
     if args.match is not None:
         pk["match"] = args.match
 
-    orig_out = config["output"]["dir"]
     if args.out_dir:
-        out_dir = Path(args.out_dir)
-    else:
-        short = args.peak.replace(":", "_").replace("-", "_")
-        out_dir = Path(orig_out) / f"PEAK_{short}_d{args.depth}"
+        config["output"]["dir"] = args.out_dir
+    out_dir = Path(config["output"]["dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
-    config["output"]["dir"] = str(out_dir) + "/"
-    if not config["output"].get("checkpoint_dir"):
-        config["output"]["checkpoint_dir"] = str(Path(orig_out) / "checkpoints")
 
     derived = out_dir / "config_peak.yaml"
     with open(derived, "w") as f:
         yaml.safe_dump(config, f, allow_unicode=True, sort_keys=False)
 
-    print(f"[peak-ko] Derived config → {derived}")
+    print(f"[peak-ko] 派生 config → {derived}")
     print(f"[peak-ko] peak={args.peak} strength={args.strength} "
           f"depth={args.depth} state={args.state}")
     print(f"[peak-ko] output.dir={config['output']['dir']}")
-    print(f"[peak-ko] checkpoint_dir={config['output']['checkpoint_dir']} (reused)")
+    checkpoint_dir = config["output"].get("checkpoint_dir") or out_dir / "checkpoints"
+    print(f"[peak-ko] checkpoint_dir={checkpoint_dir}")
 
     from CausalBridge.run import run_pipeline
     res = run_pipeline(str(derived))
     if "error" in res:
-        print(f"[peak-ko] Failed: {res['error']}")
+        print(f"[peak-ko] 失败: {res['error']}")
         sys.exit(1)
     pr = res.get("perturbation_results")
     n = 0 if pr is None or pr.empty else len(pr)
     up = res.get("upstream_tfs")
     n_up = 0 if up is None or up.empty else len(up)
-    print(f"[peak-ko] Completed: {n} target-gene effects, {n_up} upstream TFs, output directory: {out_dir}")
+    print(f"[peak-ko] 完成: {n} 条靶基因效应, {n_up} 条上游 TF, 输出目录: {out_dir}")
 
 
 if __name__ == "__main__":

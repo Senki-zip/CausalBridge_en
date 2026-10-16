@@ -1,163 +1,196 @@
-# =============================================================================
-# CausalBridge: causal perturbation prediction framework with ATAC bridging — configuration
-# =============================================================================
-# Core idea:
-#   Use chromatin accessibility (ATAC) as a mechanistic mediator and explicitly model the propagation path of gene perturbations:
-#     RNA change → TF activity change → ATAC change (peak opening/closing) → target-gene transcription change → RNA change
-#   Select regulatory edges with causal Granger tests and fit the peak→gene transfer function with a shared NN.
-#   Determine TF→peak weights and lags in the RNA→ATAC direction with single-feature Pearson tests per lag.
-#   Predict transcriptome-wide and chromatin-state shifts after knockout of any gene.
-# =============================================================================
-
-# --- Input data paths ---
+# ==================== 输入与基因标识 ====================
 input:
-  rna_h5ad: "/home/huangtao/Desktop/huangchengqi/test/output/rna_adata.h5ad"           # RNA AnnData; .var must contain chr, start, end
-  atac_h5ad: "/home/huangtao/Desktop/huangchengqi/test/output/atac_adata.h5ad"         # ATAC AnnData; .var must contain chr, start, end
-  genome_fasta: "/home/huangtao/Desktop/huangchengqi/reference_documents/refdata-cellranger-arc-GRCh38-2024-A/fasta/genome.fa"       # Reference genome (for motif scanning)
-  target_genes: "/home/huangtao/Desktop/huangchengqi/code_1/CausalBridge/target_genes.txt"          # KO target-gene list, one per line
+  gene_identity_mode: gtf_gene_id
+  annotation_gtf: "/home/huangtao/Desktop/huangchengqi/reference_documents/refdata-cellranger-arc-GRCh38-2024-A/genes/genes.gtf.gz"
+  rna_gene_id_column: gene_ids
+  rna_h5ad: "/home/huangtao/Desktop/huangchengqi/test/output/rna_adata.h5ad"
+  atac_h5ad: "/home/huangtao/Desktop/huangchengqi/test/output/atac_adata.h5ad"
+  genome_fasta: "/home/huangtao/Desktop/huangchengqi/reference_documents/refdata-cellranger-arc-GRCh38-2024-A/fasta/genome.fa"  # motif 扫描参考基因组
+  target_genes: "/home/huangtao/Desktop/huangchengqi/code_1/CausalBridge/target_genes.txt"  # 每行一个 KO 目标基因
 
-# --- RNA data preprocessing ---
+# ==================== 预处理：质控、参考视图与模型视图 ====================
 preprocess:
   rna:
-    min_cells_per_gene: 50                  # Gene must be detected in at least N cells
-    min_umi_per_cell: 500                   # Cell must have at least N UMIs
-    n_highly_variable_genes: 3000           # Number of highly variable genes (accelerates downstream computation)
+    min_cells_per_gene: 50                  # 基因最少检出细胞数
+    min_umi_per_cell: 500                   # 细胞最少 UMI 数
+    n_highly_variable_genes: 3000           # 高变基因数
   atac:
-    min_cells_per_peak: 10                  # Peak must be open in at least N cells
-    min_peaks_per_cell: 1000                # Cell must have at least N peaks
-    binarize: true                          # Binarize ATAC counts (0/1)
+    min_cells_per_peak: 10                  # peak 最少开放细胞数
+    min_peaks_per_cell: 1000                # 细胞最少开放 peak 数
+    binarize: true                         # 质控与参考视图使用二值 ATAC
+  # 连续模型视图仅用于 saturating_hybrid；启用后覆盖模型 ATAC 视图，参考质控仍为二值。
+  atac_depth_normalization:
+    enabled: true
+    target_sum: 10000.0                     # 深度分母为原始完整输入的 peak 计数总和
+    output_cap_expansion: 0.25              # 归一化 ATAC log1p 单位下扩展 WT 跨度的 25%，不是原始概率
 
-# --- Pseudotime inference ---
-# Available methods:
-#   dpt (default): Diffusion Pseudotime, based on diffusion distance and robust to noise
-#   palantir:      based on diffusion maps and entropy; natively supports multi-lineage branching (requires pip install palantir)
-pseudotime:
-  method: "dpt"                        # dpt | palantir
-  n_neighbors: 20                           # Number of KNN graph neighbors
-  root_cell_marker: null                    # Marker gene for the developmental start (or null to infer automatically)
-  root_cell_method: "cytotrace"             # Root-cell strategy: cytotrace (default, global Scheme B) | marker | min_umi | auto
-  cytotrace_n_top_genes: 200               # CytoTRACE 2020: compute pairwise correlations from the top-N highly expressed genes per cell
-  n_bins: 50                                # Maximum number of bins
-  min_cells_per_bin: 10                     # Target cells per bin (controls bin count and Gaussian sigma)
-  smooth_kernel: "gaussian"                 # gaussian | hard (gaussian soft-binning reduces small-cluster noise)
-  smooth_overlap_factor: 2.0                # k in sigma≤k×bin_width for Gaussian mode; controls adjacent-bin overlap tolerance
-  ablation_shuffle_pseudotime: false        # true=ablation: randomly shuffle pseudotime values and disrupt time-axis ordering
-
-# --- Granger causal testing ---
-granger:
-  distance_thresh: 200000                   # Maximum peak-gene genomic distance (bp)
-  significance_threshold: 0.01              # F-test p-value threshold
-  correction_method: "fdr_bh"               # Multiple-testing correction method
-  min_effect_size: 0.1                     # Minimum ΔR² effect size
-  soft_threshold: true                       # Enable soft threshold (composite score replaces hard filtering)
-  min_composite_score: 0.3                   # Minimum composite score
-  composite_weights: [0.4, 0.6]              # [p_adj weight, effect_size weight]
-  max_lag: 1                                  # Number of Granger lags (lag=1)
-  reference_bins: 50                         # Reference bin count for Granger degrees-of-freedom correction (used to scale threshold)
-  ablation_lag0: false                       # true=ablation: remove temporal lag and run pure correlation Y(t)~X(t)
-
-# --- ATAC→RNA transfer-function fitting ---
-atac_to_rna:
-# Shared NN transfer function (NN-only since v1.39): PairEmbeddingNN, f(ATAC, peak_id, gene_id) → RNA
-#   Shared ATAC pathway outputs nn_d_atac monotonic increasing basis functions (nonnegative-weight MLP, full real domain, no OOB issue)
-#   Pair embedding supplies only combination weights and bias, not predictions; gain sign is uniquely determined by pair weights
-  log_normalize_rna: true                   # RNA log1p normalization; gain becomes log-fold-change
-  min_observations: 5                       # Minimum valid observations for fitting (5 is more suitable after adaptive binning)
-  root_cell_quantile: 0.05                 # Root-cell quantile (earliest N% of pseudotime cells used for the ATAC baseline)
-  root_cell_min_count: 5                   # Minimum root-cell count (quantile expands automatically if insufficient)
-  root_atac_floor: 0.05                    # Minimum root-cell ATAC baseline (prevents noise amplification at low-baseline peaks)
-  # --- NN parameters ---
-  nn_d_embed: 4                            # Embedding dimension (small dimension forces NN dependence on ATAC)
-  nn_d_atac: 16                              # ATAC feature-vector dimension (dot-product modulation allows pair-specific signs/shapes)
-  nn_atac_hidden_dims: [32, 64, 128]         # atac_net hidden-layer dimensions
-  nn_dropout: 0.1                           # Dropout ratio
-  nn_batch_size: 4096                        # Training batch size
-  nn_learning_rate: 0.001                   # Initial learning rate
-  nn_max_epochs: 200                         # Maximum training epochs
-  nn_early_stopping_patience: 25            # Early-stopping patience
-  nn_device: "cuda"                         # Training device: "cuda" | "cpu" (automatically falls back to CPU if no GPU is available)
-
-# --- RNA→ATAC regulatory relationship learning ---
-rna_to_atac:
-  motif_db: "jaspar2024"                    # TF motif database
-  motif_pval_threshold: 0.1             # Motif-scan p-value threshold (candidate prefilter; per-lag Pearson tests filter again)
-  max_tfs_per_peak: 5                       # Maximum TFs retained per peak
-  tf_peak_pvalue_threshold: 0.05            # TF→peak single-feature Pearson-test p-value threshold (filters nonsignificant edges)
-  min_abs_contribution: 0.01                  # Minimum |weight| × std(X) (filters TF→peak bindings with tiny effect sizes)
-  tf_expression_filter: true                # Enable TF-expression filter: verify gene names in the RNA matrix
-
-  # ==========================================================================
-  # Time-lag design (independent regression per lag)
-  # ==========================================================================
-  # When time_lag: true, run independent single-feature Pearson tests for lag=0,1,...,max_lag.
-  # (Each lag has one X column.) The first significant lag wins → output that (TF, peak, lag).
-  # | Advantages               | Disadvantages              |
-  # | No collinearity between lags | Runtime ≈ max_lag times |
-  # | Highly autocorrelated TF→naturally lag=0 |                  |
-  # | True delayed regulation TF→accurate true lag |              |
-  #
-  # Disable time lag (only TF(t)→peak(t), no lag):
-  #   time_lag: false  (the script then forces lag=0; max_lag is ignored)
-  # ==========================================================================
-  time_lag: true                             # Whether to enable time lag
-  max_lag: "auto"                              # Maximum lag count ("auto"/0/negative use n_bins//4; N=fixed value; time_lag=false uses lag=0 only)
-
-
-# --- Perturbation simulation ---
-perturbation:
-  cell_projection:
-    enabled: false                            # Enable optional RNA reference projection
-    n_components: null                        # null=retain all estimable PCA components
-    n_neighbors: 10                           # Reference neighbors for inverse-distance projection
-    history_delta_threshold: 1.0e-8           # Sparse-history nonzero cutoff
-    state_unit: rna_log1p_cp10k               # Unit of projected RNA state values
-  perturbation_mode: "bin_forward"               # Bin-wise forward propagation: TF-specific lag + causal ordering
-  propagation_rounds: 1                          # Propagation rounds: 1=single round (no fold accumulation, symmetric), >1=multiple rounds (independent delta per round)
-  joint_knockout: true                         # Whether bin_forward jointly knocks out all target_genes (true=one simulation, false=per gene)
-  ko_strength: 1.0                          # Knockout strength (1.0=complete knockout)
-  subnetwork_depth: unlimited                       # Perturbation subnetwork depth (unlimited/number)
-  subnetwork_unlimited_max_edges: 125000           # Maximum simulated edges retained in unlimited mode
-  subnetwork_unlimited_max_work_edges: 250000      # Safety limit for candidate rows traversed during unlimited closure
-  min_r2_threshold: 0.3                      # Minimum R² for peak→gene edges in perturbation simulation (hard filter replacing soft weighting)
-  min_delta_threshold: 0                # Output filter: minimum |log2FC| (0=no filter, 0.25≈1.2-fold, 0.5≈1.4-fold, 1.0≈2-fold)
-  log_accumulation: true                # Accumulation space (v1.36 default true): true accumulates in native log1p-log1p NN space (+δ/−δ symmetric cancellation, avoids raw accumulation bias); false uses legacy raw accumulation (regression comparison)
-  atac_significance_zscore: 2.0          # ATAC-change significance: |z| = |delta_accessibility| / WT between-bin std; >= this value is significant (outputs atac_changes_significant.bed)
-  min_lag_per_peak_filter: true             # Retain only TF(s) with the minimum lag per peak; share when multiple TFs have the same lag
-
-  # --- Peak perturbation (peak KO) ---
-  # Mode switch: "gene"=TF/gene KO (default, existing flow unchanged) | "peak"=peak KO
-  # In peak mode, target_genes.txt is ignored; the peak_ko section below is used instead
-  knockout_type: "gene"
-  peak_ko:
-    peak_id: "chr3:34,691,323–34,693,322"           # Target peak (supports exact/overlap/nearest matching)
-    mode: relative                          # relative: A'=A(1+s) | absolute: A'=s (raw [0,1] target value)
-    strength: -1.0                          # s ∈ [-1,+1]; -1=fully closed, -0.5=50% reduction, +0.5=enhanced
-    state: "all"                            # Leiden cluster label or "all" (simulate per cluster then merge weighted by cell count)
-    depth: 2                                # Propagation depth: 1=direct (default, direct targets only) | 2/3=cascade (TF→secondary peak→secondary gene)
-    match: overlap                          # exact | overlap | nearest (explicitly output distance; never silently substitute)
-# --- Cell clustering ---
+# ==================== 细胞聚类与谱系 ====================
 clustering:
-  enabled: true                             # Whether to enable clustering (false=global Palantir mode, true=per-cluster DPT mode)
-  cluster_key: "leiden"                                    # Column name for cluster labels in obs: annotation_simplified/leiden
-  n_neighbors: 20                           # Number of KNN graph neighbors
-  n_pcs: 20                                 # Number of PCA components
-  resolution: 0.5                           # Leiden resolution (higher means more clusters)
-  random_state: 42                          # Random seed
-  min_cells_per_cluster: 50                  # Minimum cells per cluster (smaller clusters trigger fallback)
-  fallback_pseudotime_method: "palantir"     # Pseudotime method for global fallback (Palantir recommended; natively supports multi-lineage)
-
-  # --- PAGA lineage merging ---
-  # Leiden clustering may split a continuous developmental lineage into multiple small clusters.
-  # After PAGA identifies topological connectivity between clusters, connected clusters are merged into one lineage,
-  # and pseudotime inference runs on the merged lineage to preserve trajectory continuity.
+  enabled: true
+  cluster_key: "leiden"                     # obs 聚类标签列
+  n_neighbors: 20
+  n_pcs: 20
+  resolution: 0.5                          # Leiden 分辨率
+  random_state: 42
+  min_cells_per_cluster: 50                 # 低于此细胞数时回退
+  fallback_pseudotime_method: "palantir"     # 全局回退方法
   paga:
-    enabled: false                            # true=enable PAGA lineage merging, false=independent per cluster
-    connectivity_threshold: 0.08             # PAGA connectivity threshold (model=v1.0, intentionally low)
-    min_cells_per_lineage: 50                # Minimum cells in merged lineage (smaller lineages merge into the nearest lineage)
+    enabled: false                         # 启用后按 PAGA 连通性合并谱系
+    connectivity_threshold: 0.08
+    min_cells_per_lineage: 50
 
-# --- Output ---
+# R、R 包和原生依赖统一安装在 CausalBridge conda 环境中。
+cytotrace:
+  rscript_binary: "/home/huangtao/miniconda3/envs/CausalBridge/bin/Rscript"
+  r_library_dir: "/home/huangtao/miniconda3/envs/CausalBridge/lib/R/library"
+  native_library_dir: "/home/huangtao/miniconda3/envs/CausalBridge/lib"
+
+# ==================== 伪时间与分箱 ====================
+pseudotime:
+  method: "dpt"                            # dpt | palantir
+  n_neighbors: 20
+  root_cell_marker: null                    # 根细胞标记基因；null 为自动推断
+  root_cell_method: "cytotrace"             # cytotrace | marker | min_umi | auto
+  cytotrace_n_top_genes: 200
+  n_bins: 50                               # 分箱数上限
+  min_cells_per_bin: 10                     # 每箱目标细胞数
+  smooth_kernel: "gaussian"                 # gaussian 软分箱 | hard 硬分箱
+  smooth_overlap_factor: 2.0                # 高斯 sigma 上限相对于箱宽的倍数
+  ablation_shuffle_pseudotime: false        # 消融：打乱伪时间
+  adaptive_binning:
+    enabled: false
+    bandwidth_selection: state             # 带宽依据有效样本量，不依据状态分数
+    boundary: split_noise                  # 状态边界保护；none 为仅按有效样本量分箱
+    state_modality: rna                    # 仅用于状态判定；伪时间仍使用联合 RNA+ATAC 主成分
+    embedding:
+      n_components: 5
+      max_features: 512
+      max_dense_elements: 2000000
+      random_seed: 42
+
+# ==================== Granger 调控边筛选 ====================
+granger:
+  distance_thresh: 200000                   # peak–gene 最大距离，单位 bp
+  significance_threshold: 0.01              # 调控边 F 检验阈值，不是最终扰动显著性阈值
+  correction_method: "fdr_bh"
+  min_effect_size: 0.1                      # 最小 ΔR²
+  soft_threshold: true                     # 使用复合分数筛选
+  min_composite_score: 0.3
+  composite_weights: [0.4, 0.6]             # [校正 p 值权重, 效应量权重]
+  max_lag: 1
+  reference_bins: 50                       # 自由度校正的参考分箱数
+  ablation_lag0: false                      # 消融：仅使用同期关系
+
+# ==================== ATAC→RNA：流程与响应模型 ====================
+atac_to_rna:
+  # saturating_hybrid 使用单关系/支持组流程；两层 response_model 独立选择。
+  model_mode: saturating_hybrid
+  response_model: nn                   # 当前层响应：spline | nn | saturation
+  # 实验性绿色试验参数；smoothness=1e-6 尚非验证最优值，不在生产内逐关系 CV。
+  spline_response:
+    smoothness: 1.0e-6
+    group_interaction_penalty: 0.01          # 2/3输入组交互系数惩罚，实验性默认
+    tail_scale: 0.5
+    internal_knots: 2
+    max_nfev: 1000
+    restarts: 3
+    seed: 42
+  log_normalize_rna: true                   # RNA 使用 log1p 归一化
+
+  # 仅当前层 response_model=nn：独立 NN 训练预算。
+  nn_response:
+    hidden_width: 4
+    epochs: 300
+    lr: 0.01
+    l2: 0.01
+    seed: 42
+    restarts: 1                            # NN 重启次数，与下方饱和拟合起点数独立
+
+  # 仅 saturating_hybrid：两层共享的拟合与支持组参数。
+  saturating_hybrid:
+    workers: 24                            # 所有拟合阶段的目标进程数
+    max_nfev: 500                           # 仅 saturation 响应的求解预算
+    budget_exhausted_policy: best_finite    # 饱和求解耗尽预算后保留有效有限候选
+    det_starts: 3                          # 饱和拟合确定性起点数，不控制 NN 重启
+    rna_cap_lambda: 0.25                   # RNA 输出上限扩展 WT 跨度的比例
+    min_fit_rows: 12
+    group_sizes: [2, 3]
+    max_groups: 2
+    polynomial_degree: 2
+    ridge: 0.1
+    min_group_rows: 24
+    min_group_cell_ess: 30.0
+    min_query_cell_ess: 10.0
+    min_group_effective_rows: 12.0
+    max_geometry_condition: 10000.0
+    support_radius_quantile: 0.95
+    min_penalized_gain: 0.05
+    restart_prediction_spread_max: 0.05
+    query_neighbors: 10
+
+# ==================== RNA→ATAC：响应模型与调控边 ====================
+rna_to_atac:
+  response_model: spline                   # 当前层响应：spline | nn | saturation；两层独立
+  spline_response:
+    smoothness: 1.0e-6                     # 实验性默认，不代表已验证最优
+    group_interaction_penalty: 0.01          # 2/3输入组交互系数惩罚
+    tail_scale: 0.5
+    internal_knots: 2
+    max_nfev: 1000
+    restarts: 3
+    seed: 42
+  # 仅当前层 response_model=nn；当前为 spline，保留供切换比较。
+  nn_response:
+    hidden_width: 4
+    epochs: 300
+    lr: 0.01
+    l2: 0.01
+    seed: 42
+    restarts: 1
+  motif_db: "jaspar2024"
+  motif_scan_workers: 24                    # motif 缺失扫描进程数
+  motif_pval_threshold: 0.1                 # motif 候选粗筛阈值
+  max_tfs_per_peak: 5
+  tf_peak_pvalue_threshold: 0.05            # TF→peak Pearson 边筛选阈值，不是扰动显著性阈值
+  min_abs_contribution: 0.01                # 最小 |weight| × std(X)
+  tf_expression_filter: true               # 验证 TF 是否在 RNA 矩阵中
+  time_lag: true                           # 逐 lag 独立检验，取第一个显著 lag
+  max_lag: "auto"                          # auto/0/负数按 n_bins//4；关闭 time_lag 时仅使用 lag=0
+
+# ==================== 扰动传播与结果汇总 ====================
+perturbation:
+  knockout_type: "gene"                     # gene | peak
+  perturbation_mode: "bin_forward"
+  joint_knockout: true                      # 联合敲除所有目标基因；false 为逐基因模拟
+  ko_strength: 1.0                         # 1.0 为完全敲除
+  propagation_rounds: 1
+  subnetwork_depth: unlimited
+  subnetwork_unlimited_max_edges: 250000    # 最终模拟边数上限
+  subnetwork_unlimited_max_work_edges: 250000  # 闭包遍历候选行上限
+  min_r2_threshold: 0.3                    # peak→gene 边的最低 R²
+  min_lag_per_peak_filter: true             # 每个 peak 保留最小 lag 的 TF
+  log_accumulation: true                    # 在 log1p 空间累加；false 使用历史 raw 累加
+  min_delta_threshold: 0                    # 输出 |log2FC| 阈值；0 为不过滤
+  atac_significance_zscore: 2.0             # ATAC 扰动显著性：|变化量| / WT 箱间标准差
+  aggregation_policy: valid_cell_means      # 同一有效细胞子集的 WT/扰后均值按细胞数加权，再计算 log2 比值
+  cell_projection:
+    enabled: true                          # 启用 RNA 参考投影
+    n_components: null                     # 保留所有可估计的 PCA 主成分
+    n_neighbors: 20
+    history_delta_threshold: 1.0e-8        # 稀疏历史变化量的非零阈值
+    state_unit: rna_log1p_cp10k
+  # 仅 knockout_type=peak：读取此段，不使用 target_genes。
+  peak_ko:
+    peak_id: "chr3:34,691,323–34,693,322"
+    mode: relative                         # relative: A'=A(1+s)；absolute: A'=s
+    strength: -1.0                         # -1 完全关闭，+1 增强
+    state: "all"                           # 簇标签或 all
+    depth: 2                               # 1 为直接靶基因；2/3 为级联传播
+    match: overlap                         # exact | overlap | nearest
+
+# ==================== 输出与缓存 ====================
 output:
-  dir: "/home/huangtao/Desktop/huangchengqi/code_1/CausalBridge/results/test/GATA1_KLF1/"  # Output directory
-  cache_dir: "/home/huangtao/Desktop/huangchengqi/code_1/CausalBridge/cache_test/"                       # Cache directory (persistent cache for motif scans, TF databases, etc.)
-  checkpoint_dir: null                           # Checkpoint directory (null=use output.dir/checkpoints)
-  save_intermediate: true                        # Whether to retain intermediate files
+  dir: "/home/huangtao/Desktop/huangchengqi/code_1/CausalBridge/results/test/MYB_test/"
+  cache_dir: "/home/huangtao/Desktop/huangchengqi/code_1/CausalBridge/cache_test/"
+  checkpoint_dir: null                     # null 使用 output.dir/checkpoints
+  save_intermediate: true

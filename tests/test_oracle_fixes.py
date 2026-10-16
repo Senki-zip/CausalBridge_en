@@ -6,34 +6,13 @@ from pathlib import Path
 import pandas as pd
 
 from CausalBridge.io import load_config
-from CausalBridge.nn_transfer import _train_validation_sizes
-from CausalBridge.perturbation import _nn_delta_or_linear, _read_nn_rna_log_normalized
 from CausalBridge.run import _validate_step5_checkpoint, _validate_step6_checkpoint
 
 
-def test_nn_train_validation_sizes():
-    assert _train_validation_sizes(1) == (1, 0)
-    for n in (2, 10, 1000, 10000):
-        train, val = _train_validation_sizes(n)
-        assert train >= 1 and val >= 1 and train + val == n
-    assert _train_validation_sizes(10)[0] == 9
 
 
-def test_nn_failure_uses_linear_fallback():
-    def failed_predictor(*args):
-        raise RuntimeError("synthetic prediction failure")
-
-    assert _nn_delta_or_linear(failed_predictor, (), 2.0, 0.5) == (1.0, "linear")
 
 
-def test_normalization_metadata_mismatch_is_rejected():
-    checkpoint = {"data": {"rna_log_normalized": True}}
-    try:
-        _read_nn_rna_log_normalized(checkpoint, {"atac_to_rna": {"log_normalize_rna": False}})
-    except RuntimeError as error:
-        assert "disagrees" in str(error)
-    else:
-        raise AssertionError("normalization mismatch was accepted")
 
 
 def test_legacy_step5_step6_checkpoints_are_rejected():

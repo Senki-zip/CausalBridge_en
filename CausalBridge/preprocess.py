@@ -1,8 +1,8 @@
 """
- CausalBridge preprocessing module
+CausalBridge 预处理模块
 
- Perform quality control, normalization, and highly variable gene selection on RNA and ATAC AnnData.
- All filtering steps preserve the original counts in .layers["raw"] for downstream kinetic modeling.
+对 RNA 和 ATAC AnnData 进行质量控制、归一化、高变基因筛选。
+所有过滤步骤保留原始计数在 .layers["raw"] 中，供下游动力学建模使用。
 """
 
 import numpy as np
@@ -20,60 +20,65 @@ def preprocess_rna(
     min_umi_per_cell: int = 500,
     n_highly_variable_genes: int = 3000,
     keep_genes: Optional[list] = None,
+    *,
+    filter_cells: bool = True,
 ) -> ad.AnnData:
     """
-    Quality control and normalization of RNA data.
+    RNA 数据质量控制和归一化。
 
-    Processing steps:
-    1. Preserve the original counts in .layers["raw"] — downstream kinetic modeling requires the original values
-    2. Filter low-expression genes and low-quality cells
-    3. Normalize by library size → apply a log1p transformation
-    4. Select highly variable genes — reduce dimensionality and accelerate downstream Granger tests and regression
-    5. Retain genes in keep_genes (such as KO target genes), even if they are not highly variable
+    处理流程：
+    1. 保留原始计数到 .layers["raw"] — 后续动力学建模需要原始值
+    2. 过滤低表达基因和低质量细胞
+    3. 文库大小归一化 → log1p 变换
+    4. 筛选高变基因 — 减少维度，加速下游 Granger 检验和回归
+    5. 保留 keep_genes 中的基因（如 KO 目标基因），即使它们不在高变基因中
 
     Parameters
     ----------
     adata : AnnData
-        Raw RNA count data; .X is a sparse matrix (cells×genes)
+        原始 RNA 计数数据，.X 为稀疏矩阵（细胞×基因）
     min_cells_per_gene : int
-        Retain genes detected in at least N cells
+        基因至少在 N 个细胞中检出才保留
     min_umi_per_cell : int
-        Retain cells with at least N UMIs
+        细胞至少需 N 个 UMI 才保留
     n_highly_variable_genes : int
-        Number of highly variable genes to retain
+        高变基因保留数量
     keep_genes : list or None
-        List of genes that must be retained (such as knockout target genes), even if they are not selected as highly variable
+        必须保留的基因列表（如敲除目标基因），即使不在高变基因筛选中
+    filter_cells : bool
+        是否执行细胞 QC；模型视图使用参考聚类的细胞集合时设为 False。
 
     Returns
     -------
     adata : AnnData
-        Preprocessed data; .layers["raw"] contains the original counts
+        预处理后的数据，.layers["raw"] 为原始计数
     """
     adata = adata.copy()
 
-    # --- Step 1: Preserve the original counts ---
-    # Downstream kinetic parameter fitting requires the unnormalized original values
+    # --- 步骤1: 保留原始计数 ---
+    # 后续动力学参数拟合需要未归一化的原始值
     adata.layers["raw"] = adata.X.copy()
 
-    # --- Step 2: Gene/cell quality control ---
-    logger.info(f"Before QC: {adata.n_obs} cells, {adata.n_vars} genes")
+    # --- 步骤2: 基因/细胞质控 ---
+    logger.info(f"QC 前: {adata.n_obs} 细胞, {adata.n_vars} 基因")
     sc.pp.filter_genes(adata, min_cells=min_cells_per_gene)
-    sc.pp.filter_cells(adata, min_counts=min_umi_per_cell)
-    logger.info(f"After QC: {adata.n_obs} cells, {adata.n_vars} genes")
+    if filter_cells:
+        sc.pp.filter_cells(adata, min_counts=min_umi_per_cell)
+    logger.info(f"QC 后: {adata.n_obs} 细胞, {adata.n_vars} 基因")
 
     if adata.n_obs < 100 or adata.n_vars < 500:
         raise ValueError(
-            f"Dataset is too small after QC ({adata.n_obs} cells, {adata.n_vars} genes); "
-            f"relax the filtering thresholds or check the quality of the input data."
+            f"QC 后数据量过小 ({adata.n_obs} 细胞, {adata.n_vars} 基因)，"
+            f"请放宽过滤阈值或检查输入数据质量。"
         )
 
-    # --- Step 3: Normalization + log transformation (for clustering and visualization) ---
+    # --- 步骤3: 归一化 + log 变换（用于聚类和可视化）---
     sc.pp.normalize_total(adata, target_sum=1e4)
     sc.pp.log1p(adata)
 
-    # --- Step 4: Highly variable gene selection ---
-    # Highly variable genes capture the main biological variation in the data while substantially reducing computation
-    # seurat_v3 requires raw counts, so temporarily replace X with raw
+    # --- 步骤4: 高变基因筛选 ---
+    # 高变基因捕获了数据中最主要的生物学变异信号，同时显著减少计算量
+    # seurat_v3 需要原始计数，因此临时将 X 替换为 raw
     normalized_X = adata.X
     adata.X = adata.layers["raw"]
     sc.pp.highly_variable_genes(
@@ -81,11 +86,11 @@ def preprocess_rna(
     )
     adata.X = normalized_X
 
-    # --- Step 5: Determine genes to retain for downstream analysis ---
-    # Downstream analysis requires HVGs + user-specified target genes.
-    # Important: never modify the highly_variable column itself — PCA/clustering relies on it to select features;
-    # setting target genes to highly_variable=True would change the PCA input when the target genes change,
-    # resulting in inconsistent clustering results.
+    # --- 步骤5: 确定下游分析保留的基因 ---
+    # 下游分析需要 HVG + 用户指定的靶基因。
+    # 关键：绝不修改 highly_variable 列本身 —— PCA/聚类依赖它选择特征，
+    # 若将靶基因写入 highly_variable=True，更换靶基因会改变 PCA 输入，
+    # 导致聚类结果不一致。
     genes_to_keep = adata.var["highly_variable"].copy()
     if keep_genes:
         keep_set = {g for g in keep_genes if g in adata.var_names}
@@ -96,14 +101,14 @@ def preprocess_rna(
                 n_forced += 1
         if n_forced > 0:
             logger.info(
-                f"Retaining {n_forced} additional target genes (not highly variable) for downstream analysis"
+                f"额外保留 {n_forced} 个靶基因（不在高变基因中）用于下游分析"
             )
 
     adata_out = adata[:, genes_to_keep].copy()
     logger.info(
-        f"Retaining {adata_out.n_vars} genes for downstream analysis "
+        f"保留 {adata_out.n_vars} 个基因用于下游分析 "
         f"(HVG={adata_out.var['highly_variable'].sum()}, "
-        f"including target gene additions)"
+        f"含靶基因补充)"
     )
 
     return adata_out
@@ -116,50 +121,54 @@ def preprocess_atac(
     binarize: bool = True,
 ) -> ad.AnnData:
     """
-    Quality control and preprocessing of ATAC data.
+    ATAC 数据质量控制和预处理。
 
-    ATAC data is extremely sparse (<1% of peaks are nonzero in a single cell). Processing steps:
-    1. Filter low-coverage peaks and low-quality cells
-    2. Optional binarization (0/1) — ATAC signal is inherently binary (open/closed);
-       binarization can reduce the effects of PCR amplification bias and sequencing-depth differences
-    3. TF-IDF normalization — the standard normalization method for ATAC-seq data, increasing the weight of rare peaks
+    ATAC 数据极度稀疏（单细胞中 <1% peaks 非零）。处理步骤：
+    1. 过滤低覆盖 peak 和低质量细胞
+    2. 可选二值化（0/1）— ATAC 信号本质是 binary 的（开放/不开放），
+       二值化可以减少 PCR 扩增偏差和测序深度差异的影响
+    3. TF-IDF 归一化 — ATAC-seq 数据的标准归一化方法，放大稀有 peak 的权重
 
     Parameters
     ----------
     adata : AnnData
-        Raw ATAC count data
+        原始 ATAC 计数数据
     min_cells_per_peak : int
-        Peaks with signal in at least N cells
+        peak 至少在 N 个细胞中有信号
     min_peaks_per_cell : int
-        Cells with at least N peaks
+        细胞至少 N 个 peak
     binarize : bool
-        Whether to binarize the count matrix
+        是否将计数矩阵二值化
 
     Returns
     -------
     adata : AnnData
-        Preprocessed ATAC data
+        预处理后的 ATAC 数据
     """
+    from .atac_normalization import META, SOURCE_SCHEMA, validate_full_atac_source, finalize_atac_qc
+    prepared_source = adata if adata.uns.get(META, {}).get("schema") == SOURCE_SCHEMA else None
+    if prepared_source is not None:
+        validate_full_atac_source(prepared_source)
     adata = adata.copy()
 
-    logger.info(f"Before ATAC QC: {adata.n_obs} cells, {adata.n_vars} peaks")
+    logger.info(f"ATAC QC 前: {adata.n_obs} 细胞, {adata.n_vars} peaks")
 
-    # --- Step 1: Optional binarization ---
+    # --- 步骤1: 可选二值化 ---
     if binarize:
         adata.X = (adata.X > 0).astype(np.float32)
-        logger.info("ATAC matrix binarized")
+        logger.info("ATAC 矩阵已二值化")
 
-    # --- Step 2: Filtering ---
+    # --- 步骤2: 过滤 ---
     sc.pp.filter_genes(adata, min_cells=min_cells_per_peak)
     sc.pp.filter_cells(adata, min_genes=min_peaks_per_cell)
-    logger.info(f"After ATAC QC: {adata.n_obs} cells, {adata.n_vars} peaks")
+    logger.info(f"ATAC QC 后: {adata.n_obs} 细胞, {adata.n_vars} peaks")
 
     if adata.n_vars < 1000:
         logger.warning(
-            f"ATAC peak count is low ({adata.n_vars}), which may affect the statistical power of causal tests"
+            f"ATAC peak 数量较少 ({adata.n_vars})，可能影响因果检验的统计效力"
         )
 
-    return adata
+    return finalize_atac_qc(adata, prepared_source) if prepared_source is not None else adata
 
 
 def cluster_cells(
@@ -171,50 +180,50 @@ def cluster_cells(
     random_state: int = 42,
 ) -> ad.AnnData:
     """
-    Perform PCA + KNN graph construction + Leiden clustering on RNA data.
+    对 RNA 数据执行 PCA + KNN 图构建 + Leiden 聚类。
 
-    Write clustering labels to adata.obs[key_added] for per-cluster modeling by the pipeline.
+    聚类标签写入 adata.obs[key_added]，供 pipeline 按簇分别建模。
 
     Parameters
     ----------
     adata : AnnData
-        log1p-normalized RNA data
+        log1p 归一化后的 RNA 数据
     n_neighbors : int
-        Number of neighbors in the KNN graph
+        KNN 图邻居数
     n_pcs : int
-        Number of PCA components to use
+        使用的 PCA 主成分数
     resolution : float
-        Leiden clustering resolution (higher values produce more clusters)
+        Leiden 聚类分辨率（越大簇越多）
     key_added : str
-        Column name for clustering labels in obs
+        obs 中聚类标签的列名
     random_state : int
-        Random seed
+        随机种子
 
     Returns
     -------
     adata : AnnData
-        Data with clustering labels and UMAP coordinates
+        带有聚类标签和 UMAP 坐标的数据
     """
     logger.info(f"PCA → KNN(n={n_neighbors}, pcs={n_pcs}) → Leiden(res={resolution}) → UMAP")
 
-    # Compute PCA (scanpy checks whether PCA already exists and skips it if so)
+    # 计算 PCA（scanpy 会检查是否已有 PCA，有则跳过）
     if "X_pca" not in adata.obsm:
         sc.pp.pca(adata, n_comps=max(50, n_pcs), random_state=random_state)
-        logger.info(f"  PCA computed: {adata.obsm['X_pca'].shape}")
+        logger.info(f"  已计算 PCA: {adata.obsm['X_pca'].shape}")
 
-    # Build the neighborhood graph
+    # 构建邻域图
     sc.pp.neighbors(
         adata, n_neighbors=n_neighbors, n_pcs=n_pcs,
         random_state=random_state,
     )
 
-    # Leiden clustering
+    # Leiden 聚类
     sc.tl.leiden(adata, resolution=resolution, key_added=key_added,
                  random_state=random_state)
 
-    # UMAP dimensionality reduction (reuse the neighbors graph)
+    # UMAP 降维（复用 neighbors 图）
     sc.tl.umap(adata, random_state=random_state)
-    logger.info(f"  UMAP computed: {adata.obsm['X_umap'].shape}")
+    logger.info(f"  已计算 UMAP: {adata.obsm['X_umap'].shape}")
 
     n_clusters = adata.obs[key_added].nunique()
     cluster_sizes = adata.obs[key_added].value_counts()
@@ -226,8 +235,8 @@ def cluster_cells(
         cluster_sizes = cluster_sizes.reindex(
             sorted(cluster_sizes.index, key=str)
         )
-    logger.info(f"  Clustering complete: {n_clusters} clusters, "
-                f"sizes = {dict(cluster_sizes)}")
+    logger.info(f"  聚类完成: {n_clusters} 个簇, "
+                f"大小 = {dict(cluster_sizes)}")
 
     return adata
 
@@ -239,87 +248,87 @@ def build_paga_lineages(
     min_cells_per_lineage: int = 50,
 ) -> dict:
     """
-    Run PAGA on the Leiden clustering and merge connected clusters into continuous lineages.
+    在 Leiden 聚类基础上运行 PAGA，将连通的簇合并为连续谱系 (lineage)。
 
-    Purpose: Leiden clustering may fragment continuous developmental lineages into multiple small clusters. PAGA's graph abstraction
-    can identify the topological connectivity between these clusters and merge clusters that belong to the same lineage,
-    allowing pseudotime inference to run on the merged continuous lineages and avoiding broken trajectories.
+    目的：Leiden 聚类可能将连续发育谱系切碎成多个小簇。PAGA 的图抽象
+    能识别这些簇之间的拓扑连通性，将实际属于同一谱系的簇合并，
+    使得伪时间推断在合并后的连续谱系上运行，避免轨迹断裂。
 
     Parameters
     ----------
     adata : AnnData
-        RNA data with PCA + neighbors + Leiden clustering completed.
-        Must contain .obsm["X_pca"] and .uns["neighbors"].
+        已完成 PCA + neighbors + Leiden 聚类的 RNA 数据。
+        需包含 .obsm["X_pca"] 和 .uns["neighbors"]。
     cluster_key : str
-        Column name for Leiden clustering labels in .obs
+        .obs 中 Leiden 聚类标签的列名
     connectivity_threshold : float
-        PAGA connectivity threshold. Cluster pairs with connectivities[i,j] >= threshold are considered connected.
+        PAGA 连通性阈值。connectivities[i,j] >= threshold 的簇对视为连通。
     min_cells_per_lineage : int
-        Minimum number of cells after merging. Lineages below this value are merged into the nearest lineage.
+        合并后最少细胞数。低于此值的 lineage 合并到最近的 lineage。
 
     Returns
     -------
     lineages : dict
-        {cluster_label: lineage_id}, where lineage_id is "L0", "L1", ...
+        {cluster_label: lineage_id}，lineage_id 为 "L0", "L1", ...
     """
     from scipy.sparse import issparse
     from scipy.sparse.csgraph import connected_components
 
     logger.info(
-        f"Building PAGA lineages: groupby='{cluster_key}', "
+        f"PAGA lineage 构建: groupby='{cluster_key}', "
         f"threshold={connectivity_threshold}"
     )
 
-    # Ensure that the neighbors graph exists
+    # 确保 neighbors 图存在
     if "neighbors" not in adata.uns:
         raise RuntimeError(
-            "PAGA requires a precomputed KNN graph; run sc.pp.neighbors() first"
+            "PAGA 需要预先计算 KNN 图，请先运行 sc.pp.neighbors()"
         )
 
-    # Run PAGA (model='v1.0' does not depend on igraph cluster_graph and is compatible with igraph>=0.11)
+    # 运行 PAGA（model='v1.0' 不依赖 igraph cluster_graph，兼容 igraph>=0.11）
     sc.tl.paga(adata, groups=cluster_key, model="v1.0")
 
-    # Extract the connectivity matrix
+    # 提取连通性矩阵
     paga_conn = adata.uns["paga"]["connectivities"]
     if issparse(paga_conn):
         paga_conn = paga_conn.toarray()
     paga_conn = np.asarray(paga_conn)
 
-    # Cluster labels (keep the ordering consistent with cluster_cells)
+    # 簇标签（保持与 cluster_cells 一致的排序）
     cluster_labels = adata.obs[cluster_key].unique()
     try:
         cluster_labels = sorted(cluster_labels, key=int)
     except (ValueError, TypeError):
         cluster_labels = sorted(cluster_labels, key=str)
 
-    # Build the cluster-level connectivity graph: add an edge when connectivities >= threshold
+    # 构建簇级连通图：connectivities >= threshold 则连边
     adj = paga_conn >= connectivity_threshold
-    # Ensure it is undirected (PAGA connectivities should theoretically be symmetric, but values may differ)
+    # 确保无向（PAGA connectivities 理论上是对称的，但数值可能有差异）
     adj = adj | adj.T
 
-    # Analyze connected components
+    # 连通分量分析
     n_components, component_ids = connected_components(adj, directed=False)
 
-    # Build the cluster -> lineage mapping
+    # 构建 cluster -> lineage 映射
     lineage_map = {}
     for i, cl in enumerate(cluster_labels):
         comp_id = int(component_ids[i])
         lineage_map[cl] = f"L{comp_id}"
 
-    # Count cells in each lineage
+    # 统计每个 lineage 的细胞数
     lineage_cells = {}
     for cl, lin in lineage_map.items():
         n = (adata.obs[cluster_key] == cl).sum()
         lineage_cells[lin] = lineage_cells.get(lin, 0) + n
 
-    # Handle small lineages: merge them into the nearest lineage
+    # 处理过小的 lineage：合并到最近的 lineage
     small_lineages = {
         lin for lin, n in lineage_cells.items()
         if n < min_cells_per_lineage
     }
     if small_lineages and len(lineage_cells) > 1:
         for small_lin in small_lineages:
-            # Find the adjacent lineage with the highest PAGA connectivity
+            # 找 paga connectivities 最高的相邻 lineage
             small_clusters = [
                 cl for cl, lin in lineage_map.items() if lin == small_lin
             ]
@@ -339,18 +348,18 @@ def build_paga_lineages(
                 for cl in small_clusters:
                     lineage_map[cl] = best_target
                 logger.info(
-                    f"Lineage {small_lin} ({lineage_cells[small_lin]} cells) "
-                    f"merged into {best_target} "
+                    f"Lineage {small_lin} ({lineage_cells[small_lin]} 细胞) "
+                    f"合并到 {best_target} "
                     f"(PAGA connectivity={best_conn:.3f})"
                 )
 
-    # Renumber lineages (merging may leave gaps)
+    # 重新编号 lineage（合并后可能有空缺）
     unique_lineages = sorted(set(lineage_map.values()))
     if unique_lineages:
         new_ids = {old: f"L{i}" for i, old in enumerate(unique_lineages)}
         lineage_map = {cl: new_ids[lin] for cl, lin in lineage_map.items()}
 
-    # Output summary
+    # 输出摘要
     final_counts = {}
     for cl, lin in lineage_map.items():
         n = (adata.obs[cluster_key] == cl).sum()
@@ -362,15 +371,15 @@ def build_paga_lineages(
             key=lambda x: (x.isdigit(), x),
         )
         logger.info(
-            f"  {lin}: {final_counts[lin]} cells, "
-            f"clusters = [{', '.join(member_clusters)}]"
+            f"  {lin}: {final_counts[lin]} 细胞, "
+            f"簇 = [{', '.join(member_clusters)}]"
         )
 
-    # Write lineage labels to adata.obs
+    # 将 lineage 标签写入 adata.obs
     adata.obs["lineage"] = adata.obs[cluster_key].map(lineage_map)
     logger.info(
-        f"PAGA lineage construction complete: {len(unique_lineages)} lineages, "
-        f"covering {sum(final_counts.values())} cells"
+        f"PAGA lineage 构建完成: {len(unique_lineages)} 个 lineage, "
+        f"覆盖 {sum(final_counts.values())} 个细胞"
     )
 
     return lineage_map
@@ -381,63 +390,67 @@ def save_cluster_top_genes(
     cluster_key: str = "leiden",
     n_top: int = 50,
     output_path: str = None,
+    *, gene_identity=None,
 ):
     """
-    Perform differential expression analysis for each cluster and output top N marker genes and statistics.
+    对每个簇做差异表达分析，输出 top N 标记基因及统计量。
 
-    Use scanpy rank_genes_groups (Wilcoxon) to calculate:
-      - logFC: log fold change for this cluster vs. other clusters
-      - p_value / p_adj: Wilcoxon rank-sum test p-value and FDR correction
-      - pct_in: proportion of cells expressing this gene within the cluster
-      - pct_out: proportion of cells expressing this gene outside the cluster
+    使用 scanpy rank_genes_groups (Wilcoxon) 计算：
+      - logFC: 该簇 vs 其他簇的对数倍变化
+      - p_value / p_adj: Wilcoxon 秩和检验 p 值及 FDR 校正
+      - pct_in: 簇内表达该基因的细胞比例
+      - pct_out: 簇外表达该基因的细胞比例
 
     Parameters
     ----------
     adata : AnnData
-        Preprocessed RNA data (.layers["raw"] must contain the original counts)
+        预处理后的 RNA 数据（.layers["raw"] 需包含原始计数）
     cluster_key : str
-        Column name for clustering labels
+        聚类标签列名
     n_top : int
-        Number of top genes to output for each cluster
+        每个簇输出的 top 基因数
     output_path : str or None
-        Output CSV path
+        输出 CSV 路径
     """
     import pandas as pd
+    from .kinetics import _gene_base_map
+    base_map = _gene_base_map(adata, gene_identity)
 
     if cluster_key not in adata.obs.columns:
-        logger.warning(f"Column '{cluster_key}' not found; skipping cluster marker gene output")
+        logger.warning(f"未找到 '{cluster_key}' 列，跳过簇标记基因输出")
         return
 
-    # Filter out clusters with too few cells to prevent rank_genes_groups from failing
+    # 过滤掉细胞数过少的簇，避免 rank_genes_groups 崩溃
     cluster_counts = adata.obs[cluster_key].value_counts()
     valid_clusters = cluster_counts[cluster_counts >= 5].index.tolist()
     if len(valid_clusters) < len(cluster_counts):
         skipped = set(cluster_counts.index) - set(valid_clusters)
         logger.warning(
-            f"Skipping {len(skipped)} clusters with too few cells: {sorted(skipped)}"
+            f"跳过 {len(skipped)} 个细胞数不足的簇: {sorted(skipped)}"
         )
         if len(valid_clusters) < 2:
-            logger.warning("Fewer than 2 valid clusters; skipping cluster marker gene output")
+            logger.warning("有效簇不足 2 个，跳过簇标记基因输出")
             return
         adata = adata[adata.obs[cluster_key].isin(valid_clusters)].copy()
 
-    # Exclude mitochondrial genes
+    # 排除线粒体基因
     # ``var_names`` may use pandas' nullable string dtype, which makes this
     # expression a nullable BooleanArray.  AnnData requires a plain NumPy
     # boolean array for boolean variable indexing; ``na=False`` also keeps
     # missing/non-string names as non-mitochondrial.
     is_mito = np.asarray(
-        adata.var_names.str.upper().str.startswith("MT-", na=False),
+        pd.Index(list(base_map.values()) if base_map is not None else adata.var_names)
+        .str.upper().str.startswith("MT-", na=False),
         dtype=bool,
     )
     adata_no_mt = adata[:, ~is_mito].copy()
     logger.info(
-        f"Excluded {is_mito.sum()} mitochondrial genes, "
-        f"leaving {adata_no_mt.n_vars} genes for differential expression analysis"
+        f"排除 {is_mito.sum()} 个线粒体基因，"
+        f"剩余 {adata_no_mt.n_vars} 个基因用于差异分析"
     )
 
-    # Wilcoxon differential expression (requires raw counts)
-    # Temporarily replace X with raw, then restore it
+    # Wilcoxon 差异表达（需要原始计数）
+    # 临时将 X 替换为 raw，用完恢复
     saved_X = adata_no_mt.X
     if "raw" in adata_no_mt.layers:
         adata_no_mt.X = adata_no_mt.layers["raw"]
@@ -446,12 +459,13 @@ def save_cluster_top_genes(
         adata_no_mt, groupby=cluster_key,
         method="wilcoxon", n_genes=n_top,
         tie_correct=True,
+        **({"use_raw": False} if base_map is not None else {}),
     )
 
     adata_no_mt.X = saved_X
 
     result = adata_no_mt.uns["rank_genes_groups"]
-    # Support both integer cluster IDs (Leiden) and string cluster names (author annotations)
+    # 兼容整数簇号（Leiden）和字符串簇名（作者标注）
     try:
         clusters = sorted(adata_no_mt.obs[cluster_key].unique(), key=int)
     except ValueError:
@@ -491,6 +505,11 @@ def save_cluster_top_genes(
             })
 
     top_df = pd.DataFrame(rows)
+    if base_map is not None and "gene" in top_df:
+        top_df["gene_id"] = top_df["gene"]
+        top_df["gene_name"] = top_df["gene"].map(base_map)
+        top_df["gene"] = top_df["gene"].map(adata.var["gene_display_name"])
+        top_df["gene_display_name"] = top_df["gene"]
 
     if output_path is None:
         output_path = f"cluster_top{n_top}_genes.csv"
@@ -498,13 +517,20 @@ def save_cluster_top_genes(
 
     for cl in clusters:
         cl_genes = top_df[top_df["cluster"] == cl]["gene"].head(10).tolist()
-        logger.info(f"  Cluster {cl} top10: {', '.join(cl_genes)}")
+        logger.info(f"  簇 {cl} top10: {', '.join(cl_genes)}")
 
-    logger.info(f"Cluster marker genes saved to: {output_path}")
+    logger.info(f"簇标记基因已保存至: {output_path}")
+
+
+def _export_cluster_markers(adata, cluster_key="leiden", n_top=50,
+                            output_path=None, *, gene_identity=None):
+    """Identity-aware marker export entry point for pipeline callers."""
+    return save_cluster_top_genes(adata, cluster_key, n_top, output_path,
+                                 gene_identity=gene_identity)
 
 
 def _safe_float(val) -> float:
-    """Safely convert to float; write NaN/Inf as 1.0 (the least significant value)."""
+    """安全转换为 float，NaN/Inf 写为 1.0（最不显著的值）。"""
     v = float(val)
     if np.isnan(v) or np.isinf(v):
         return 1.0
@@ -516,31 +542,31 @@ def match_cells(
     atac_adata: ad.AnnData,
 ) -> Tuple[ad.AnnData, ad.AnnData]:
     """
-    Ensure that the cells in the RNA and ATAC AnnData objects match exactly and have the same order.
+    确保 RNA 和 ATAC 两个 AnnData 对象的细胞完全匹配、顺序一致。
 
-    This is one of the most error-prone steps in multi-omics analysis—even if the two files come from the same 10x Multiome
-    experiment, the retained cells may differ after different QC filters. This function:
-    1. Takes the intersection of the cells in both objects
-    2. Orders the cells consistently
-    3. Verifies that only shared cells are retained
+    这是多组学分析中最容易出错的步骤——即使两个文件来自同一个 10x Multiome
+    实验，经过不同的 QC 过滤后，保留的细胞可能不同。此函数：
+    1. 取两者细胞交集
+    2. 将细胞按统一顺序排列
+    3. 验证只有共有细胞被保留
 
     Returns
     -------
-     rna_adata, atac_adata : Two AnnData objects with matching cells in the same order
+    rna_adata, atac_adata : 细胞匹配且顺序一致的两个 AnnData
     """
     common_cells = list(
         set(rna_adata.obs_names) & set(atac_adata.obs_names)
     )
     if len(common_cells) == 0:
-        raise ValueError("RNA and ATAC have no shared cells")
+        raise ValueError("RNA 和 ATAC 没有共享细胞")
 
     rna_adata = rna_adata[common_cells].copy()
     atac_adata = atac_adata[common_cells].copy()
 
-    # Sort consistently to ensure matching indices
+    # 统一排序，确保索引一致
     sorted_barcodes = sorted(common_cells)
     rna_adata = rna_adata[sorted_barcodes]
     atac_adata = atac_adata[sorted_barcodes]
 
-    logger.info(f"Cell matching complete: {len(common_cells)} shared cells")
+    logger.info(f"细胞匹配完成: {len(common_cells)} 个共有细胞")
     return rna_adata, atac_adata

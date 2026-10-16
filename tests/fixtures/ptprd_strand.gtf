@@ -1,0 +1,3 @@
+chr9	HAVANA	gene	8314246	10613002	.	-	.	gene_id "ENSG00000153707"; gene_version "19"; gene_type "protein_coding"; gene_name "PTPRD";
+chr9	test	gene	8314246	8314345	.	+	.	gene_id "PLUS"; gene_name "PLUS";
+chr9	test	gene	42	42	.	-	.	gene_id "ONE"; gene_name "ONE";

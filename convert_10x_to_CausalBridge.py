@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-10x output → CausalBridge input format conversion tool
+10x 输出 → CausalBridge 输入格式转换工具
 
-Supports two input modes:
+支持两种输入模式：
 
-  Mode A — combined Multiome file (h5 or mtx directory) ★ Recommended
-    Cell Ranger ARC outputs ATAC+RNA to one h5 file or mtx directory;
-    features are automatically split by type label (Gene Expression / Peaks).
+  模式A — 合并的 Multiome 文件（h5 或 mtx 目录） ★ 推荐
+    Cell Ranger ARC 同时输出 ATAC+RNA 到一个 h5 文件或 mtx 目录，
+    feature 按类型标签（Gene Expression / Peaks），自动拆分。
 
     python convert_10x_to_CausalBridge.py \
         -i /home/huangtao/Desktop/huangchengqi/GSE282390_WT_KO/WT/ \
@@ -18,8 +18,8 @@ Supports two input modes:
         -g genes.gtf \
         -o /home/huangtao/Desktop/huangchengqi/CausalBridge/result/
 
-  Mode B — separate RNA and ATAC paths
-    Use when RNA and ATAC come from different 10x output directories.
+  模式B — 分离的 RNA 和 ATAC 路径
+    当 RNA 和 ATAC 来自不同的 10x 输出目录时使用。
 
     python convert_10x_to_CausalBridge.py \
         --rna  RNA/ \
@@ -28,7 +28,7 @@ Supports two input modes:
         -g genes.gtf \
         -o ./output
 
-Dependencies: scanpy, anndata, pandas, numpy
+依赖：scanpy, anndata, pandas, numpy
 """
 
 import argparse
@@ -48,125 +48,125 @@ from scipy.sparse import issparse
 
 def main():
     parser = argparse.ArgumentParser(
-        description="10x output → CausalBridge AnnData conversion"
+        description="10x 输出 → CausalBridge AnnData 转换"
     )
 
-    # --- Input paths ---
+    # --- 输入路径 ---
     parser.add_argument(
         "--input", "-i", default=None,
-        help="Path to a combined Multiome file (.h5) or mtx directory. "
-             "Use this instead of --rna/--atac.",
+        help="合并的 Multiome 文件（.h5）或 mtx 目录路径。"
+             "与 --rna/--atac 二选一。",
     )
     parser.add_argument(
         "--rna", default=None,
-        help="Path to the RNA 10x mtx directory (with matrix.mtx.gz + barcodes.tsv.gz + features.tsv.gz)",
+        help="RNA 数据的 10x mtx 目录路径（含 matrix.mtx.gz + barcodes.tsv.gz + features.tsv.gz）",
     )
     parser.add_argument(
         "--atac", default=None,
-        help="Path to the ATAC 10x mtx directory (with matrix.mtx + barcodes.tsv)",
+        help="ATAC 数据的 10x mtx 目录路径（含 matrix.mtx + barcodes.tsv）",
     )
     parser.add_argument(
         "--atac-peaks", default=None,
-        help="ATAC peak annotation file (peaks.bed), required when the ATAC mtx directory lacks features. "
-             "Format: chr start end",
+        help="ATAC peak 注释文件（peaks.bed），ATAC mtx 目录缺少 features 时需要。"
+             "格式: chr start end",
     )
 
-    # --- Gene coordinates ---
+    # --- 基因坐标 ---
     parser.add_argument(
         "--gtf", "-g", default=None,
-        help="Gene annotation GTF/GFF file (supports .gz), used to extract gene TSS coordinates",
+        help="基因注释 GTF/GFF 文件（支持 .gz），用于提取基因 TSS 坐标",
     )
     parser.add_argument(
         "--genome", default=None,
-        help="Genome version (hg38/hg19/mm10/mm39), used for online MyGene API queries",
+        help="基因组版本（hg38/hg19/mm10/mm39），用于 MyGene API 在线查询",
     )
 
-    # --- Output and filtering ---
+    # --- 输出与过滤 ---
     parser.add_argument(
         "--output", "-o", default="./CausalBridge_input",
-        help="Output directory (default: ./CausalBridge_input)",
+        help="输出目录（默认 ./CausalBridge_input）",
     )
     parser.add_argument(
         "--min-genes", type=int, default=200,
-        help="Minimum genes detected per cell (default: 200)",
+        help="细胞至少检测到的基因数（默认 200）",
     )
     parser.add_argument(
         "--min-peaks", type=int, default=500,
-        help="Minimum peaks detected per cell (default: 500)",
+        help="细胞至少检测到的 peak 数（默认 500）",
     )
 
     args = parser.parse_args()
 
-    # --- Validate input combinations ---
+    # --- 验证输入组合 ---
     if args.input and (args.rna or args.atac):
-        print("Error: --input cannot be used together with --rna/--atac; choose one")
+        print("错误: --input 与 --rna/--atac 不能同时使用，请二选一")
         sys.exit(1)
     if not args.input and not (args.rna and args.atac):
-        print("Error: provide --input or both --rna and --atac")
+        print("错误: 必须提供 --input 或同时提供 --rna 和 --atac")
         sys.exit(1)
 
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # ========================================================================
-    # Step 1: Read data
+    # Step 1: 读取数据
     # ========================================================================
-    print("[1/5] Reading input data...")
+    print("[1/5] 读取输入数据...")
 
     if args.input:
-        # Mode A: combined multi-omics data
+        # 模式A: 合并的多组学数据
         rna_adata, atac_adata = _read_combined_input(args.input)
     else:
-        # Mode B: separate RNA and ATAC data
+        # 模式B: 分离的 RNA 和 ATAC 数据
         rna_adata = _read_10x_mtx_dir(args.rna, modality="rna")
         atac_adata = _read_atac_mtx_dir(args.atac, args.atac_peaks)
 
-        # Warning for Mode B: cells may not match (not paired multi-omics data)
-        print("      Note: RNA and ATAC come from different experiments; cells may not match.")
-        print("      CausalBridge requires paired multi-omics data (ATAC+RNA from the same cells).")
-        print("      If cell counts differ, only shared barcodes will be retained.")
+        # 模式B 的警告: 细胞可能不匹配（非多组学配对数据）
+        print("      注意: RNA 和 ATAC 来自不同实验，细胞可能不匹配。")
+        print("      CausalBridge 需要配对的多组学数据（同一细胞的 ATAC+RNA）。")
+        print("      如果细胞数不同，将仅保留共有 barcode。")
 
     # ========================================================================
-    # Step 2: Basic QC
+    # Step 2: 基础 QC
     # ========================================================================
-    print("[2/5] Quality control...")
+    print("[2/5] 质量控制...")
 
     rna_adata, atac_adata = _filter_cells(
         rna_adata, atac_adata, args.min_genes, args.min_peaks
     )
 
     # ========================================================================
-    # Step 3: Add genomic coordinates
+    # Step 3: 添加基因组坐标
     # ========================================================================
-    print("[3/5] Adding genomic coordinates...")
+    print("[3/5] 添加基因组坐标...")
 
-    # ATAC: parse from peak names or peaks.bed
+    # ATAC: 从 peak 名称或 peaks.bed 解析
     atac_adata = _annotate_peak_coords(atac_adata)
 
-    # RNA: obtain gene TSS from GTF or MyGene API
+    # RNA: 从 GTF 或 MyGene API 获取基因 TSS
     rna_adata = _annotate_gene_coords(
         rna_adata, args.gtf, args.genome
     )
 
     # ========================================================================
-    # Step 4: Align cell order
+    # Step 4: 统一细胞顺序
     # ========================================================================
-    print("[4/5] Aligning cell order...")
+    print("[4/5] 统一细胞顺序...")
 
     common = sorted(set(rna_adata.obs_names) & set(atac_adata.obs_names))
     if len(common) == 0:
-        print("Error: RNA and ATAC have no shared cell barcodes")
+        print("错误: RNA 和 ATAC 无共享细胞 barcode")
         sys.exit(1)
 
     rna_adata = rna_adata[common].copy()
     atac_adata = atac_adata[common].copy()
 
-    print(f"      Final cell count: {len(common)}")
+    print(f"      最终细胞数: {len(common)}")
 
     # ========================================================================
-    # Step 5: Save
+    # Step 5: 保存
     # ========================================================================
-    print("[5/5] Saving...")
+    print("[5/5] 保存...")
 
     rna_path = output_dir / "rna_adata.h5ad"
     atac_path = output_dir / "atac_adata.h5ad"
@@ -177,39 +177,39 @@ def main():
     atac_adata.write(atac_path)
 
     print(f"      RNA  → {rna_path}")
-    print(f"             {rna_adata.n_obs} cells × {rna_adata.n_vars} genes")
+    print(f"             {rna_adata.n_obs} 细胞 × {rna_adata.n_vars} 基因")
     print(f"      ATAC → {atac_path}")
-    print(f"             {atac_adata.n_obs} cells × {atac_adata.n_vars} peaks")
+    print(f"             {atac_adata.n_obs} 细胞 × {atac_adata.n_vars} peaks")
     print()
-    print("Add to config.yaml:")
+    print("config.yaml 中填入:")
     print(f"  input.rna_h5ad: {rna_path.resolve()}")
     print(f"  input.atac_h5ad: {atac_path.resolve()}")
 
-    # Check coordinate completeness
+    # 检查坐标完整性
     for label, a in [("RNA", rna_adata), ("ATAC", atac_adata)]:
         missing = [c for c in ["chr", "start", "end"] if c not in a.var.columns]
         if missing:
-            print(f"  ⚠ {label} is missing columns: {missing}; check the input data")
+            print(f"  ⚠ {label} 缺少列: {missing}，请检查输入数据")
 
 
 # ============================================================================
-# Data reading
+# 数据读取
 # ============================================================================
 
 def _read_combined_input(path_str: str):
-    """Mode A: read combined multi-omics data and automatically split RNA and ATAC."""
+    """模式A: 读取合并的多组学数据，自动拆分为 RNA 和 ATAC。"""
     path = Path(path_str)
 
     if path.is_dir():
         adata = _read_10x_mtx_dir(path_str, modality="multiome")
     elif path.suffix in (".h5", ".h5ad"):
-        # gex_only=False must be explicit: the default True silently discards all Peaks features
+        # gex_only=False 必须显式传: 默认 True 会静默丢弃全部 Peaks features
         adata = sc.read_10x_h5(str(path), gex_only=False)
     else:
-        print(f"Error: unrecognized input format: {path}")
+        print(f"错误: 无法识别输入格式: {path}")
         sys.exit(1)
 
-    # Determine the feature-type column
+    # 确定 feature 类型列
     if "feature_types" not in adata.var.columns:
         adata.var["feature_types"] = _infer_feature_types(adata)
 
@@ -217,34 +217,34 @@ def _read_combined_input(path_str: str):
     atac_mask = adata.var["feature_types"] == "Peaks"
 
     if rna_mask.sum() == 0:
-        print("Error: no Gene Expression features found")
+        print("错误: 未找到 Gene Expression features")
         sys.exit(1)
     if atac_mask.sum() == 0:
-        print("Error: no Peaks features found; is this Multiome data?")
+        print("错误: 未找到 Peaks features，是否为 Multiome 数据？")
         sys.exit(1)
 
     rna = adata[:, rna_mask].copy()
     atac = adata[:, atac_mask].copy()
 
-    print(f"      RNA:  {rna.n_obs} cells × {rna.n_vars} genes")
-    print(f"      ATAC: {atac.n_obs} cells × {atac.n_vars} peaks")
+    print(f"      RNA:  {rna.n_obs} 细胞 × {rna.n_vars} 基因")
+    print(f"      ATAC: {atac.n_obs} 细胞 × {atac.n_vars} peaks")
     return rna, atac
 
 
 def _read_10x_mtx_dir(dir_path: str, modality: str = "rna"):
     """
-    Read a 10x mtx-format directory.
+    读取 10x mtx 格式目录。
 
-    A standard 10x directory contains:
-      matrix.mtx.gz (or .mtx)
-      barcodes.tsv.gz (or .tsv)
-      features.tsv.gz (or .tsv)   — three columns: feature_id, feature_name, feature_type
+    标准 10x 目录包含:
+      matrix.mtx.gz (或 .mtx)
+      barcodes.tsv.gz (或 .tsv)
+      features.tsv.gz (或 .tsv)   — 三列: feature_id, feature_name, feature_type
     """
     path = Path(dir_path)
 
-    # Find files (supports .gz and uncompressed files)
+    # 查找文件（支持 .gz 和未压缩）
     def _find(pattern):
-        # Try the .gz suffix and the uncompressed version
+        # 尝试 .gz 后缀和未压缩版本
         candidates = list(path.glob(pattern)) + list(path.glob(pattern.replace(".gz", "")))
         for c in candidates:
             if c.is_file():
@@ -259,7 +259,7 @@ def _read_10x_mtx_dir(dir_path: str, modality: str = "rna"):
     feature_file = _find("features.tsv*") or _find("genes.tsv*")
 
     if not mtx_file:
-        print(f"Error: matrix.mtx(.gz) not found in {dir_path}")
+        print(f"错误: 在 {dir_path} 中未找到 matrix.mtx(.gz)")
         sys.exit(1)
 
     adata = sc.read_10x_mtx(
@@ -268,46 +268,46 @@ def _read_10x_mtx_dir(dir_path: str, modality: str = "rna"):
         gex_only=False,
     )
 
-    print(f"      mtx read: {adata.n_obs} cells × {adata.n_vars} features")
+    print(f"      mtx 读取: {adata.n_obs} 细胞 × {adata.n_vars} features")
     return adata
 
 
 def _read_atac_mtx_dir(dir_path: str, peaks_bed: str = None):
     """
-    Read an ATAC mtx matrix.
+    读取 ATAC mtx 矩阵。
 
-    ATAC directories usually do not contain features.tsv (peak information is in a separate peaks.bed).
-    If peaks.bed is provided, use it for var annotations; otherwise infer from the barcode filename.
+    ATAC 目录通常不包含 features.tsv（peak 信息在单独的 peaks.bed 中）。
+    如果提供了 peaks.bed，用其作为 var 注释；否则从 barcode 文件名推断。
 
-    Also try reading directly with scanpy's read_10x_mtx (if the directory has a features file).
+    同时尝试用 scanpy 的 read_10x_mtx 直接读取（如果目录有 features 文件）。
     """
     path = Path(dir_path)
 
-    # First try standard 10x mtx reading
+    # 先尝试标准 10x mtx 读取
     mtx_file = list(path.glob("matrix.mtx*"))
     if mtx_file:
         try:
             adata = sc.read_10x_mtx(str(path), gex_only=False)
-            print(f"      ATAC mtx: {adata.n_obs} cells × {adata.n_vars} features")
+            print(f"      ATAC mtx: {adata.n_obs} 细胞 × {adata.n_vars} features")
             return adata
         except Exception as e:
-            print(f"      Standard mtx read failed ({e}); trying manual reading...")
+            print(f"      标准 mtx 读取失败 ({e})，尝试手动读取...")
 
-    # Manual reading: matrix.mtx + barcodes.tsv
+    # 手动读取: matrix.mtx + barcodes.tsv
     import scipy.io
     from scipy.sparse import csr_matrix
 
-    # Read matrix.mtx
+    # 读取 matrix.mtx
     mtx_candidates = list(path.glob("matrix.mtx*"))
     if not mtx_candidates:
-        print(f"Error: matrix.mtx not found in {dir_path}")
+        print(f"错误: 在 {dir_path} 中未找到 matrix.mtx")
         sys.exit(1)
 
     mat = scipy.io.mmread(str(mtx_candidates[0]))
     if not issparse(mat):
         mat = csr_matrix(mat)
 
-    # Read barcodes
+    # 读取 barcodes
     bc_candidates = list(path.glob("barcodes.tsv*"))
     barcodes = []
     if bc_candidates:
@@ -318,7 +318,7 @@ def _read_atac_mtx_dir(dir_path: str, peaks_bed: str = None):
     else:
         barcodes = [f"cell_{i}" for i in range(mat.shape[0])]
 
-    # Read or generate peak names
+    # 读取或生成 peak 名称
     features_candidates = list(path.glob("features.tsv*"))
     if features_candidates:
         feat_file = str(features_candidates[0])
@@ -327,7 +327,7 @@ def _read_atac_mtx_dir(dir_path: str, peaks_bed: str = None):
         with opener(feat_file, "rt") as f:
             for line in f:
                 parts = line.strip().split("\t")
-                # Use the second column as the name (10x format: id name type)
+                # 取第二列作为名称（10x 格式: id name type）
                 peak_names.append(parts[1] if len(parts) > 1 else parts[0])
     elif peaks_bed:
         with open(peaks_bed) as f:
@@ -337,7 +337,7 @@ def _read_atac_mtx_dir(dir_path: str, peaks_bed: str = None):
                     c, s, e = line.strip().split("\t")[:3]
                     peak_names.append(f"{c}:{s}-{e}")
     else:
-        # Fallback: check whether the directory contains peaks.bed
+        # 兜底: 检查目录中是否有 peaks.bed
         bed_candidates = list(path.parent.glob("peaks.bed")) + list(path.parent.glob("*.bed"))
         if bed_candidates:
             with open(bed_candidates[0]) as f:
@@ -348,9 +348,9 @@ def _read_atac_mtx_dir(dir_path: str, peaks_bed: str = None):
                         peak_names.append(f"{c}:{s}-{e}")
         else:
             peak_names = [f"peak_{i}" for i in range(mat.shape[1])]
-            print("      Warning: no peak annotation file found; using placeholder names")
+            print("      警告: 未找到 peak 注释文件，将使用占位名称")
 
-    # Construct AnnData (transpose to cells × peaks)
+    # 构造 AnnData（转置为 cells × peaks）
     if mat.shape[0] == len(barcodes) and mat.shape[1] == len(peak_names):
         adata_atac = ad.AnnData(
             X=mat.tocsr(),
@@ -364,7 +364,7 @@ def _read_atac_mtx_dir(dir_path: str, peaks_bed: str = None):
             var=pd.DataFrame(index=peak_names),
         )
     else:
-        # Try matching the larger dimension
+        # 尝试匹配较大维度
         if mat.shape[0] > mat.shape[1]:
             adata_atac = ad.AnnData(
                 X=mat.tocsr(),
@@ -378,16 +378,16 @@ def _read_atac_mtx_dir(dir_path: str, peaks_bed: str = None):
                 var=pd.DataFrame(index=peak_names[:mat.shape[0]]),
             )
 
-    print(f"      ATAC mtx (manual): {adata_atac.n_obs} cells × {adata_atac.n_vars} peaks")
+    print(f"      ATAC mtx (手动): {adata_atac.n_obs} 细胞 × {adata_atac.n_vars} peaks")
     return adata_atac
 
 
 # ============================================================================
-# Feature type inference
+# Feature 类型推断
 # ============================================================================
 
 def _infer_feature_types(adata: ad.AnnData) -> pd.Series:
-    """Infer feature type from the name. Peak: chr1:12345-67890; gene: anything else."""
+    """从名称推断 feature 类型。Peak: chr1:12345-67890, 基因: 其他。"""
     types = []
     for name in adata.var_names:
         if _is_peak_name(name):
@@ -396,12 +396,12 @@ def _infer_feature_types(adata: ad.AnnData) -> pd.Series:
             types.append("Gene Expression")
     series = pd.Series(types, index=adata.var_names)
     n_peaks = (series == "Peaks").sum()
-    print(f"      Inferred: {len(series) - n_peaks} genes, {n_peaks} peaks")
+    print(f"      推断: {len(series) - n_peaks} 基因, {n_peaks} peaks")
     return series
 
 
 def _is_peak_name(name: str) -> bool:
-    """Return whether the name matches peak format: chr1:12345-67890 or chr1-12345-67890."""
+    """判断名称是否符合 peak 格式: chr1:12345-67890 或 chr1-12345-67890。"""
     try:
         return _parse_peak_name(name) is not None
     except (AttributeError, TypeError):
@@ -409,7 +409,7 @@ def _is_peak_name(name: str) -> bool:
 
 
 def _parse_peak_name(name: str):
-    """Parse the two peak-name formats chr:start-end and chr-start-end."""
+    """解析 chr:start-end 和 chr-start-end 两种 peak 名称格式。"""
     if ":" in name:
         parts = name.split(":")
         if len(parts) != 2:
@@ -431,11 +431,11 @@ def _parse_peak_name(name: str):
 
 
 # ============================================================================
-# QC filtering
+# QC 过滤
 # ============================================================================
 
 def _filter_cells(rna_adata, atac_adata, min_genes: int, min_peaks: int):
-    """Basic cell filtering; retain cells that pass both modalities."""
+    """基础细胞过滤，保留两个模态均通过的细胞。"""
     # RNA
     rna_n = np.array((rna_adata.X > 0).sum(axis=1)).flatten() if issparse(rna_adata.X) else (rna_adata.X > 0).sum(axis=1)
     rna_keep = rna_n >= min_genes
@@ -445,18 +445,18 @@ def _filter_cells(rna_adata, atac_adata, min_genes: int, min_peaks: int):
     atac_keep = atac_n >= min_peaks
 
     keep = rna_adata.obs_names[rna_keep & atac_keep]
-    print(f"      Before QC: {rna_adata.n_obs} cells")
-    print(f"      After QC: {len(keep)} cells")
+    print(f"      QC 前: {rna_adata.n_obs} 细胞")
+    print(f"      QC 后: {len(keep)} 细胞")
 
     return rna_adata[keep].copy(), atac_adata[keep].copy()
 
 
 # ============================================================================
-# Peak coordinate parsing
+# Peak 坐标解析
 # ============================================================================
 
 def _annotate_peak_coords(atac_adata: ad.AnnData) -> ad.AnnData:
-    """Parse chr/start/end from peak names. Supports colon- and hyphen-separated formats."""
+    """从 peak 名称解析 chr/start/end。支持冒号和连字符分隔格式。"""
     chrs, starts, ends = [], [], []
     failed = 0
 
@@ -479,37 +479,37 @@ def _annotate_peak_coords(atac_adata: ad.AnnData) -> ad.AnnData:
 
     n = len(atac_adata.var_names)
     if failed > 0:
-        print(f"      Warning: could not parse coordinates for {failed}/{n} peaks")
+        print(f"      警告: {failed}/{n} 个 peak 无法解析坐标")
     else:
-        print(f"      ATAC: successfully parsed coordinates for {n} peaks")
+        print(f"      ATAC: {n} 个 peak 坐标解析成功")
     return atac_adata
 
 
 # ============================================================================
-# Gene coordinate annotation
+# 基因坐标注释
 # ============================================================================
 
 def _annotate_gene_coords(rna_adata: ad.AnnData, gtf_path: str = None, genome: str = None) -> ad.AnnData:
     """
-    Add chr/start/end columns to RNA .var.
+    为 RNA .var 添加 chr/start/end 列。
 
-    Priority: GTF file > MyGene.info API > local cache > placeholder values
+    优先级: GTF 文件 > MyGene.info API > 本地缓存 > 占位值
     """
     gene_info = None
 
-    # Strategy 1: GTF
+    # 策略1: GTF
     if gtf_path and Path(gtf_path).exists():
-        print(f"      Parsing GTF: {gtf_path}")
+        print(f"      解析 GTF: {gtf_path}")
         gene_info = _parse_gtf_genes(gtf_path, set(rna_adata.var_names))
         if gene_info:
-            print(f"      GTF matches: {len(gene_info)}/{rna_adata.n_vars} genes")
+            print(f"      GTF 匹配: {len(gene_info)}/{rna_adata.n_vars} 基因")
 
-    # Strategy 2: MyGene API
+    # 策略2: MyGene API
     if gene_info is None or len(gene_info) < rna_adata.n_vars * 0.3:
-        print("      Trying online MyGene.info query...")
+        print("      尝试 MyGene.info 在线查询...")
         gene_info = _query_mygene(list(rna_adata.var_names), genome)
 
-    # Strategy 3: local cache
+    # 策略3: 本地缓存
     if gene_info is None:
         cache = Path.home() / ".CausalBridge" / "gene_coords.parquet"
         if cache.exists():
@@ -519,12 +519,12 @@ def _annotate_gene_coords(rna_adata: ad.AnnData, gtf_path: str = None, genome: s
                 for _, r in df.iterrows()
             }
             n = sum(1 for g in rna_adata.var_names if g in gene_info)
-            print(f"      Cache matches: {n}/{rna_adata.n_vars} genes")
+            print(f"      缓存匹配: {n}/{rna_adata.n_vars} 基因")
 
-    # Fill annotations
+    # 填充
     if gene_info is None:
-        print("      Warning: unable to obtain gene coordinates; using placeholder values")
-        print("      (CausalBridge can still run, but genomic-distance filtering will be skipped)")
+        print("      警告: 无法获取基因坐标，将使用占位值")
+        print("      (CausalBridge 仍可运行，但会跳过基因组距离过滤)")
         rna_adata.var["chr"] = "unknown"
         rna_adata.var["start"] = -1
         rna_adata.var["end"] = -1
@@ -536,12 +536,12 @@ def _annotate_gene_coords(rna_adata: ad.AnnData, gtf_path: str = None, genome: s
             for g in rna_adata.var_names
         ]
     n = (rna_adata.var["chr"] != "unknown").sum()
-    print(f"      Gene coordinates: {n}/{rna_adata.n_vars} annotated")
+    print(f"      基因坐标: {n}/{rna_adata.n_vars} 已注释")
     return rna_adata
 
 
 def _parse_gtf_genes(gtf_path: str, gene_set: set) -> dict:
-    """Extract chr and TSS for each gene from GTF/GFF, accounting for strand direction."""
+    """从 GTF/GFF 提取每个 gene 的 chr 和 TSS（考虑链方向）。"""
     opener = gzip.open if str(gtf_path).endswith(".gz") else open
     info = {}
 
@@ -572,14 +572,14 @@ def _parse_gtf_genes(gtf_path: str, gene_set: set) -> dict:
                         info[val] = {"chr": chrom, "start": tss, "end": tss + 1}
                         break
     except Exception as e:
-        print(f"      GTF parsing failed: {e}")
+        print(f"      GTF 解析失败: {e}")
         return None
 
     return info if info else None
 
 
 def _query_mygene(gene_names, genome: str = None) -> dict:
-    """Fetch gene coordinates in batches through the MyGene.info API and cache them."""
+    """通过 MyGene.info API 批量获取基因坐标并缓存。"""
     species = {"hg38": "human", "hg19": "human", "mm10": "mouse", "mm39": "mouse"}
     sp = species.get(genome, "human")
 
@@ -616,11 +616,11 @@ def _query_mygene(gene_names, genome: str = None) -> dict:
                 for g, i in info.items()
             ]).to_parquet(cache)
 
-        print(f"      MyGene returned: {len(info)} genes")
+        print(f"      MyGene 返回: {len(info)} 基因")
         return info if info else None
 
     except Exception as e:
-        print(f"      MyGene query failed: {e}")
+        print(f"      MyGene 查询失败: {e}")
         return None
 
 
