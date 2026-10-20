@@ -28,6 +28,11 @@ def adapters(monkeypatch):
             raise ValueError("incompatible saturating registry; rerun Step 5/6")
         return registry
     transfer.validate_registry = validate
+    def validate_configured(registry, kind, cfg):
+        from CausalBridge.atac_normalization import expected_registry_schema
+        return validate(registry, expected_type=kind,
+            expected_schema=expected_registry_schema(kind, cfg))
+    transfer.validate_configured_registry = validate_configured
     transfer.fit_tf_peak = lambda *a, **k: registry("tf_peak")
     transfer._snapshot = lambda r, a, *args: {"R": r.X, "A": a.X}
     engine = ModuleType("CausalBridge.saturating_perturbation")
@@ -46,7 +51,7 @@ def config():
 
 def registry(layer):
     return {"type": "saturating_hybrid_" + layer,
-            "schema": "saturating_" + layer + "_registry_v1"}
+            "schema": "hybrid_saturation_tf_peak_local_registry_v3" if layer == "tf_peak" else "saturating_" + layer + "_registry_v1"}
 
 
 def test_mode_and_invalid_mode():
@@ -112,7 +117,7 @@ def test_tf_registry_transactional_and_no_attrs(adapters, monkeypatch):
     assert caller == {"previous": True}
     def fit(*args, **kwargs):
         assert args[0] is rna and args[1] is atac
-        assert set(args[3].screening_status) == {"linear_pearson_screen"}
+        assert set(args[3].screening_status) == {"local_pearson_routes"}
         return registry("tf_peak")
     transfer.fit_tf_peak = fit
     result = kinetics.fit_rna_to_atac(rna, atac, pt, pd.DataFrame(), config(), tf_model_registry=caller)
@@ -121,9 +126,12 @@ def test_tf_registry_transactional_and_no_attrs(adapters, monkeypatch):
 
 @pytest.mark.parametrize("peak", [False, True])
 def test_half_ko_dispatch_never_linear(adapters, peak):
-    _, engine, _ = adapters
+    transfer, engine, _ = adapters
     seen = []
     def simulate(*args, **kwargs):
+        # The engine now owns the single strict gate for direct and public calls.
+        transfer.validate_configured_registry(kwargs["transfer_models"], GENE_TYPE, args[7])
+        transfer.validate_configured_registry(kwargs["tf_model_registry"], TF_TYPE, args[7])
         seen.append((args, kwargs))
         return {"raw_ko_strength": args[7]["perturbation"]["ko_strength"]}
     engine.propagate_saturating = simulate
@@ -218,6 +226,14 @@ def test_real_fit_checkpoint_recovery_and_missing_tf_registry(tmp_path, monkeypa
     from CausalBridge import saturating_transfer
     rna, atac, pt, edges, screen, cfg = fixture_data(bins=50)
     rna.var_names=['KO','B','C'];screen.tf_gene=screen.tf_gene.replace({'A':'KO'})
+    # This pipeline fixture emulates the current per-bin Step 6 screen.
+    screen["lag_mode"] = "local"
+    screen["local_lag_max"] = 1
+    screen["local_lag_window_rows"] = 12
+    screen["local_routes"] = [[dict(target_bin=b,source_bin=b-int(lag) if b>=lag else -1,
+        selected_lag=int(lag) if b>=lag else -1,status="supported" if b>=lag else "no_supported_lag")
+        for b in range(50)] for lag in screen.tf_lag]
+    screen["tf_lag"] = None
     cfg['pseudotime'].update(n_bins=50,n_neighbors=5,method='dpt')
     cfg['granger']={'reference_bins':50,'min_composite_score':.3}
     cfg['output']=dict(dir=str(tmp_path),checkpoint_dir=str(tmp_path/'checkpoints'),cache_dir=str(tmp_path/'cache'))
@@ -346,7 +362,7 @@ def test_real_public_fit_simulate_project_and_merge(smooth, monkeypatch):
     transfer.validate_registry(genes, expected_type=transfer.GENE_TYPE)
     transfer.validate_registry(tfs, expected_type=transfer.TF_TYPE)
     assert set(tfs["targets"]) == {"chr1:10-20"} and set(genes["targets"]) == {"G"}
-    assert set(screen.screening_status) == {"linear_pearson_screen"} and not screen.attrs
+    assert set(screen.screening_status) == {"local_pearson_routes"} and not screen.attrs
     assert genes["target_metrics"]["G"]["status"] == "ok"
     assert tfs["target_metrics"]["chr1:10-20"]["status"] == "ok"
     before = copy.deepcopy((genes, tfs))
@@ -433,6 +449,7 @@ def test_real_subset_runner_warm_checkpoint_and_exports(tmp_path, monkeypatch, s
     pd.testing.assert_frame_equal(warm["perturbation_results"], result["perturbation_results"])
     pd.testing.assert_frame_equal(warm["cell_projection"], result["cell_projection"])
     assert all((directory / f"{name}.pkl").read_bytes() == content for name, content in checkpoints.items())
+    cfg["output"]["export_details"] = True
     io.save_results(result, cfg)
     output = tmp_path
     assert len(pd.read_csv(output / "saturating_response_weights.csv")) == 2

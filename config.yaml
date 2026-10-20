@@ -1,119 +1,118 @@
-# ==================== 输入与基因标识 ====================
+# ==================== Inputs and gene identity ====================
 input:
   gene_identity_mode: gtf_gene_id
-  annotation_gtf: "/home/huangtao/Desktop/huangchengqi/reference_documents/refdata-cellranger-arc-GRCh38-2024-A/genes/genes.gtf.gz"
+  annotation_gtf: "/reference/GRCh38/genes.gtf.gz"
   rna_gene_id_column: gene_ids
-  rna_h5ad: "/home/huangtao/Desktop/huangchengqi/test/output/rna_adata.h5ad"
-  atac_h5ad: "/home/huangtao/Desktop/huangchengqi/test/output/atac_adata.h5ad"
-  genome_fasta: "/home/huangtao/Desktop/huangchengqi/reference_documents/refdata-cellranger-arc-GRCh38-2024-A/fasta/genome.fa"  # motif 扫描参考基因组
-  target_genes: "/home/huangtao/Desktop/huangchengqi/code_1/CausalBridge/target_genes.txt"  # 每行一个 KO 目标基因
+  rna_h5ad: "/data/human/rna_adata.h5ad"
+  atac_h5ad: "/data/human/atac_adata.h5ad"
+  genome_fasta: "/reference/GRCh38/genome.fa"  # Reference genome for motif scanning
+  target_genes: "target_genes.txt"  # One KO target gene per line
 
-# ==================== 预处理：质控、参考视图与模型视图 ====================
+# ==================== Preprocessing: QC, reference and model views ====================
 preprocess:
   rna:
-    min_cells_per_gene: 50                  # 基因最少检出细胞数
-    min_umi_per_cell: 500                   # 细胞最少 UMI 数
-    n_highly_variable_genes: 3000           # 高变基因数
+    min_cells_per_gene: 50                  # Minimum cells detecting each gene
+    min_umi_per_cell: 500                   # Minimum UMIs per cell
+    n_highly_variable_genes: 3000           # Number of highly variable genes
   atac:
-    min_cells_per_peak: 10                  # peak 最少开放细胞数
-    min_peaks_per_cell: 1000                # 细胞最少开放 peak 数
-    binarize: true                         # 质控与参考视图使用二值 ATAC
-  # 连续模型视图仅用于 saturating_hybrid；启用后覆盖模型 ATAC 视图，参考质控仍为二值。
+    min_cells_per_peak: 10                  # Minimum cells with each accessible peak
+    min_peaks_per_cell: 1000                # Minimum accessible peaks per cell
+    binarize: true                         # Binary ATAC for QC and reference views
+  # Continuous model view for saturating_hybrid only; reference QC remains binary.
   atac_depth_normalization:
     enabled: true
-    target_sum: 10000.0                     # 深度分母为原始完整输入的 peak 计数总和
-    output_cap_expansion: 0.25              # 归一化 ATAC log1p 单位下扩展 WT 跨度的 25%，不是原始概率
+    target_sum: 10000.0                     # Depth denominator: all peaks in the original complete input
+    output_cap_expansion: 0.25              # Expand WT span by25% in normalized ATAC log1p units, not raw probabilities
 
-# ==================== 细胞聚类与谱系 ====================
+# ==================== Cell clustering and lineages ====================
 clustering:
   enabled: true
-  cluster_key: "leiden"                     # obs 聚类标签列
+  cluster_key: "leiden"                     # Cluster-label column in obs
   n_neighbors: 20
   n_pcs: 20
-  resolution: 0.5                          # Leiden 分辨率
+  resolution: 0.5                          # Leiden resolution
   random_state: 42
-  min_cells_per_cluster: 50                 # 低于此细胞数时回退
-  fallback_pseudotime_method: "palantir"     # 全局回退方法
+  min_cells_per_cluster: 50                 # Fallback below this cell count
+  fallback_pseudotime_method: "palantir"     # Global fallback method
   paga:
-    enabled: false                         # 启用后按 PAGA 连通性合并谱系
+    enabled: false                         # Merge lineages by PAGA connectivity when enabled
     connectivity_threshold: 0.08
     min_cells_per_lineage: 50
 
-# R、R 包和原生依赖统一安装在 CausalBridge conda 环境中。
+# Install R, R packages and native dependencies in the same CausalBridge conda environment.
 cytotrace:
-  rscript_binary: "/home/huangtao/miniconda3/envs/CausalBridge/bin/Rscript"
-  r_library_dir: "/home/huangtao/miniconda3/envs/CausalBridge/lib/R/library"
-  native_library_dir: "/home/huangtao/miniconda3/envs/CausalBridge/lib"
+  rscript_binary: "Rscript"
 
-# ==================== 伪时间与分箱 ====================
+# ==================== Pseudotime and binning ====================
 pseudotime:
   method: "dpt"                            # dpt | palantir
   n_neighbors: 20
-  root_cell_marker: null                    # 根细胞标记基因；null 为自动推断
+  root_cell_marker: null                    # Root marker genes; null infers automatically
   root_cell_method: "cytotrace"             # cytotrace | marker | min_umi | auto
   cytotrace_n_top_genes: 200
-  n_bins: 50                               # 分箱数上限
-  min_cells_per_bin: 10                     # 每箱目标细胞数
-  smooth_kernel: "gaussian"                 # gaussian 软分箱 | hard 硬分箱
-  smooth_overlap_factor: 2.0                # 高斯 sigma 上限相对于箱宽的倍数
-  ablation_shuffle_pseudotime: false        # 消融：打乱伪时间
+  n_bins: 50                               # Maximum bin count
+  min_cells_per_bin: 10                     # Target cells per bin
+  smooth_kernel: "gaussian"                 # gaussian soft binning | hard binning
+  smooth_overlap_factor: 2.0                # Maximum Gaussian sigma as a multiple of bin width
+  ablation_shuffle_pseudotime: false        # Ablation: shuffled pseudotime
   adaptive_binning:
     enabled: false
-    bandwidth_selection: state             # 带宽依据有效样本量，不依据状态分数
-    boundary: split_noise                  # 状态边界保护；none 为仅按有效样本量分箱
-    state_modality: rna                    # 仅用于状态判定；伪时间仍使用联合 RNA+ATAC 主成分
+    bandwidth_selection: state             # Bandwidth based on effective sample size rather than state score
+    boundary: split_noise                  # Protect state boundaries; none uses effective sample size only
+    state_modality: rna                    # State decisions only; pseudotime still uses joint RNA+ATAC PCs
     embedding:
       n_components: 5
       max_features: 512
       max_dense_elements: 2000000
       random_seed: 42
 
-# ==================== Granger 调控边筛选 ====================
+# ==================== Granger regulatory-edge screening ====================
 granger:
-  distance_thresh: 200000                   # peak–gene 最大距离，单位 bp
-  significance_threshold: 0.01              # 调控边 F 检验阈值，不是最终扰动显著性阈值
+  distance_thresh: 200000                   # Maximum peak–gene distance in bp
+  significance_threshold: 0.01              # Edge F-test threshold, not final perturbation significance
   correction_method: "fdr_bh"
-  min_effect_size: 0.1                      # 最小 ΔR²
-  soft_threshold: true                     # 使用复合分数筛选
+  min_effect_size: 0.1                      # Minimum partial Delta R²
+  soft_threshold: true                     # Composite-score filtering
   min_composite_score: 0.3
-  composite_weights: [0.4, 0.6]             # [校正 p 值权重, 效应量权重]
+  composite_weights: [0.4, 0.6]             # [adjusted-p weight, effect-size weight]
   max_lag: 1
-  reference_bins: 50                       # 自由度校正的参考分箱数
-  ablation_lag0: false                      # 消融：仅使用同期关系
+  reference_bins: 50                       # Reference bin count for degrees-of-freedom correction
+  ablation_lag0: false                      # Ablation: contemporaneous relationships only
 
-# ==================== ATAC→RNA：流程与响应模型 ====================
+# ==================== ATAC→RNA pipeline and response models ====================
 atac_to_rna:
-  # saturating_hybrid 使用单关系/支持组流程；两层 response_model 独立选择。
+  single_min_r2: 0.3  # Single peak→gene training R² threshold before alpha; null disables
+  # saturating_hybrid uses singles/supported groups; response families are independent by layer.
   model_mode: saturating_hybrid
-  response_model: nn                   # 当前层响应：spline | nn | saturation
-  # 实验性绿色试验参数；smoothness=1e-6 尚非验证最优值，不在生产内逐关系 CV。
+  response_model: nn                   # This layer's response: spline | nn | saturation
+  # Experimental smoothness=1e-6, not a validated optimum; no per-relationship production CV.
   spline_response:
     smoothness: 1.0e-6
-    group_interaction_penalty: 0.01          # 2/3输入组交互系数惩罚，实验性默认
+    group_interaction_penalty: 0.01          # Experimental interaction penalty for2/3-input groups
     tail_scale: 0.5
     internal_knots: 2
     max_nfev: 1000
     restarts: 3
     seed: 42
-  log_normalize_rna: true                   # RNA 使用 log1p 归一化
+  log_normalize_rna: true                   # RNA uses log1p normalization
 
-  # 仅当前层 response_model=nn：独立 NN 训练预算。
+  # Independent NN training budget when this layer uses response_model=nn.
   nn_response:
     hidden_width: 4
     epochs: 300
     lr: 0.01
     l2: 0.01
     seed: 42
-    restarts: 1                            # NN 重启次数，与下方饱和拟合起点数独立
+    restarts: 1                            # NN restarts, independent of saturation starts below
 
-  # 仅 saturating_hybrid：两层共享的拟合与支持组参数。
+  # Shared two-layer fitting/support settings for saturating_hybrid only.
   saturating_hybrid:
-    workers: 24                            # 所有拟合阶段的目标进程数
-    max_nfev: 500                           # 仅 saturation 响应的求解预算
-    budget_exhausted_policy: best_finite    # 饱和求解耗尽预算后保留有效有限候选
-    det_starts: 3                          # 饱和拟合确定性起点数，不控制 NN 重启
-    rna_cap_lambda: 0.25                   # RNA 输出上限扩展 WT 跨度的比例
-    min_fit_rows: 12
+    workers: 24                            # Target process count for all fitting stages
+    max_nfev: 500                           # Solver budget for saturation responses only
+    budget_exhausted_policy: best_finite    # Retain valid finite candidates after saturation budget exhaustion
+    det_starts: 3                          # Deterministic saturation starts, independent of NN restarts
+    rna_cap_lambda: 0.25                   # Expand RNA output cap by this fraction of WT span
+    min_fit_rows: 12                        # Minimum single-response supported rows; local TF-lag evidence uses up to12 nearest rows (engineering neighborhood, not biologically validated)
     group_sizes: [2, 3]
     max_groups: 2
     polynomial_degree: 2
@@ -128,18 +127,18 @@ atac_to_rna:
     restart_prediction_spread_max: 0.05
     query_neighbors: 10
 
-# ==================== RNA→ATAC：响应模型与调控边 ====================
+# ==================== RNA→ATAC responses and regulatory edges ====================
 rna_to_atac:
-  response_model: spline                   # 当前层响应：spline | nn | saturation；两层独立
+  response_model: spline                   # This layer's independent response: spline | nn | saturation
   spline_response:
-    smoothness: 1.0e-6                     # 实验性默认，不代表已验证最优
-    group_interaction_penalty: 0.01          # 2/3输入组交互系数惩罚
+    smoothness: 1.0e-6                     # Experimental default, not a validated optimum
+    group_interaction_penalty: 0.01          # Interaction penalty for2/3-input groups
     tail_scale: 0.5
     internal_knots: 2
     max_nfev: 1000
     restarts: 3
     seed: 42
-  # 仅当前层 response_model=nn；当前为 spline，保留供切换比较。
+  # Used only for response_model=nn; current spline setting retains this for comparisons.
   nn_response:
     hidden_width: 4
     epochs: 300
@@ -148,49 +147,57 @@ rna_to_atac:
     seed: 42
     restarts: 1
   motif_db: "jaspar2024"
-  motif_scan_workers: 24                    # motif 缺失扫描进程数
-  motif_pval_threshold: 0.1                 # motif 候选粗筛阈值
+  motif_scan_workers: 24                    # Processes for missing motif scans
+  motif_pval_threshold: 0.1                 # Motif candidate screening threshold
   max_tfs_per_peak: 5
-  tf_peak_pvalue_threshold: 0.05            # TF→peak Pearson 边筛选阈值，不是扰动显著性阈值
-  min_abs_contribution: 0.01                # 最小 |weight| × std(X)
-  tf_expression_filter: true               # 验证 TF 是否在 RNA 矩阵中
-  time_lag: true                           # 逐 lag 独立检验，取第一个显著 lag
-  max_lag: "auto"                          # auto/0/负数按 n_bins//4；关闭 time_lag 时仅使用 lag=0
+  tf_peak_pvalue_threshold: 0.05            # TF→peak Pearson screening threshold, not perturbation significance
+  min_abs_contribution: 0.01                # Minimum |weight| × std(X)
+  tf_expression_filter: true               # Check TF presence in the RNA matrix
+  time_lag: true                           # Test nearby WT evidence per target bin; select first supported lag
+  max_lag: "auto"                          # Lookback limit only, without truncating early bins; auto/0/negative uses n_bins//4
 
-# ==================== 扰动传播与结果汇总 ====================
+# ==================== Perturbation propagation and aggregation ====================
 perturbation:
   knockout_type: "gene"                     # gene | peak
   perturbation_mode: "bin_forward"
-  joint_knockout: true                      # 联合敲除所有目标基因；false 为逐基因模拟
-  ko_strength: 1.0                         # 1.0 为完全敲除
+  joint_knockout: true                      # Joint KO of all targets; false runs each separately
+  ko_strength: 1.0                         # 1.0 means complete KO
   propagation_rounds: 1
   subnetwork_depth: unlimited
-  subnetwork_unlimited_max_edges: 250000    # 最终模拟边数上限
-  subnetwork_unlimited_max_work_edges: 250000  # 闭包遍历候选行上限
-  min_r2_threshold: 0.3                    # peak→gene 边的最低 R²
-  min_lag_per_peak_filter: true             # 每个 peak 保留最小 lag 的 TF
-  log_accumulation: true                    # 在 log1p 空间累加；false 使用历史 raw 累加
-  min_delta_threshold: 0                    # 输出 |log2FC| 阈值；0 为不过滤
-  atac_significance_zscore: 2.0             # ATAC 扰动显著性：|变化量| / WT 箱间标准差
-  aggregation_policy: valid_cell_means      # 同一有效细胞子集的 WT/扰后均值按细胞数加权，再计算 log2 比值
+  subnetwork_unlimited_max_edges: 250000    # Maximum final simulation edges
+  subnetwork_unlimited_max_work_edges: 250000  # Maximum candidate rows visited during closure traversal
+  min_r2_threshold: 0.3                    # Minimum training R² for the combined complete gene model
+  min_lag_per_peak_filter: true             # Compare actual supported lags per peak/bin; never renormalize alpha
+  log_accumulation: true                    # Accumulate in log1p space; false is the historical raw route
+  min_delta_threshold: 0                    # Output |log2FC| threshold; implementation retains at least1e-6 even at0
+  atac_significance_zscore: 2.0             # ATAC change / WT between-bin SD
+  aggregation_policy: valid_cell_means      # Cell-count-weight WT/KO means over the same valid cells, then compute log2 ratio
   cell_projection:
-    enabled: true                          # 启用 RNA 参考投影
-    n_components: null                     # 保留所有可估计的 PCA 主成分
+    enabled: true                          # Enable RNA reference projection
+    n_components: null                     # Retain all estimable PCA components
     n_neighbors: 20
-    history_delta_threshold: 1.0e-8        # 稀疏历史变化量的非零阈值
+    history_delta_threshold: 1.0e-8        # Nonzero threshold for sparse history changes
     state_unit: rna_log1p_cp10k
-  # 仅 knockout_type=peak：读取此段，不使用 target_genes。
+  # Read this block only for knockout_type=peak, without target_genes.
   peak_ko:
     peak_id: "chr3:34,691,323–34,693,322"
-    mode: relative                         # relative: A'=A(1+s)；absolute: A'=s
-    strength: -1.0                         # -1 完全关闭，+1 增强
-    state: "all"                           # 簇标签或 all
-    depth: 2                               # 1 为直接靶基因；2/3 为级联传播
+    mode: relative                         # relative: A'=A(1+s); absolute: A'=s
+    strength: -1.0                         # -1 closes completely, +1 enhances
+    state: "all"                           # Cluster label or all
+    depth: 2                               # 1 direct targets;2/3 cascade propagation
     match: overlap                         # exact | overlap | nearest
 
-# ==================== 输出与缓存 ====================
+# ==================== Parallel screening and simulation ====================
+execution:
+  granger_workers: 24                        # Step4 candidate-test processes;1 is serial
+  local_lag_workers: 24                      # Step6 local-lag Pearson processes;1 is serial
+  defer_cluster_simulation: true            # Start simulation queue after all cluster training finishes
+  simulation_workers: 4                     # Maximum concurrent clusters, positive integer; use1 when memory is limited
+
+# ==================== Outputs and caches ====================
 output:
-  dir: "/home/huangtao/Desktop/huangchengqi/code_1/CausalBridge/results/test/MYB_test/"
-  cache_dir: "/home/huangtao/Desktop/huangchengqi/code_1/CausalBridge/cache_test/"
-  checkpoint_dir: null                     # null 使用 output.dir/checkpoints
+  dir: "results/example/"
+  cache_dir: "cache/"
+  checkpoint_dir: null                     # null uses output.dir/checkpoints
+  export_details: true                    # false summaries; true adds diagnostics, attributions, responses and projection history/events
   save_intermediate: true

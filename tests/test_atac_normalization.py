@@ -166,11 +166,14 @@ def test_real_public_continuous_fit_units_caps_and_raw_interventions(tmp_path,mo
     tfs={}
     screen=kinetics.fit_rna_to_atac(rna,atac,pt,edges,cfg,tf_model_registry=tfs,
         motif_resources={"motif_db":{"synthetic":{"tf_name":"TF"}},"tf_database":frozenset({"TF"}),"resource_cache_dir":str(tmp_path)})
-    assert genes["schema"]==transfer.GENE_SCHEMA_V2 and tfs["schema"]==transfer.TF_SCHEMA_V2
+    assert genes["schema"]==transfer.GENE_SCHEMA_V2
+    assert tfs["schema"]=="hybrid_saturation_tf_peak_local_registry_v3"
+    assert tfs["context"]["tf_lag_mode"]=="local" and set(screen.lag_mode)=={"local"}
+    assert len(screen.iloc[0].local_routes)==tfs["context"]["n_bins"]
     assert genes["input_unit"]==norm.UNIT and tfs["output_unit"]==norm.UNIT
     assert genes["targets"]["G"]["schema"]==core.CONTINUOUS_SCHEMA
     transfer.validate_registry(genes,expected_schema=transfer.GENE_SCHEMA_V2)
-    transfer.validate_registry(tfs,expected_schema=transfer.TF_SCHEMA_V2)
+    transfer.validate_registry(tfs,expected_schema="hybrid_saturation_tf_peak_local_registry_v3")
     snapshot=transfer._snapshot(rna,atac,pt,cfg)
     np.testing.assert_allclose(snapshot["A"],snapshot["operator"]@atac.X.toarray())
     tf=core.TargetModel.from_bundle(tfs["targets"]["chr1:10-20"])
@@ -274,7 +277,8 @@ def test_continuous_subset_warm_v2_and_exports(tmp_path,monkeypatch,smooth):
     step5=pickle.loads(saved["step5_atac_to_rna"])
     step6=pickle.loads(saved["step6_rna_to_atac"])
     assert step5["transfer_models"]["schema"]==transfer.GENE_SCHEMA_V2
-    assert step6["tf_model_registry"]["schema"]==transfer.TF_SCHEMA_V2
+    assert step6["tf_model_registry"]["schema"]=="hybrid_saturation_tf_peak_local_registry_v3"
+    assert step6["tf_model_registry"]["context"]["tf_lag_mode"]=="local"
     with pytest.raises(RuntimeError,match="incompatible"):
         run._validate_step5_checkpoint(step5,"saturating_hybrid")  # Binary expectation must not consume v2.
     warm_cfg = copy.deepcopy(cfg)
@@ -348,20 +352,20 @@ def continuous_lag_failure_fit():
 @pytest.mark.parametrize("failed_gene,tainted", [("B", False), ("A", True)])
 def test_continuous_only_enabled_lag_failures_taint_and_abstain(
         continuous_lag_failure_fit, monkeypatch, failed_gene, tainted, tmp_path):
-    from types import SimpleNamespace
     from CausalBridge import saturating_perturbation as simulation
     from test_saturating_perturbation import execute
     fitted = continuous_lag_failure_fit
     baseline = execute(fitted, targets=("D",))
     model = core.TargetModel.from_bundle(fitted[-1]["targets"]["p0"])
     frozen = copy.deepcopy(fitted[-1])
-    proxy = SimpleNamespace(**core.__dict__)
-    def fail_gene(m, old, new, **kwargs):
+    actual_predict = simulation._SinglesPlan.predict
+    def fail_gene(plan, position, new):
+        m = plan.model
+        old = plan.old[position:position+1]
         if m.target_id == failed_gene and m.output_unit == "log1p_rna_log1p_cp10k" and len(old) == 1:
             raise FloatingPointError("synthetic continuous query failure")
-        return core.predict_delta(m, old, new, **kwargs)
-    proxy.predict_delta = fail_gene
-    monkeypatch.setattr(simulation, "core", proxy)
+        return actual_predict(plan, position, new)
+    monkeypatch.setattr(simulation._SinglesPlan, "predict", fail_gene)
     result = execute(fitted, targets=("D",))
     assert result["rna_unavailable_mask"][1:, ["D", "A", "B"].index(failed_gene)].all()
     assert int(result["atac_unavailable_mask"][:, 0].sum()) == (19 if tainted else 0)
@@ -381,6 +385,7 @@ def test_continuous_only_enabled_lag_failures_taint_and_abstain(
         assert set(result["saturating_tf_peak_contributions"].query("peak_id == 'p0'").tf_gene) == {"A"}
     assert fitted[-1] == frozen
     cfg = copy.deepcopy(fitted[5]); cfg["output"] = {"dir": str(tmp_path), "save_intermediate": False}
+    cfg["output"]["export_details"] = True
     io.save_results(result, cfg)
     exported = pd.read_csv(tmp_path / "saturating_support_diagnostics.csv")
     assert "unavailable_origins_json" in exported

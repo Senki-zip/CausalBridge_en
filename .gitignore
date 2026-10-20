@@ -1,8 +1,10 @@
-# Cache directories
+# 缓存目录
 cache_test/
 cache_mouse/
+cache/
+cache_*/
 
-# Run results
+# 运行结果
 results/
 
 # Python
@@ -13,7 +15,7 @@ __pycache__/
 dist/
 build/
 
-# Large-file cache
+# 大文件缓存
 *.pkl
 
 # Jupyter
@@ -23,14 +25,15 @@ build/
 .vscode/
 .idea/
 
-# System files
+# 系统文件
 .DS_Store
 .Rhistory
 .RData
 
-# Environment
+# 环境
 .env
 .env.local
 
 # Local orchestration notes
+.sisyphus/
 .slim/deepwork/

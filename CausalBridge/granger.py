@@ -670,113 +670,17 @@ def granger_test(
     from .gene_identity import gene_tss_coordinates
     rna_tss_arr = gene_tss_coordinates(rna_adata)
 
-    # 预计算基因的自回归 SSR（每个基因只用一次）
-    ones = np.ones(n_valid_pairs)
-    gene_ssr_cache = {}
-
-    results = []
-    total = len(candidates)
-    log_interval = max(total // 20, 1000)  # 每 5% 输出一次进度
-
-    for i, (peak_id, gene) in enumerate(candidates):
-        peak_idx = atac_name_to_idx.get(peak_id)
-        gene_idx = rna_name_to_idx.get(gene)
-        if peak_idx is None or gene_idx is None:
-            continue
-
-        Y_t = _rna_t[:, gene_idx]
-        Y_lag = _rna_t1[:, gene_idx] if _rna_t1 is not None else None
-
-        if np.var(Y_t) < 1e-6:
-            continue
-
-        # Reduced model: Y(t) ~ Y(t-1), 缓存结果，同一基因不重复算
-        if ablation_mode:
-            # 消融模式: Reduced = Y(t) ~ 1 (仅截距，无自回归)
-            ssr_reduced = float(np.sum((Y_t - np.mean(Y_t)) ** 2))
-            if ssr_reduced < 1e-10:
-                continue
-        else:
-            if gene_idx in gene_ssr_cache:
-                ssr_reduced = gene_ssr_cache[gene_idx]
-            else:
-                Y_lag_const = np.column_stack([ones, Y_lag])
-                _, residuals_reduced, _, _ = np.linalg.lstsq(
-                    Y_lag_const, Y_t, rcond=None
-                )
-                # lstsq returns sums of squared residuals, not residual vectors.
-                # Empty arrays (rank-deficient fits) retain the existing skip policy.
-                ssr_reduced = float(np.sum(residuals_reduced))
-                if ssr_reduced < 1e-10:
-                    ssr_reduced = 0.0
-                gene_ssr_cache[gene_idx] = ssr_reduced
-
-        if ssr_reduced < 1e-10:
-            continue
-
-        # Full model
-        if ablation_mode:
-            # 消融模式: Y(t) ~ X(t) (同时刻 peak，无滞后)
-            x_col = _atac_current[:, peak_idx]
-            if np.var(x_col) < 1e-6:
-                continue
-            X_const = np.column_stack([ones, x_col])
-            coeffs, residuals_full, _, _ = np.linalg.lstsq(
-                X_const, Y_t, rcond=None
-            )
-            atac_coef = float(coeffs[1])  # β₁: ATAC_t → RNA_t
-            # NumPy has already squared and summed the residual vector.
-            ssr_full = float(np.sum(residuals_full))
-            df_full = n_valid_pairs - 2
-        else:
-            # 标准 Granger: Y(t) ~ Y(t-1) + X(t-1)
-            x_col = _atac_lag_mats[0][:, peak_idx]
-            if np.var(x_col) < 1e-6:
-                continue
-            YX_lag_const = np.column_stack([ones, Y_lag, x_col])
-            coeffs, residuals_full, _, _ = np.linalg.lstsq(
-                YX_lag_const, Y_t, rcond=None
-            )
-            atac_coef = float(coeffs[2])  # β₂: ATAC_{t-1} → RNA_t
-            # NumPy has already squared and summed the residual vector.
-            ssr_full = float(np.sum(residuals_full))
-            df_full = n_valid_pairs - 3
-
-        if ssr_full < 1e-10 or df_full <= 0:
-            continue
-
-        f_num = ssr_reduced - ssr_full
-        f_den = ssr_full / df_full
-        if f_den <= 0:
-            continue
-
-        f_stat = f_num / f_den
-        p_value = stats.f.sf(f_stat, 1, df_full)
-        delta_r2 = 1 - ssr_full / ssr_reduced
-
-        # Pearson r: X vs Y — 用于方向判断 (标准模式=lagged, 消融模式=contemporaneous)
-        pearson_r = float(np.corrcoef(x_col, Y_t)[0, 1]) if np.std(x_col) > 1e-6 else 0.0
-
-        results.append({
-            "peak_id": peak_id,
-            "gene": gene,
-            "peak_chr": atac_chr_arr[peak_idx],
-            "peak_start": int(atac_start_arr[peak_idx]),
-            "peak_end": int(atac_end_arr[peak_idx]),
-            "gene_chr": rna_chr_arr[gene_idx],
-            "gene_tss": int(rna_tss_arr[gene_idx]),
-            "F_statistic": f_stat,
-            "p_value": p_value,
-            "delta_r2": delta_r2,
-            "atac_coef": atac_coef,
-            "pearson_r": pearson_r,
-        })
-
-        if (i + 1) % log_interval == 0:
-            pct = (i + 1) / total * 100
-            mode_label = "消融" if ablation_mode else "Granger"
-            logger.info(f"  {mode_label} 检验进度: {i+1}/{total} ({pct:.0f}%), "
-                        f"已发现 {sum(1 for r in results if r['p_value'] < 0.05)} 个显著对")
+    # 候选对分块检验；块内复用同一基因的自回归 SSR。
+    from .screening_parallel import granger_candidates, screening_workers
+    results = granger_candidates(
+        candidates, dict(
+            atac_name_to_idx=atac_name_to_idx, rna_name_to_idx=rna_name_to_idx,
+            atac_chr_arr=atac_chr_arr, atac_start_arr=atac_start_arr,
+            atac_end_arr=atac_end_arr, rna_chr_arr=rna_chr_arr,
+            rna_tss_arr=rna_tss_arr, _rna_t=_rna_t, _rna_t1=_rna_t1,
+            _atac_lag_mats=_atac_lag_mats, _atac_current=_atac_current,
+            n_valid_pairs=n_valid_pairs, ablation_mode=ablation_mode),
+        workers=screening_workers(config, "granger_workers"))
 
     if len(results) == 0:
         mode_label = "消融" if ablation_mode else "Granger"

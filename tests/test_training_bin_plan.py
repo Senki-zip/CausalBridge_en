@@ -171,18 +171,25 @@ def test_no_attrs_tf_actual_regression_rows_and_root_reuse(monkeypatch):
     monkeypatch.setattr(kinetics, "_load_motif_database", lambda *args: {})
     monkeypatch.setattr(kinetics, "_scan_peaks_with_jaspar", lambda *args: {"p1": ["TF1"]})
     calls = []
+    # Each target bin tests lag 0 then lag 1, using valid pairs from its own
+    # branch. These ten-bin branches fit entirely inside the 12-row window.
+    expected_pairs = []
+    for start, end in ctx.policy.branch_boundaries:
+        for target in range(start, end):
+            for lag in range(min(1, target-start)+1):
+                times = np.array([b for b in range(start+lag, end)
+                    if ctx.plan.valid[b] and ctx.plan.valid[b-lag]])
+                expected_pairs.append((r_bins[times-lag, 0], a_bins[times, 0]))
     def pearson(x, y):
-        lag = len(calls)
-        expected_x = np.concatenate([r_bins[a+1-lag:b-lag, 0] for a, b in ctx.policy.branch_boundaries])
-        expected_y = np.concatenate([a_bins[a+1:b, 0] for a, b in ctx.policy.branch_boundaries])
-        assert len(x) == len(y) == 18
+        expected_x, expected_y = expected_pairs[len(calls)]
+        assert len(x) == len(y) == len(expected_x)
         np.testing.assert_allclose(x, expected_x)
         np.testing.assert_allclose(y, expected_y)
-        calls.append(lag)
+        calls.append(True)
         return 0., 1.  # force both lag candidates through the real regressor
     monkeypatch.setattr(kinetics, "pearsonr", pearson)
     kinetics.fit_rna_to_atac(rna, atac, pt, edges, cfg, tf_model_registry={}, bin_plan=ctx.plan)
-    assert calls == [0, 1]
+    assert len(calls) == len(expected_pairs) == 38
     pd.testing.assert_frame_equal(pt, original)
     assert pt.attrs == {}
 

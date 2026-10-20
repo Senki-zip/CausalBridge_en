@@ -116,9 +116,10 @@ def load_config(config_path: str) -> Dict[str, Any]:
             "motif_scan_workers": 1,
             "max_tfs_per_peak": 5,
             "tf_peak_pvalue_threshold": 0.05,  # TF→peak 边显著性过滤
-            "time_lag": True,  # 自适应 lag: 根据簇的转录变化速率动态确定步数
+            "min_abs_contribution": 0.01,
+            "time_lag": True,  # 每个目标bin独立选择首个受附近WT数据支持的lag
             "tf_expression_filter": True,  # TF 表达过滤: 验证基因名是否在 RNA 矩阵中
-            "max_lag": 0,  # 0=自动: max(3, min(n_bins//4, 12))
+            "max_lag": 0,  # 自动=max(1,n_bins//4)，只限制回看范围，不丢弃早期bin
         },
         "perturbation": {
             "aggregation_policy": "strict_complete",  # Output aggregation only; preserve library default.
@@ -150,6 +151,7 @@ def load_config(config_path: str) -> Dict[str, Any]:
         "output": {
             "dir": "results/", "cache_dir": "cache/",
             "checkpoint_dir": None,
+            "export_details": False,
             "save_intermediate": True,
         },
     }
@@ -173,6 +175,8 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 def _validate_config(config: dict):
     """检查配置中必需字段是否存在且合理。"""
+    if not isinstance(config.get("output", {}).get("export_details", False), bool):
+        raise ValueError("output.export_details must be a boolean")
     policy = config.get("perturbation", {}).get("aggregation_policy", "strict_complete")
     if policy not in ("strict_complete", "valid_cell_means"):
         raise ValueError("perturbation.aggregation_policy must be 'strict_complete' or "
@@ -189,6 +193,9 @@ def _validate_config(config: dict):
         if config.get("pseudotime", {}).get("ablation_shuffle_pseudotime", False):
             raise ValueError("saturating_hybrid does not support shuffled pseudotime")
     _validate_motif_scan_workers(config.get("rna_to_atac", {}).get("motif_scan_workers", 1))
+    from .screening_parallel import screening_workers
+    for key in ("granger_workers", "local_lag_workers"):
+        screening_workers(config, key)
     from .binning_adapter import _selector, _embedding_settings
     from .adaptive_binning import BinningConfig
     settings = _selector(config)
@@ -451,9 +458,42 @@ def _present_gene_results(results, gene_identity):
     return result
 
 
+# Canonical CSV names. Managed keys never fall back to intermediate/, including
+# aliases and optional tables disabled by configuration.
+RESULT_CSV_EXPORTS = {
+    **{key: f"{key}.csv" for key in (
+        "saturating_gene_metrics", "saturating_tf_metrics", "saturating_response_weights",
+        "saturating_support_diagnostics", "saturating_gates", "saturating_response_curves",
+        "saturating_endpoints", "saturating_aggregation_diagnostics",
+        "saturating_peak_attributions", "saturating_tf_peak_contributions", "l1_floor_diagnostics",
+        "atac_changes", "gene_identity", "gene_filter_report", "gene_target_resolution",
+        "tf_peak_weights", "tf_peak_lag_routes", "perturbation_results", "perturbation_merged",
+        "aggregated_tf_peak_edges", "atac_changes_merged",
+    )},
+    "saturating_pathways": "perturbation_pathways.csv",
+    "pathway_edges": "perturbation_pathways.csv",
+    "causal_edges": "causal_peak_gene_edges.csv",
+    "upstream_tfs": "peak_upstream_tfs.csv",
+    "upstream_tfs_merged": "peak_upstream_tfs_merged.csv",
+    "cell_projection": "perturbation_cell_projection.csv",
+    "projection_summary": "perturbation_projection_summary.csv",
+    "projection_branch_probabilities": "perturbation_projection_branch_probabilities.csv",
+    "projection_history": "perturbation_projection_bin_history.csv",
+    "projection_bin_metadata": "perturbation_projection_bin_metadata.csv",
+    "projection_events": "perturbation_projection_events.csv",
+}
+DETAIL_EXPORT_KEYS = frozenset({
+    "tf_peak_lag_routes",
+    "saturating_response_weights", "saturating_support_diagnostics", "saturating_gates",
+    "saturating_response_curves", "saturating_peak_attributions",
+    "saturating_tf_peak_contributions", "l1_floor_diagnostics",
+    "projection_history", "projection_events",
+})
+
+
 def save_results(results: dict, config: dict, *, gene_identity=None):
     """
-    保存所有输出结果到指定目录。
+    保存汇总结果；output.export_details=true 时另存明细，每张表仅存一份。
 
     结果包括：
     - perturbation_results.csv：核心结果表（每个 KO 的转录组+染色质偏移，net effect per gene）
@@ -470,6 +510,14 @@ def save_results(results: dict, config: dict, *, gene_identity=None):
         配置字典（用于获取输出路径）
     """
     config = _gene_identity_runtime_config(config)
+    export_details = config["output"].get("export_details", False)
+    if not isinstance(export_details, bool):
+        raise ValueError("output.export_details must be a boolean")
+    skipped_details = sorted(DETAIL_EXPORT_KEYS.intersection(results)) if not export_details else []
+    # Filter before identity presentation to avoid copying large unused tables.
+    # This new dictionary leaves the caller's in-memory results untouched.
+    from .result_store import ExportResults
+    results = ExportResults(results, excluded=skipped_details)
     if _gene_identity_enabled(config):
         if gene_identity is None:
             raise ValueError("gtf_gene_id output requires the runtime gene_identity index")
@@ -481,7 +529,21 @@ def save_results(results: dict, config: dict, *, gene_identity=None):
         metadata = results.get("gene_identity_metadata")
         if metadata is not None and any(metadata.get(k) != v for k, v in expected.items()):
             raise ValueError("output results have mismatched gene identity provenance")
-        results = _present_gene_results(results, gene_identity)
+        # Per-context frames are already represented by the merged root tables.
+        # Keep only their metadata here rather than copying all detail frames a
+        # second time just to decorate names that will never be exported.
+        def present(key, value):
+            if isinstance(value, pd.DataFrame) and key not in ("gene_identity", "gene_filter_report", "gene_target_resolution"):
+                return _present_gene_frame(value, gene_identity)
+            return value
+        results = ExportResults(results, presenter=present)
+        # Validate presentation before creating any public output, preserving
+        # the old fail-before-write contract. Discard each decorated table
+        # immediately instead of retaining a second full set of frames.
+        for key in results:
+            if key not in ("cluster_results", "projection_inputs"):
+                value = results[key]
+                del value
     out_dir = Path(config["output"]["dir"])
     from ._wt_aggregation import validate_model_mode
     validate_model_mode(config)
@@ -493,8 +555,7 @@ def save_results(results: dict, config: dict, *, gene_identity=None):
         for key in ("saturating_gene_metrics", "saturating_tf_metrics", "saturating_response_weights",
                     "saturating_support_diagnostics", "saturating_gates", "saturating_response_curves",
                     "saturating_endpoints", "saturating_aggregation_diagnostics",
-                    "saturating_peak_attributions", "saturating_tf_peak_contributions", "l1_floor_diagnostics",
-                    "atac_changes", "saturating_pathways"):
+                    "saturating_peak_attributions", "saturating_tf_peak_contributions", "l1_floor_diagnostics"):
             frame = results.get(key)
             if isinstance(frame, pd.DataFrame):
                 frame.to_csv(out_dir / f"{key}.csv", index=False)
@@ -539,8 +600,18 @@ def save_results(results: dict, config: dict, *, gene_identity=None):
         logger.info(f"因果边已保存: {len(results['causal_edges'])} 条")
 
     # --- TF→peak 权重 ---
+    if export_details and isinstance(results.get("tf_peak_lag_routes"), pd.DataFrame):
+        results["tf_peak_lag_routes"].to_csv(out_dir / "tf_peak_lag_routes.csv", index=False)
     if "tf_peak_weights" in results:
-        results["tf_peak_weights"].to_csv(
+        weights = results["tf_peak_weights"]
+        if export_details and "local_routes" in weights:
+            route_rows = []
+            for edge in weights.to_dict("records"):
+                identity = {k:edge[k] for k in ("cluster", "tf_gene", "tf_gene_id", "tf_gene_name", "peak_id") if k in edge}
+                for route in edge.get("local_routes", ()):
+                    route_rows.append(dict(identity, **route))
+            pd.DataFrame(route_rows).to_csv(out_dir / "tf_peak_lag_routes.csv", index=False)
+        weights.drop(columns=["local_routes"], errors="ignore").to_csv(
             out_dir / "tf_peak_weights.csv", index=False
         )
 
@@ -579,6 +650,7 @@ def save_results(results: dict, config: dict, *, gene_identity=None):
     # --- ATAC 变化 (BED 格式，可用 IGV 可视化) ---
     if "atac_changes" in results:
         atac_df = results["atac_changes"]
+        atac_df.to_csv(out_dir / RESULT_CSV_EXPORTS["atac_changes"], index=False)
         if not atac_df.empty:
             _save_atac_bed(atac_df, out_dir / "atac_changes.bed")
             # 显著 ATAC 变化: |z_score| >= 阈值 (z-score 由 WT 零分布计算)
@@ -639,21 +711,20 @@ def save_results(results: dict, config: dict, *, gene_identity=None):
         _write_peak_report(results["peak_summary"], out_dir / "peak_perturbation_report.txt")
 
     # --- 中间文件 ---
-    if config["output"]["save_intermediate"]:
+    if config["output"].get("save_intermediate", True):
         inter_dir = out_dir / "intermediate"
-        inter_dir.mkdir(exist_ok=True)
 
         for key, df in results.items():
-            if isinstance(df, pd.DataFrame) and not key.endswith("_saved"):
+            if (isinstance(df, pd.DataFrame) and key not in RESULT_CSV_EXPORTS
+                    and key not in {"peak_summary", "cell_states", "projection_cell_states"}
+                    and not key.endswith("_saved")):
+                inter_dir.mkdir(exist_ok=True)
                 df.to_csv(inter_dir / f"{key}.csv", index=False)
 
-        # 按簇保存各自的扰动结果
-        if "cluster_results" in results:
-            for i, cl_res in enumerate(results["cluster_results"]):
-                pert = cl_res.get("perturbation_results")
-                if isinstance(pert, pd.DataFrame) and not pert.empty:
-                    cluster_label = pert["cluster"].iloc[0] if "cluster" in pert.columns else f"cl_{i}"
-                    pert.to_csv(inter_dir / f"perturbation_{cluster_label}.csv", index=False)
+    if skipped_details:
+        logger.info("汇总导出：跳过 %d 类明细 (%s)；需要时设置 output.export_details: true。"
+                    "历史／事件／响应曲线诊断图需要这些明细。",
+                    len(skipped_details), ", ".join(skipped_details))
 
     logger.info(f"所有结果已保存至: {out_dir.resolve()}")
 

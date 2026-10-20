@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 import pickle
 import threading
+import sqlite3
 
 import anndata as ad
 import numpy as np
@@ -46,7 +47,12 @@ def spy_scan(monkeypatch):
 
 def cache_path(f):
     descriptor = k._raw_scan_cache_descriptor(f[3], f[2])
-    return k.Path(descriptor["base_cache_dir"]) / "peak_motif_raw_v1" / (descriptor["scan_key"] + ".pkl")
+    return k.Path(descriptor["base_cache_dir"]) / "peak_motif_raw_v1" / (descriptor["scan_key"] + ".sqlite")
+
+
+def raw_records(f):
+    descriptor = k._raw_scan_cache_descriptor(f[3], f[2])
+    return k._read_raw_motif_cache(cache_path(f).with_suffix(".pkl"), descriptor, f[2])
 
 
 def test_repeat_changed_model_rna_bins_topn_no_extract_or_scan(tmp_path, monkeypatch):
@@ -91,8 +97,7 @@ def test_subset_union_and_negative_hits(tmp_path, monkeypatch):
     assert len(calls) == 3
     monkeypatch.setattr(k, "_extract_peak_sequences", lambda *args, **kwargs: pytest.fail("cached zero extracted"))
     assert scan(f, ["ZERO"]) == {} and len(calls) == 3
-    with cache_path(f).open("rb") as handle:
-        records = pickle.load(handle)["records"]
+    records = raw_records(f)
     assert len(records) == 3 and records[("ZERO", "chr1", 200, 250)] == []
 
 
@@ -126,8 +131,7 @@ def test_coordinate_change_same_id_and_partial_failure_not_negative(tmp_path, mo
     f[1].var.loc["A", ["start", "end"]] = [10, 90]
     scan(f, ["A"])
     assert len(calls) == 2
-    with cache_path(f).open("rb") as handle:
-        records = pickle.load(handle)["records"]
+    records = raw_records(f)
     assert len(records) == 2 and not any(key[0] == "MISSING" for key in records)
 
 
@@ -140,7 +144,7 @@ def test_failed_genome_frozen_fallback_never_cached(tmp_path, monkeypatch, mode)
     monkeypatch.setattr(k, "_load_tf_database", lambda *args: pytest.fail("frozen TF reloaded"))
     assert scan(f, ["A"], frozen=frozenset({"TF"})) == {"A": ["TF"]}
     assert scan(f, ["A"], frozen=frozenset()) == {}
-    assert not cache_path(f).exists()
+    assert not raw_records(f)
 
 
 def test_descriptor_base_not_model_namespace_legacy_not_promoted(tmp_path, monkeypatch, caplog):
@@ -177,7 +181,7 @@ def test_legacy_two_requests_zero_scans_no_promotion(tmp_path, monkeypatch, capl
     f[3]["rna_to_atac"]["max_tfs_per_peak"] = 99
     assert scan(f, ["A", "B"]) == {"A": ["FIRST", "SECOND"], "B": ["BTF"]}
     assert calls == [] and old.read_bytes() == before
-    assert not cache_path(f).exists()
+    assert not raw_records(f)
     assert "reused_legacy=2 scanned=0" in caplog.text
     assert "Not promoting" not in caplog.text
 
@@ -193,8 +197,7 @@ def test_mixed_raw_legacy_new_subset_and_missing_genome(tmp_path, monkeypatch):
     result = scan(f, ["A", "B", "ZERO", "OUTSIDE"])
     assert result["A"] == ["LEGACY"] and "B" in result and "ZERO" not in result and "OUTSIDE" not in result
     assert len(calls) == 1
-    with cache_path(f).open("rb") as handle:
-        assert {key[0] for key in pickle.load(handle)["records"]} == {"B", "ZERO"}
+    assert {key[0] for key in raw_records(f)} == {"B", "ZERO"}
     k.Path(f[3]["input"]["genome_fasta"]).unlink()
     result = scan(f, ["A", "B"], frozen=frozenset({"TF"}))
     assert result == {"A": ["LEGACY"], "B": ["TF"]}
@@ -219,18 +222,21 @@ def test_legacy_bad_or_empty_only_uncovered_scanned(tmp_path, monkeypatch, damag
 
 
 @pytest.mark.parametrize("damage", ["schema", "identity", "record", "pickle"])
-def test_malformed_cache_rescanned(tmp_path, monkeypatch, damage, caplog):
+def test_malformed_cache_rejected(tmp_path, monkeypatch, damage, caplog):
     f = fixture(tmp_path)
     calls = spy_scan(monkeypatch)
     scan(f, ["A"])
     path = cache_path(f)
-    with path.open("rb") as handle: payload = pickle.load(handle)
-    if damage == "schema": payload["schema"] = "unknown"
-    elif damage == "identity": payload["identity"] = {}
-    elif damage == "record": payload["records"][("A", "chr1", 0, 80)] = [{"bad": 1}]
-    path.write_bytes(b"broken" if damage == "pickle" else pickle.dumps(payload))
-    scan(f, ["A"])
-    assert len(calls) == 2 and "Ignoring invalid shared" in caplog.text
+    if damage == "pickle":
+        path.write_bytes(b"broken")
+    else:
+        with sqlite3.connect(path) as db:
+            if damage == "record": db.execute("UPDATE records SET hits='[{\"bad\":1}]'")
+            elif damage == "schema": db.execute("UPDATE metadata SET value='unknown' WHERE name='version'")
+            else: db.execute("UPDATE metadata SET value='{}' WHERE name='descriptor'")
+    with pytest.raises((ValueError, sqlite3.DatabaseError)):
+        scan(f, ["A"])
+    assert len(calls) == 1
 
 
 def test_concurrent_disjoint_misses_merge_union(tmp_path, monkeypatch):
@@ -245,8 +251,7 @@ def test_concurrent_disjoint_misses_merge_union(tmp_path, monkeypatch):
     with ThreadPoolExecutor(2) as pool:
         futures = [pool.submit(scan, f, [peak]) for peak in ("A", "B")]
         assert all(future.result(timeout=15) for future in futures)
-    with cache_path(f).open("rb") as handle:
-        assert len(pickle.load(handle)["records"]) == 2
+    assert len(raw_records(f)) == 2
     monkeypatch.setattr(k, "_extract_peak_sequences", lambda *args, **kwargs: pytest.fail("union lost coverage"))
     assert set(scan(f, ["A", "B"])) == {"A", "B"}
 
@@ -277,14 +282,15 @@ def test_atomic_failure_cleans_temp_and_preserves_previous_cache(tmp_path, monke
     def failed_replace(*args):
         raise OSError("simulated publish failure")
     monkeypatch.setattr(k.os, "replace", failed_replace)
+    other = path.with_name("unpublished.pkl")
     with pytest.raises(OSError, match="publish failure"):
-        k._merge_raw_motif_cache(path, descriptor, f[2], {("B", "chr1", 80, 160): []})
+        k._merge_raw_motif_cache(other, descriptor, f[2], {("B", "chr1", 80, 160): []})
     assert path.read_bytes() == before
-    assert not list(path.parent.glob(path.name + ".*"))
+    assert not list(path.parent.glob("*.tmp")) and not other.with_suffix(".sqlite").exists()
 
 
 def test_empty_or_out_of_range_extraction_never_cached_as_zero(tmp_path):
     f = fixture(tmp_path)
     f[1].var.loc["A", ["start", "end"]] = [240, 999]
     assert scan(f, ["A"]) == {}
-    assert not cache_path(f).exists()
+    assert not raw_records(f)

@@ -6,6 +6,7 @@ CausalBridge 预处理模块
 """
 
 import numpy as np
+from scipy import sparse
 import scanpy as sc
 import anndata as ad
 import logging
@@ -22,6 +23,7 @@ def preprocess_rna(
     keep_genes: Optional[list] = None,
     *,
     filter_cells: bool = True,
+    retain_low_count_targets: bool = False,
 ) -> ad.AnnData:
     """
     RNA 数据质量控制和归一化。
@@ -47,6 +49,9 @@ def preprocess_rna(
         必须保留的基因列表（如敲除目标基因），即使不在高变基因筛选中
     filter_cells : bool
         是否执行细胞 QC；模型视图使用参考聚类的细胞集合时设为 False。
+    retain_low_count_targets : bool
+        模型视图保留有非零计数但未通过基因 QC 的指定靶点；
+        不改变其他基因的归一化分母和 HVG 选择，参考视图默认关闭。
 
     Returns
     -------
@@ -61,7 +66,19 @@ def preprocess_rna(
 
     # --- 步骤2: 基因/细胞质控 ---
     logger.info(f"QC 前: {adata.n_obs} 细胞, {adata.n_vars} 基因")
-    sc.pp.filter_genes(adata, min_cells=min_cells_per_gene)
+    rescued = []
+    if retain_low_count_targets and keep_genes:
+        detected = np.asarray((adata.X > 0).sum(axis=0)).ravel()
+        requested = adata.var_names.isin(keep_genes)
+        rescued_mask = requested & (detected > 0) & (detected < min_cells_per_gene)
+        rescued = adata.var_names[rescued_mask].tolist()
+        for gene in rescued:
+            logger.warning("强制保留低检出靶基因 %s: %d/%d 细胞检出，min_cells_per_gene=%d；不参与 HVG 排名",
+                           gene, detected[adata.var_names.get_loc(gene)], adata.n_obs, min_cells_per_gene)
+        adata.var['n_cells'] = detected
+        adata = adata[:, (detected >= min_cells_per_gene) | rescued_mask].copy()
+    else:
+        sc.pp.filter_genes(adata, min_cells=min_cells_per_gene)
     if filter_cells:
         sc.pp.filter_cells(adata, min_counts=min_umi_per_cell)
     logger.info(f"QC 后: {adata.n_obs} 细胞, {adata.n_vars} 基因")
@@ -73,7 +90,18 @@ def preprocess_rna(
         )
 
     # --- 步骤3: 归一化 + log 变换（用于聚类和可视化）---
-    sc.pp.normalize_total(adata, target_sum=1e4)
+    if rescued:
+        # Preserve the original QC-passing library denominator. A rare target
+        # must not change normalization or HVG ranking of the other genes.
+        qc_columns = ~adata.var_names.isin(rescued)
+        totals = np.asarray(adata.X[:, qc_columns].sum(axis=1)).ravel()
+        factors = np.divide(1e4, totals, out=np.zeros_like(totals, dtype=float), where=totals > 0)
+        if (totals <= 0).any():
+            raise ValueError("cannot normalize rescued targets: cells have zero QC-passing RNA depth")
+        adata.X = (adata.X.multiply(factors[:, None]).tocsr() if sparse.issparse(adata.X)
+                   else adata.X * factors[:, None])
+    else:
+        sc.pp.normalize_total(adata, target_sum=1e4)
     sc.pp.log1p(adata)
 
     # --- 步骤4: 高变基因筛选 ---
@@ -81,9 +109,19 @@ def preprocess_rna(
     # seurat_v3 需要原始计数，因此临时将 X 替换为 raw
     normalized_X = adata.X
     adata.X = adata.layers["raw"]
-    sc.pp.highly_variable_genes(
-        adata, n_top_genes=n_highly_variable_genes, flavor="seurat_v3"
-    )
+    if rescued:
+        hvg_view = adata[:, ~adata.var_names.isin(rescued)].copy()
+        sc.pp.highly_variable_genes(hvg_view, n_top_genes=n_highly_variable_genes, flavor="seurat_v3")
+        for column in hvg_view.var.columns.difference(adata.var.columns).union(
+                ["highly_variable", "highly_variable_rank", "means", "variances", "variances_norm"]):
+            if column in hvg_view.var:
+                adata.var[column] = hvg_view.var[column].reindex(adata.var_names)
+        adata.var["highly_variable"] = adata.var["highly_variable"].fillna(False).astype(bool)
+        adata.uns["hvg"] = hvg_view.uns["hvg"].copy()
+    else:
+        sc.pp.highly_variable_genes(
+            adata, n_top_genes=n_highly_variable_genes, flavor="seurat_v3"
+        )
     adata.X = normalized_X
 
     # --- 步骤5: 确定下游分析保留的基因 ---

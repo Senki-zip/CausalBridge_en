@@ -1,6 +1,8 @@
 """CPU-only bounded spline math, strict codecs, independent-layer integration."""
 import copy
 import json
+import warnings
+from types import SimpleNamespace
 from dataclasses import replace
 from pathlib import Path
 
@@ -149,6 +151,7 @@ def test_both_layer_adapters_reporting_checkpoint_and_units(tmp_path,gene_family
     output=propagate_saturating(['A'],r,a,pt,edges,table,tf,cfg,transfer_models=gr,tf_model_registry=tr,cluster_label='0')
     assert np.isfinite(output['saturating_endpoints'].query("status == 'ok'").delta_rna).all()
     reports=run._saturating_registry_reports(gr,'peak_gene')
+    cfg['output']['export_details']=True
     io.save_results(dict(saturating_gene_metrics=reports[0],saturating_response_curves=reports[2]),cfg)
     assert (Path(cfg['output']['dir'])/'saturating_response_curves.csv').exists()
 
@@ -191,7 +194,7 @@ def test_continuous_runtime_checkpoint_recovery_and_family_rejection(tmp_path,mo
         motif_resources={'motif_db':{'synthetic':{'tf_name':'TF'}},'tf_database':frozenset({'TF'}),'resource_cache_dir':str(tmp_path)})
     assert_pipeline_registry_contracts(cfg,gr,tr)
     assert gr['schema']=='hybrid_spline_peak_gene_registry_v2'
-    assert tr['schema']=='hybrid_spline_tf_peak_registry_v2'
+    assert tr['schema']=='hybrid_spline_tf_peak_local_registry_v3'
     frozen=copy.deepcopy((gr,tr))
     output=perturbation.propagate_perturbation(['TF'],r,a,pt,edges,table,screen,cfg,
         transfer_models=gr,tf_model_registry=tr)
@@ -213,6 +216,77 @@ def test_spline_helper_change_invalidates_signature(monkeypatch):
 
 def alternative_design(x,x_range,knots,tail_scale):
     raise AssertionError('signature only, never evaluated')
+
+
+@pytest.mark.parametrize('tiny', [8.4e-131, 3.27e-25, 2.94e-16, 1e-12])
+def test_only_numerically_degenerate_knots_are_repaired(tiny):
+    x = np.r_[0., np.full(20, tiny), np.linspace(.01, 1, 21)]
+    y = .15 + .65 * np.sin(np.pi*x)**2
+    cfg = spline.SplineConfig()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always', RuntimeWarning)
+        model = spline.fit_single(x, y, (0, 1), cfg)
+    assert not [w for w in caught if issubclass(w.category, RuntimeWarning)]
+    repair = model.metrics['knot_repair']
+    np.testing.assert_array_equal(repair['original_knots'], spline._knots(x, 2))
+    assert len(model.knots) < len(repair['original_knots'])
+    assert model.config == cfg.to_dict()
+    assert np.isfinite(model.metrics['best_objective'])
+    assert model.metrics['best_objective'] < .1
+    clone = spline.SplineSingleModel(**{k:v for k,v in model.to_dict().items() if k != 'response_type'})
+    query = np.linspace(-1, 2, 200)
+    np.testing.assert_array_equal(model.predict(query), clone.predict(query))
+    assert ((model.predict(query) >= 0) & (model.predict(query) <= 1)).all()
+    for join in model.x_range:
+        h = 1e-7
+        v = model.predict([join-h, join, join+h])
+        assert abs((v[2]-2*v[1]+v[0])/h) < 1e-3
+    bad = model.to_dict(); bad.pop('response_type')
+    bad['metrics']['knot_repair']['repaired_knots'][4] = .2
+    with pytest.raises(ValueError, match='repair'):
+        spline.SplineSingleModel(**bad)
+
+
+def test_healthy_matrices_and_budget_failure_do_not_repair(monkeypatch):
+    x = np.r_[np.zeros(10), np.linspace(.02, 1, 32)]
+    cfg = spline.SplineConfig(max_nfev=1)
+    knots = spline._knots(x, cfg.internal_knots)
+    B, P, used, repair = spline._single_matrices(x, (x.min(), x.max()), knots, cfg)
+    assert repair is None
+    np.testing.assert_array_equal(used, knots)
+    np.testing.assert_array_equal(B, spline._design(x, (x.min(), x.max()), knots, cfg.tail_scale))
+    np.testing.assert_array_equal(P, np.sqrt(cfg.smoothness)*spline._penalty(knots, cfg.tail_scale))
+    calls = []
+    original = spline.least_squares
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(spline, 'least_squares', counted)
+    with pytest.raises(spline.SplineFitFailure):
+        spline.fit_single(x, .1+.7*x, (0, 1), cfg)
+    assert len(calls) == cfg.restarts
+
+
+@pytest.mark.parametrize('bad', ['objective', 'jacobian', 'warning'])
+def test_numerically_invalid_success_is_not_accepted(monkeypatch, bad):
+    def invalid_success(fun, start, jac, **kwargs):
+        if bad == 'warning':
+            warnings.warn('overflow encountered in solver', RuntimeWarning)
+        return SimpleNamespace(success=True, status=3, nfev=1, x=start,
+            fun=np.full(10, 1e200) if bad == 'objective' else fun(start),
+            jac=np.full((10, len(start)), np.nan) if bad == 'jacobian' else jac(start))
+    monkeypatch.setattr(spline, 'least_squares', invalid_success)
+    with pytest.raises(spline.SplineFitFailure) as exc:
+        spline.fit_single(np.linspace(0, 1, 30), np.linspace(.1, .9, 30), (0, 1))
+    assert all(not s['finite'] for s in exc.value.starts)
+    if bad == 'warning':
+        assert all(s['numeric_warnings'] for s in exc.value.starts)
+
+
+def test_numeric_helpers_are_in_source_signature():
+    signature = transfer._source_signature(transfer.TF_TYPE, response_family='spline')
+    for name in ('_single_matrices', '_finite_objective', '_numerical_knot_failure'):
+        assert 'CausalBridge.spline_hybrid.' + name in signature['functions']
 
 
 def test_spline_subset_warm_recovery_and_config_change_rejects_without_overwrite(tmp_path,monkeypatch):

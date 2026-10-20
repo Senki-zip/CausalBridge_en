@@ -63,12 +63,37 @@ def target_members(row):
         names = json.loads(row.get("target_gene_names_json", row["target_gene_ids_json"]))
         if (not isinstance(ids, list) or not isinstance(names, list) or not ids
                 or len(ids) != len(names)
+                or len(set(ids)) != len(ids)
                 or not all(isinstance(value, str) and value for value in ids + names)):
             raise ValueError("target gene JSON arrays must have matching lengths")
         return ids, names
-    ids = [v.strip() for v in re.split(r"[,+]", str(row["target_gene"])) if v.strip()]
+    raw = row.get("target_gene_id")
+    if not isinstance(raw, str) or not raw:
+        raw = str(row["target_gene"])
+    if raw.startswith("joint:"):
+        raise ValueError("Composite joint identity requires canonical target_gene_ids_json arrays")
+    ids = [v.strip() for v in re.split(r"[,+;]", raw) if v.strip()]
     names = [v.strip() for v in re.split(r"[,+]", str(row.get("target_gene_label", row["target_gene"]))) if v.strip()]
     return ids, names if len(names) == len(ids) else ids
+
+
+def intervention_members(frame):
+    """Validate one coalition before pooling contexts or selecting top genes."""
+    columns = [c for c in ("target_gene", "target_gene_id", "target_gene_label",
+                           "target_gene_ids_json", "target_gene_names_json") if c in frame]
+    members = None
+    labels = {}
+    for _, row in frame[columns].drop_duplicates().iterrows():
+        ids, names = target_members(row)
+        if members is not None and set(ids) != set(members):
+            raise ValueError("Multiple interventions found; choose a single-run result directory")
+        if members is None:
+            members = ids
+        for gene, name in zip(ids, names):
+            if gene in labels and labels[gene] != name:
+                raise ValueError("Inconsistent target display names")
+            labels[gene] = name
+    return members or [], labels
 
 
 def boolean_flags(values):
@@ -193,7 +218,9 @@ def extract_subgraph(G, target_gene, affected_genes, orphan_genes,
     sg.graph["target"] = target_gene
 
     targets = target_gene if isinstance(target_gene, tuple) else (target_gene,)
-    sg.add_node(target_gene, ntype="target", layer=0)
+    sg.graph["targets"] = targets
+    for target in targets:
+        sg.add_node(target, ntype="target", layer=0)
 
     # Precompute lookups
     tf_all = set(tf_weights_df["tf_gene"])
@@ -226,7 +253,9 @@ def extract_subgraph(G, target_gene, affected_genes, orphan_genes,
         can_reach = bool(downstream_tfs)
         if hits_affected or can_reach:
             sg.add_node(p, ntype="peak", layer=1)
-            sg.add_edge(target_gene, p, etype="TF_PEAK")
+            for target in targets:
+                if p in set(tf_weights_df.loc[tf_weights_df.tf_gene.eq(target), "peak_id"]):
+                    sg.add_edge(target, p, etype="TF_PEAK")
             peaks_layer1.add(p)
 
     # --- Layer 2: genes downstream of layer-1 peaks ---
@@ -236,7 +265,7 @@ def extract_subgraph(G, target_gene, affected_genes, orphan_genes,
     for p in peaks_layer1:
         downstream = set(causal_edges_df[causal_edges_df["peak_id"] == p]["gene"])
         for g in downstream:
-            if g not in G:
+            if g not in G or g in targets:
                 continue
             if g in affected_set:
                 genes_layer2.add(g)
@@ -410,7 +439,7 @@ def draw_network(ax, G, target_gene, cluster_label, delta_map=None,
     # ── Draw orphan fallback edges (target → orphan gene, dashed) ──
     for node, ndata in G.nodes(data=True):
         if ndata.get("ntype") == "orphan":
-            tpos = pos[target_gene]
+            tpos = np.mean([pos[t] for t in G.graph.get("targets", (target_gene,))], axis=0)
             opos = pos[node]
             ax.annotate("", xy=opos, xytext=tpos,
                         arrowprops=dict(
@@ -520,7 +549,8 @@ def draw_network(ax, G, target_gene, cluster_label, delta_map=None,
                    if d.get("ntype") == "orphan")
     n_total = n_causal + n_orphan
 
-    title = f"Cluster {cluster_label}  |  {G.nodes[target_gene].get('label', target_gene)} → {n_total} affected"
+    target_label = " + ".join(str(G.nodes[t].get("label", t)) for t in G.graph.get("targets", (target_gene,)))
+    title = f"Cluster {cluster_label}  |  {target_label} KO → {n_total} affected"
     if G.graph.get("effect_note"):
         title += "\n" + G.graph["effect_note"]
     if n_orphan > 0:
@@ -562,8 +592,15 @@ def main(pert_csv, tf_csv, edges_csv, top_n=5, output_dir=None):
         if not Path(path).is_file():
             raise FileNotFoundError(path)
     pert = adapt_effects(pd.read_csv(pert_csv), merged=Path(pert_csv).name == "perturbation_merged.csv")
+    # This entry point draws independent panels for independent interventions.
+    # Canonical sets keep display aliases/order from splitting the same KO.
+    pert["_intervention"] = [json.dumps(sorted(target_members(row)[0])) for _, row in pert.iterrows()]
+    identities = {key: intervention_members(group) for key, group in pert.groupby("_intervention")}
+    pert["target_gene"] = pert["_intervention"]
     print(f"Excluded {int((~pert.plot_available).sum())} unavailable RNA effects")
     pert = pert[pert.plot_available].copy()
+    pert = pert[[row.affected_gene not in identities[row["_intervention"]][0]
+                 for _, row in pert.iterrows()]].copy()
     if "cluster" not in pert:
         pert["cluster"] = "global"
     tf_df = identity_frame(pd.read_csv(tf_csv), ("tf_gene",))
@@ -616,7 +653,7 @@ def main(pert_csv, tf_csv, edges_csv, top_n=5, output_dir=None):
                 row = pert[mask].iloc[0]
                 local_graph = network_from_frames(context_rows(tf_df, cl), context_rows(edges_df, cl))
                 reachable = set().union(*(_reachable_genes(local_graph, member) if member in local_graph else set()
-                                          for member in target_members(row)[0]))
+                                          for member in identities[tg][0]))
                 pert.loc[mask, "is_fallback"] = ~pert.loc[mask, "affected_gene"].isin(reachable)
     pert["is_fallback"] = pert["is_fallback"].astype(bool)
 
@@ -627,6 +664,7 @@ def main(pert_csv, tf_csv, edges_csv, top_n=5, output_dir=None):
         print(f"  {tg}: {n_causal_tot} causal + {n_fallback} fallback genes")
 
         dft = pert[pert["target_gene"] == tg]
+        members, target_labels = identities[tg]
         for cl in clusters:
             dfc = dft[dft["cluster"] == cl]
             if dfc.empty:
@@ -647,7 +685,7 @@ def main(pert_csv, tf_csv, edges_csv, top_n=5, output_dir=None):
                 delta_map[row["affected_gene"]] = row["plot_delta"]
 
             # Build subgraph with both causal and orphan genes
-            members, member_names = target_members(dfc.iloc[0])
+            member_names = [target_labels[member] for member in members]
             target_key = members[0] if len(members) == 1 else tuple(members)
             # Context-specific tables prevent paths assembled across clusters.
             local_tf = context_rows(tf_df, cl)
@@ -661,7 +699,8 @@ def main(pert_csv, tf_csv, edges_csv, top_n=5, output_dir=None):
             labels = dict(zip(pert.affected_gene, pert.affected_gene_label))
             for node in sg:
                 sg.nodes[node]["label"] = labels.get(node, G.nodes[node].get("label", node) if node in G else node)
-            sg.nodes[target_key]["label"] = " + ".join(member_names)
+            for member in members:
+                sg.nodes[member]["label"] = target_labels.get(member, member)
             sg.graph["effect_note"] = "; ".join(dict.fromkeys(
                 list(dfc.effect_unit) + [note for note in dfc.effect_note if note]))
 

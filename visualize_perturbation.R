@@ -13,29 +13,87 @@
 # =============================================================================
 
 # ==============================================================================
-# 用户配置 / Configuration — modify these variables directly before running
-# 优先级：命令行 > 环境变量 > 下方手动配置。
+# Configuration — modify these variables directly before running
+# Precedence: CLI > environment > manual settings below.
 # ==============================================================================
 script_file <- grep("^--file=", commandArgs(), value = TRUE)
-PROJECT_DIR <- if (length(script_file)) dirname(normalizePath(sub("^--file=", "", script_file[1]))) else getwd()
+# source() (including RStudio) keeps the sourced filename in its call frame.
+# Prefer it to --file, which can identify a different, calling R script.
+vis_source_files <- Filter(function(x) is.character(x) && length(x) == 1L && nzchar(x),
+  lapply(sys.frames(), function(frame) frame$ofile))
+PROJECT_DIR <- if (length(vis_source_files)) {
+  dirname(normalizePath(tail(vis_source_files, 1)[[1]], mustWork = TRUE))
+} else if (length(script_file)) {
+  dirname(normalizePath(sub("^--file=", "", script_file[1]), mustWork = TRUE))
+} else getwd()
 
-# 输入结果目录：保留适配前的 test_2/D3 默认值；可改为任意一次运行的目录。
-RESULT_DIR <- "/home/huangtao/Desktop/huangchengqi/code_1/CausalBridge/results/test/KLF1_test/"
-# 输出图片目录：NULL 表示使用最终输入目录下的 figures_R；也可填写独立路径。
+# Input results directory: select the run to visualize.
+RESULT_DIR <- file.path(PROJECT_DIR, "results/example")
+# Original ATAC counts for trajectories; must match the model run in RESULT_DIR.
+# Independent input path, not necessarily inside RESULT_DIR; update when switching datasets.
+# NULL reads the saved run configuration; --trajectory-atac-file overrides this value.
+# Original counts/cell/peak fingerprints are checked; no substitution on mismatch.
+TRAJECTORY_ATAC_FILE <- NULL
+# Figure directory: NULL uses figures_R under the final input directory.
 OUTPUT_DIR <- NULL  # e.g. "/path/to/my_figures"
 
-# 通路图下游基因：NULL → 自动按 |delta_rna_signed| 取前 TOP_PATHWAY_N 个。
-# 手动选择示例：PATHWAY_GENES <- c("RASSF2", "CBWD2", "CDH1")
-# 支持稳定 gene ID 或显示名称；同名基因请用 ID 区分。
-# --genes 或 CAUSALBRIDGE_PATHWAY_GENES 可覆盖；__AUTO__ 切换回自动选择。
+# Downstream pathway genes: NULL selects TOP_PATHWAY_N by |delta_rna_signed|.
+# Manual example: PATHWAY_GENES <- c("RASSF2", "CBWD2", "CDH1")
+# Accepts stable IDs or display names; disambiguate duplicate names with IDs.
+# --genes or CAUSALBRIDGE_PATHWAY_GENES overrides; __AUTO__ restores automatic selection.
 PATHWAY_GENES <- NULL
 TOP_PATHWAY_N <- 5
 
-# TF 层级图：按上下游联合贡献选择 TF，再按下游贡献的绝对值选择基因。
-# 这些参数只控制展示，不改变模型或保存的扰动结果。
+# TF hierarchy: select TFs by combined upstream/downstream contribution, then genes by absolute downstream contribution.
+# Display settings only, without changing models or saved perturbations.
 TOP_TF_N <- 5
 TOP_DOWNSTREAM_N <- 4
-MIN_EFFECT_TF <- 0.005  # 去掉 |effect| 不超过此值的下游基因
+MIN_EFFECT_TF <- 0.005  # Exclude downstream genes with |effect| at or below this value
+
+# Independent additional figures; retain pathway/radial selection and layout. CLI overrides apply.
+# Selected-gene TF→peak→gene WT/KO trajectories; NULL clears gene selection.
+TRAJECTORY_GENES <- NULL  # e.g. c("NOLC1", "CDH1")
+TRAJECTORY_PEAKS <- NULL  # Exact saved peak IDs; CLI --trajectory-peaks overrides
+# Gene and peak filters intersect; peak-only mode infers downstream genes from saved paths.
+TRAJECTORY_TOP_PATHS <- 3  # Path cap per downstream gene; filter peaks first, then add two response companions per path
+# Saved TF→peak and selected-gene peak→gene curves, without an average curve.
+TF_RESPONSE_TOP_N <- 10  # Selected-gene gallery size; otherwise each cluster/layer selects the top5 by R²
+TF_RESPONSE_MIN_R2 <- 0.5  # Gallery threshold, not applied to trajectory companions or per-cluster top5
+MODEL_DIAGNOSTIC_PLOTS <- TRUE  # --model-diagnostic-plots true/false; effect versus input extrapolation
+VIS_WORKERS <- 2L  # --workers; independent cluster loading/validation processes;1 is serial
+NEW_VIS_PYTHON <- ""  # Empty auto-selects CausalBridge Python; explicit path overrides environment variables
+
+vis_new_config <- function(args = commandArgs(trailingOnly = TRUE)) {
+  result <- list(genes = TRAJECTORY_GENES, peaks = TRAJECTORY_PEAKS, top_paths = TRAJECTORY_TOP_PATHS,
+    top_n = TF_RESPONSE_TOP_N, min_r2 = TF_RESPONSE_MIN_R2,
+    diagnostics = MODEL_DIAGNOSTIC_PLOTS, atac = TRAJECTORY_ATAC_FILE,
+    workers = VIS_WORKERS, only = "--new-visualizations-only" %in% args)
+  options <- c("--trajectory-genes", "--trajectory-peaks", "--trajectory-top-paths", "--tf-response-top-n",
+    "--tf-response-min-r2", "--model-diagnostic-plots", "--trajectory-atac-file", "--workers")
+  for (option in options) {
+    at <- which(args == option)
+    if (!length(at)) next
+    at <- tail(at, 1)
+    if (at == length(args) || startsWith(args[at + 1], "--")) stop(paste("Missing value for", option))
+    value <- args[at + 1]
+    if (option == "--workers") result$workers <- as.numeric(value)
+    if (option == "--trajectory-genes") result$genes <- if (value %in% c("NULL", "__NONE__")) NULL else trimws(strsplit(value, ",")[[1]])
+    if (option == "--trajectory-peaks") result$peaks <- if (value %in% c("NULL", "__NONE__")) NULL else trimws(strsplit(value, ",")[[1]])
+    if (option == "--trajectory-top-paths") result$top_paths <- as.numeric(value)
+    if (option == "--tf-response-top-n") result$top_n <- as.numeric(value)
+    if (option == "--tf-response-min-r2") result$min_r2 <- as.numeric(value)
+    if (option == "--trajectory-atac-file") result$atac <- value
+    if (option == "--model-diagnostic-plots") {
+      if (!tolower(value) %in% c("true", "false")) stop("--model-diagnostic-plots requires true or false")
+      result$diagnostics <- tolower(value) == "true"
+    }
+  }
+  if (!is.finite(result$top_n) || result$top_n < 0 || result$top_n != as.integer(result$top_n)) stop("TF_RESPONSE_TOP_N must be a nonnegative integer")
+  if (!is.finite(result$top_paths) || result$top_paths < 1 || result$top_paths != as.integer(result$top_paths)) stop("TRAJECTORY_TOP_PATHS must be a positive integer")
+  if (!is.finite(result$min_r2)) stop("TF_RESPONSE_MIN_R2 must be finite")
+  if (!is.finite(result$workers) || result$workers < 1 || result$workers != as.integer(result$workers)) stop("VIS_WORKERS must be a positive integer")
+  result
+}
 
 # Source only these adapters with CAUSALBRIDGE_VIS_ADAPTERS_ONLY=1.
 VIS_LABELS <- new.env(parent = emptyenv())
@@ -53,24 +111,52 @@ vis_identity <- function(df, roles) {
       df[[role]][use] <- ids[use]
     }
     df[[paste0(role, "_label")]] <- label
-    for (i in seq_len(nrow(df))) if (!is.na(df[[role]][i]) && !is.na(label[i]))
-      assign(as.character(df[[role]][i]), as.character(label[i]), envir = VIS_LABELS)
+    # Preserve the last nonmissing label for each ID, without registering the
+    # same identity once per pathway edge. Invalid trailing labels never erase
+    # an earlier valid label.
+    ids <- as.character(df[[role]])
+    values <- as.character(label)
+    valid <- which(!is.na(ids) & !is.na(values))
+    keep <- valid[!duplicated(ids[valid], fromLast = TRUE)]
+    for (i in keep) assign(ids[i], values[i], envir = VIS_LABELS)
   }
   df
 }
 
 vis_targets <- function(df) {
   if (!nrow(df)) return(list(ids = character(), names = character()))
-  if ("target_gene_ids_json" %in% names(df) && !is.na(df$target_gene_ids_json[1])) {
+  if ("target_gene_ids_json" %in% names(df) && any(!is.na(df$target_gene_ids_json))) {
     if (!requireNamespace("jsonlite", quietly = TRUE)) stop("JSON target arrays require R package jsonlite")
-    ids <- jsonlite::fromJSON(df$target_gene_ids_json[1])
-    labels <- if ("target_gene_names_json" %in% names(df))
-      jsonlite::fromJSON(df$target_gene_names_json[1]) else vis_label(ids)
-    if (!is.character(ids) || !is.character(labels) || length(ids) != length(labels))
+    if (any(is.na(df$target_gene_ids_json))) stop("Missing target JSON identity in some rows")
+    arrays <- lapply(unique(df$target_gene_ids_json), jsonlite::fromJSON)
+    ids <- arrays[[1]]
+    if (!is.character(ids) || !length(ids) || anyNA(ids) || any(!nzchar(ids)) || anyDuplicated(ids) ||
+        any(!vapply(arrays, function(x) is.character(x) && !anyDuplicated(x) && setequal(x, ids), logical(1))))
+      stop("Expected one consistent intervention with nonempty unique target IDs; select a single-run directory")
+    labels <- vis_label(ids)
+    if ("target_gene_names_json" %in% names(df)) {
+      pairs <- unique(df[c("target_gene_ids_json", "target_gene_names_json")])
+      for (i in seq_len(nrow(pairs))) {
+        row_ids <- jsonlite::fromJSON(pairs$target_gene_ids_json[i])
+        row_names <- jsonlite::fromJSON(pairs$target_gene_names_json[i])
+        if (!is.character(row_names) || length(row_names) != length(ids) || anyNA(row_names))
+          stop("Target JSON arrays must contain matching gene IDs and names")
+        mapped <- row_names[match(ids, row_ids)]
+        if (i > 1 && !identical(labels, mapped)) stop("Inconsistent target display names")
+        labels <- mapped
+      }
+    }
+    if (!is.character(labels) || length(ids) != length(labels))
       stop("Target JSON arrays must contain matching gene IDs and names")
+    for (i in seq_along(ids)) assign(ids[i], labels[i], envir = VIS_LABELS)
     return(list(ids = ids, names = labels))
   }
-  ids <- unique(trimws(unlist(strsplit(as.character(df$target_gene[1]), "[,+]"))))
+  values <- unique(as.character(df$target_gene))
+  if (length(values) != 1 || is.na(values)) stop("Expected one intervention; select a single-run directory")
+  if (startsWith(values, "joint:")) stop("Composite joint identity requires canonical target JSON arrays")
+  # Known legacy separators only; underscores and hyphens belong to gene IDs.
+  # JSON above is authoritative when symbols contain these separators.
+  ids <- unique(trimws(unlist(strsplit(values, "[,+;]"))))
   ids <- ids[nzchar(ids)]
   list(ids = ids, names = vis_label(ids))
 }
@@ -213,7 +299,11 @@ vis_config <- function(args = commandArgs(trailingOnly = TRUE),
   result_arg <- NULL
   i <- 1
   while (i <= length(args)) {
-    if (args[i] %in% c("--result-dir", "--output-dir", "--genes")) {
+    if (args[i] %in% c("--trajectory-genes", "--trajectory-top-paths", "--tf-response-top-n",
+        "--tf-response-min-r2", "--model-diagnostic-plots", "--trajectory-atac-file")) {
+      if (i == length(args)) stop(paste("Missing value for", args[i]))
+      i <- i + 2
+    } else if (args[i] %in% c("--result-dir", "--output-dir", "--genes")) {
       if (i == length(args)) stop(paste("Missing value for", args[i]))
       if (args[i] == "--result-dir") result_arg <- args[i + 1]
       if (args[i] == "--output-dir") output_dir <- args[i + 1]
@@ -247,7 +337,236 @@ vis_select_pathway_genes <- function(merged, specified = NULL, top_n = TOP_PATHW
   dplyr::pull(dplyr::slice_max(available, order_by = abs(delta_rna_signed), n = top_n), affected_gene)
 }
 
+# Distribution thresholds are independent of the effect–fit quality plot.
+vis_distribution_change <- function(x) {
+  ifelse(!is.finite(x), NA_character_,
+    ifelse(x > 0.1, "Up", ifelse(x < -0.1, "Down", "Stable")))
+}
+
+# Round each signed endpoint outward; retain raw effect units on the legend.
+vis_heatmap_spec <- function(x, down, up) {
+  x <- x[is.finite(x)]
+  outward <- function(v) {
+    if (v == 0) return(0)
+    step <- 10^(floor(log10(abs(v))) - 1)
+    max(abs(v), ceiling(abs(v) / step - 1e-12) * step)
+  }
+  lo <- -outward(min(c(0, x)))
+  hi <- outward(max(c(0, x)))
+  if (lo == 0 && hi == 0)
+    return(list(limits = c(-1, 1), colors = c("white", "white"),
+                values = c(0, 1), breaks = 0))
+  knots <- unique(c(lo, 0, hi))
+  colors <- if (lo == 0) c("white", up) else if (hi == 0) c(down, "white") else c(down, "white", up)
+  list(limits = c(lo, hi), colors = colors,
+       values = (knots - lo) / (hi - lo), breaks = knots)
+}
+
+vis_heatmap_gene_ranking <- function(cluster_long) {
+  n_cluster_total <- dplyr::n_distinct(cluster_long$cluster)
+  ranked <- dplyr::summarise(
+    dplyr::group_by(cluster_long, affected_gene),
+    n_observed = dplyr::n_distinct(cluster),
+    coverage = n_observed / n_cluster_total,
+    effect_range = ifelse(n_observed > 1,
+                          max(delta_rna) - min(delta_rna), 0),
+    effect_sd = ifelse(n_observed > 1, sd(delta_rna), 0),
+    direction_switch = any(delta_rna > 0) & any(delta_rna < 0),
+    effect_sum = sum(delta_rna),
+    # A signed sum closer to zero gives a bounded bonus (at most 2x).
+    # Retaining the dispersion factor prevents zero effects scoring highly.
+    balance_score = 1 / (1 + abs(effect_sum)),
+    heterogeneity_score = coverage * (effect_range + effect_sd) *
+                          ifelse(direction_switch, 1.25, 1) * (1 + balance_score),
+    .groups = "drop"
+  )
+  dplyr::arrange(ranked, dplyr::desc(heterogeneity_score),
+                dplyr::desc(effect_range), dplyr::desc(n_observed), affected_gene)
+}
+
+# Only reconcile the pipeline's numeric cluster_N alias with an existing ID.
+# PAGA/context labels and arbitrary biological names remain intact.
+vis_cluster_ids <- function(x, reference) {
+  x <- as.character(x)
+  short <- sub("^cluster_", "", x)
+  use <- !is.na(x) & grepl("^cluster_[0-9]+$", x) &
+    !x %in% reference & short %in% reference
+  x[use] <- short[use]
+  x
+}
+
+vis_history_bin_effects <- function(history, cells, targets) {
+  required <- c("source_context", "branch", "bin", "control_state", "state_value")
+  if (!all(required %in% names(history))) stop("RNA bin history lacks complete WT/KO states")
+  if ("target_gene" %in% names(history) && !setequal(vis_targets(history)$ids, targets))
+    stop("RNA history intervention differs from endpoint intervention")
+  history <- vis_identity(history, "gene")
+  if (!"gene" %in% names(history)) stop("RNA bin history lacks gene identity")
+  if (!all(c("state_unit", "native_effect_unit") %in% names(history)))
+    stop("RNA bin history lacks native state/effect units")
+  history$cluster <- vis_cluster_ids(history$source_context, unique(cells$cluster))
+  history$bin <- as.integer(if ("global_bin" %in% names(history)) history$global_bin else history$bin)
+  # A branch is part of the state identity; never sum alternate branch states.
+  branch_keys <- unique(history[c("cluster", "bin", "branch")])
+  if (!"branch" %in% names(cells) && anyDuplicated(branch_keys[c("cluster", "bin")]))
+    stop("Multiple RNA branches per bin require branch labels in pseudotime.csv")
+  keys <- c("cluster", "bin", if ("branch" %in% names(cells)) "branch")
+  if (anyDuplicated(history[c("cluster", "branch", "bin", "gene")]))
+    stop("Duplicate RNA bin states: select one intervention/result directory")
+  history <- history[!history$gene %in% targets, , drop = FALSE]
+  valid <- is.finite(history$control_state) & is.finite(history$state_value) &
+    history$state_unit == "rna_log1p_cp10k" &
+    history$native_effect_unit == "delta_log1p_rna_log1p_cp10k"
+  if ("status" %in% names(history)) valid <- valid & !is.na(history$status) & history$status == "ok"
+  valid[is.na(valid)] <- FALSE
+  history$gene_effect <- ifelse(valid, history$state_value - history$control_state, NA_real_)
+  result <- dplyr::summarise(dplyr::group_by(history, dplyr::across(dplyr::all_of(keys))),
+    downstream_abs_sum = if (any(is.finite(gene_effect))) sum(abs(gene_effect), na.rm = TRUE) else NA_real_,
+    n_affected_genes = if (any(is.finite(gene_effect))) sum(abs(gene_effect) > 1e-10, na.rm = TRUE) else NA_integer_,
+    .groups = "drop")
+  result <- dplyr::left_join(unique(cells[keys]), result, by = keys)
+  normalize <- function(x) {
+    m <- max(c(0, x[is.finite(x)]))
+    if (m > 0) x / m else ifelse(is.finite(x), 0, NA_real_)
+  }
+  result$mean_abs_downstream_effect <- ifelse(result$n_affected_genes > 0,
+    result$downstream_abs_sum / result$n_affected_genes,
+    ifelse(is.finite(result$downstream_abs_sum), 0, NA_real_))
+  result$relative_effect <- normalize(result$downstream_abs_sum)
+  result$mean_relative_effect <- normalize(result$mean_abs_downstream_effect)
+  result
+}
+
+# Keep reticulate's Python settings local to its own bridge, not these subprocesses.
+vis_python_env <- function() c("PYTHONHOME=", "PYTHONPATH=")
+
+vis_python_probe <- function(python) {
+  executable <- Sys.which(python)
+  if (!nzchar(executable)) executable <- python
+  code <- paste("import sys, importlib;",
+    "[importlib.import_module(m) for m in ('numpy','pandas','scipy','matplotlib')];",
+    "print('CausalBridge visualization Python:', sys.executable)")
+  output <- tryCatch(suppressWarnings(system2(executable,
+    c("-c", shQuote(code)), stdout = TRUE, stderr = TRUE, env = vis_python_env())),
+    error = function(e) structure(conditionMessage(e), status = 127L))
+  status <- attr(output, "status")
+  if (is.null(status)) status <- 0L
+  list(python = unname(executable), status = status, output = output)
+}
+
+vis_resolve_python <- function(python = NEW_VIS_PYTHON, r_home = R.home()) {
+  explicit <- if (length(python) && nzchar(python)) python else
+    Sys.getenv("CAUSALBRIDGE_VIS_PYTHON", unset = "")
+  if (nzchar(explicit)) {
+    result <- vis_python_probe(explicit)
+    result$source <- if (length(python) && nzchar(python)) "NEW_VIS_PYTHON" else "CAUSALBRIDGE_VIS_PYTHON"
+    return(result)  # Never replace a user's explicit interpreter, even if broken.
+  }
+  candidates <- character()
+  home <- normalizePath(r_home, mustWork = FALSE)
+  prefix <- dirname(dirname(home))
+  if (basename(home) == "R" && basename(dirname(home)) == "lib" &&
+      dir.exists(file.path(prefix, "conda-meta")))
+    candidates <- c(candidates, file.path(prefix, "bin", "python"))
+  active <- Sys.getenv("CONDA_PREFIX", unset = "")
+  if (nzchar(active) && tolower(basename(active)) == "causalbridge")
+    candidates <- c(candidates, file.path(active, "bin", "python"))
+  attempts <- character()
+  check <- function(paths, source) {
+    for (path in unique(paths[nzchar(paths)])) {
+      result <- vis_python_probe(path)
+      result$source <- source
+      if (result$status == 0L) return(result)
+      attempts <<- c(attempts, paste0(path, ":\n", paste(result$output, collapse = "\n")))
+    }
+    NULL
+  }
+  result <- check(candidates, "R/active conda environment")
+  if (!is.null(result)) return(result)
+  conda <- Sys.getenv("CONDA_EXE", unset = "")
+  if (!nzchar(conda)) conda <- unname(Sys.which("conda"))
+  if (nzchar(conda) && requireNamespace("jsonlite", quietly = TRUE)) {
+    info <- tryCatch({
+      raw <- suppressWarnings(system2(conda, c("info", "--json"),
+        stdout = TRUE, stderr = FALSE, env = vis_python_env()))
+      jsonlite::fromJSON(paste(raw, collapse = "\n"))
+    }, error = function(e) NULL)
+    envs <- info$envs
+    named <- envs[tolower(basename(envs)) == "causalbridge"]
+    result <- check(file.path(named, "bin", "python"), "discovered CausalBridge conda environment")
+    if (!is.null(result)) return(result)
+  }
+  # RStudio may have neither conda nor its environments on PATH.
+  conda_roots <- path.expand(c("~/miniconda3", "~/anaconda3", "~/miniforge3", "~/mambaforge", "~/.conda"))
+  home_envs <- unlist(lapply(file.path(conda_roots, "envs"), function(path)
+    if (dir.exists(path)) list.dirs(path, recursive = FALSE, full.names = TRUE) else character()), use.names = FALSE)
+  named <- home_envs[tolower(basename(home_envs)) == "causalbridge"]
+  result <- check(file.path(named, "bin", "python"), "CausalBridge conda environment in user home")
+  if (!is.null(result)) return(result)
+  result <- check(unname(Sys.which("python")), "PATH (verified imports)")
+  if (!is.null(result)) return(result)
+  list(python = "", status = 1L, source = "automatic discovery",
+    output = c("No usable Python with numpy, pandas, scipy and matplotlib. Set NEW_VIS_PYTHON or CAUSALBRIDGE_VIS_PYTHON.", attempts))
+}
+
 if (!identical(Sys.getenv("CAUSALBRIDGE_VIS_ADAPTERS_ONLY"), "1")) {
+# ==============================================================================
+# Apply environment and command-line overrides to the settings above
+# ==============================================================================
+
+resolved_config <- vis_config()
+RESULT_DIR <- file.path(PROJECT_DIR, "results/example")
+OUTPUT_DIR <- resolved_config$output_dir
+specified_genes <- resolved_config$pathway_genes
+dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+new_vis_config <- vis_new_config()
+vis_run_new_visualizations <- function() {
+  helper_status <- 0L
+if (length(new_vis_config$genes) || length(new_vis_config$peaks) || new_vis_config$top_n > 0 || new_vis_config$diagnostics) {
+  message("Starting model diagnostic plots (checkpoint and history loading may take time)...")
+  diagnostic_started <- proc.time()[["elapsed"]]
+  helper <- file.path(PROJECT_DIR, "scripts", "plot_model_diagnostics.py")
+  helper_args <- c(helper, "--result-dir", RESULT_DIR, "--output-dir", OUTPUT_DIR,
+    "--workers", as.character(new_vis_config$workers),
+    "--tf-response-top-n", as.character(new_vis_config$top_n),
+    "--tf-response-min-r2", as.character(new_vis_config$min_r2),
+    "--trajectory-top-paths", as.character(new_vis_config$top_paths),
+    "--model-diagnostic-plots", tolower(as.character(new_vis_config$diagnostics)))
+  if (length(new_vis_config$genes)) helper_args <- c(helper_args, "--trajectory-genes", paste(new_vis_config$genes, collapse = ","))
+  if (length(new_vis_config$peaks)) helper_args <- c(helper_args, "--trajectory-peaks", paste(new_vis_config$peaks, collapse = ","))
+  if (!is.null(new_vis_config$atac)) helper_args <- c(helper_args, "--trajectory-atac-file", new_vis_config$atac)
+  helper_log <- file.path(OUTPUT_DIR, "model_diagnostics.log")
+  python_resolution <- vis_resolve_python()
+  helper_python <- python_resolution$python
+  helper_command <- paste(shQuote(helper_python), paste(shQuote(helper_args), collapse = " "))
+  message("Model diagnostic command: ", helper_command)
+  message("Python selection: ", python_resolution$source)
+  helper_output <- if (python_resolution$status != 0L) {
+    structure(c("Python dependency preflight failed:", python_resolution$output),
+      status = python_resolution$status)
+  } else tryCatch(
+    suppressWarnings(system2(helper_python, shQuote(helper_args), stdout = TRUE, stderr = TRUE,
+      env = vis_python_env())),
+    error = function(e) structure(conditionMessage(e), status = 127L))
+  helper_status <- attr(helper_output, "status")
+  if (is.null(helper_status)) helper_status <- 0L
+  writeLines(c(paste("Python selection:", python_resolution$source), python_resolution$output,
+    paste("Command:", helper_command), paste("Exit status:", helper_status),
+    helper_output), helper_log)
+  if (length(helper_output)) message(paste(helper_output, collapse = "\n"))
+  if (helper_status != 0) warning(paste0("Requested model diagnostic plots did not complete; Python exit code ",
+    helper_status, ". Full command and error: ", normalizePath(helper_log),
+    "; select Python through NEW_VIS_PYTHON or CAUSALBRIDGE_VIS_PYTHON."), call. = FALSE)
+  message(sprintf("Model diagnostic plots finished in %.1f s", proc.time()[["elapsed"]] - diagnostic_started))
+}
+  helper_status
+}
+if (new_vis_config$only) quit(save = "no", status = vis_run_new_visualizations())
+
+# Only the original R plots need these packages. The Python-only entry can run
+# with the R interpreter from the model's conda environment.
+message("Loading R plotting packages...")
 suppressPackageStartupMessages({
   library(ggplot2)
   library(dplyr)
@@ -257,41 +576,42 @@ suppressPackageStartupMessages({
   library(igraph)
 })
 
-# The UMAP panel is optional. Keep the core CSV-based visualizations runnable
-# when the R anndata bridge is not installed.
-HAS_ANNDATA <- requireNamespace("anndata", quietly = TRUE)
-
-# ==============================================================================
-# 应用配置 / Apply environment and command-line overrides to the settings above
-# ==============================================================================
-
-resolved_config <- vis_config()
-RESULT_DIR <- resolved_config$result_dir
-OUTPUT_DIR <- resolved_config$output_dir
-specified_genes <- resolved_config$pathway_genes
-dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+# Read saved UMAP coordinates in an isolated Python subprocess, including when
+# an interactive R session already initialized a different Python interpreter.
+vis_read_embedding <- function(path) {
+  resolved <- vis_resolve_python()
+  if (resolved$status != 0L) stop(paste(resolved$output, collapse = "\n"))
+  exported <- tempfile(fileext = ".csv")
+  on.exit(unlink(exported), add = TRUE)
+  output <- system2(resolved$python, shQuote(c(
+    file.path(PROJECT_DIR, "scripts", "export_umap.py"), path, exported)),
+    stdout = TRUE, stderr = TRUE, env = vis_python_env())
+  status <- attr(output, "status")
+  if (!is.null(status) && status != 0L) stop(paste(output, collapse = "\n"))
+  read.csv(exported, stringsAsFactors = FALSE, check.names = FALSE)
+}
 
 # ==============================================================================
 # Visual style — presentation-only settings
 # ==============================================================================
 
 COLORS <- list(
-  up       = "#E74C3C",      # 深红色，激活
-  down     = "#3498DB",      # 深蓝色，抑制
-  stable   = "#BDC3C7",      # 灰色，稳定
-  ink      = "#2C3E50",      # 深色文字
-  muted    = "#7F8C8D",      # 浅色文字
-  grid     = "#ECF0F1",      # 网格线
-  panel    = "#FFFFFF",      # 面板背景
-  peak     = "#F8F9FA",      # Peak 节点背景
-  target   = "#F39C12",      # Target 节点（橙色）
-  target_2 = "#E67E22",      # Target 边框
-  tf       = "#9B59B6",      # TF 节点（紫色）
-  tf_bg    = "#F5EEF8",      # TF 节点背景
-  gene     = "#27AE60",      # Gene 节点（绿色）
-  gene_bg  = "#EAFAF1",      # Gene 节点背景
-  edge_pos = "#E74C3C",      # 正向边（红色）
-  edge_neg = "#3498DB"       # 负向边（蓝色）
+  up       = "#E74C3C",      # Red, activation
+  down     = "#3498DB",      # Blue, repression
+  stable   = "#BDC3C7",      # Gray, stable
+  ink      = "#2C3E50",      # Dark text
+  muted    = "#7F8C8D",      # Muted text
+  grid     = "#ECF0F1",      # Grid
+  panel    = "#FFFFFF",      # Panel background
+  peak     = "#F8F9FA",      # Peak background
+  target   = "#F39C12",      # Target node (orange)
+  target_2 = "#E67E22",      # Target border
+  tf       = "#9B59B6",      # TF node (purple)
+  tf_bg    = "#F5EEF8",      # TF background
+  gene     = "#27AE60",      # Gene node (green)
+  gene_bg  = "#EAFAF1",      # Gene background
+  edge_pos = "#E74C3C",      # Positive edge (red)
+  edge_neg = "#3498DB"       # Negative edge (blue)
 )
 
 theme_pub <- function(base_size = 14) {
@@ -321,6 +641,7 @@ if (!is.null(specified_genes)) {
 # Load data
 # ==============================================================================
 cat("\n--- Loading data ---\n")
+data_load_started <- proc.time()[["elapsed"]]
 
 pert_res <- vis_effects(read.csv(file.path(RESULT_DIR, "perturbation_results.csv")))
 cat(sprintf("perturbation_results: %d rows, %d unique genes\n",
@@ -344,16 +665,21 @@ cat(sprintf("peak_gene_edges: %d rows\n", nrow(peak_gene_edges)))
 
 pathways <- vis_join_pathways(pathways, tf_weights, peak_gene_edges)
 cat("Joined canonical TF/peak/gene weights and lag into pathways\n")
+cat(sprintf("Data loading and joins finished in %.1f s\n", proc.time()[["elapsed"]] - data_load_started))
 
 # Auto-detect one or more jointly perturbed TFs. Combined-KO outputs encode the
 # intervention as a comma- or plus-delimited string (for example KLF1,GATA1),
 # while pathway tf_name values remain individual gene symbols.
 target_gene_names <- vis_targets(pert_merged)$ids
 target_gene_name <- paste(vis_targets(pert_merged)$names, collapse = " + ")
+for (table in list(pert_res, pathways)) {
+  if (nrow(table) && !setequal(vis_targets(table)$ids, target_gene_names))
+    stop("Result tables describe different interventions; select a single-run directory")
+}
 
 if (identical(Sys.getenv("CAUSALBRIDGE_REQUIRE_MULTI_TF"), "1") &&
     length(target_gene_names) < 2) {
-  stop("联合 KO 可视化脚本要求 target_gene 至少包含两个 TF")
+  stop("Joint-KO visualization requires at least two TFs in target_gene")
 }
 
 cat(sprintf("Target gene%s: %s\n",
@@ -366,7 +692,7 @@ cat(sprintf("Target gene%s: %s\n",
 cat("\n--- Computing volcano data ---\n")
 
 # The saved merged endpoint is authoritative, including partial coverage.
-delta_df <- pert_merged %>% filter(plot_available) %>%
+delta_df <- pert_merged %>% filter(plot_available, !affected_gene %in% target_gene_names) %>%
   select(affected_gene, mean_delta = delta_rna_signed)
 
 # Per-gene mean R² from pathway edges (ATAC→RNA transfer function fit quality)
@@ -452,7 +778,7 @@ cat(sprintf("[OK] Effect–fit plot saved: %s\n", file.path(OUTPUT_DIR, "volcano
 # ==============================================================================
 cat("\n--- Drawing pathway schematics ---\n")
 
-# 手动指定或按保存的有符号效应绝对值自动选择；内部始终使用稳定 ID。
+# Select manually or by absolute saved signed effect; stable IDs are used internally.
 pathway_genes <- vis_select_pathway_genes(pert_merged, specified_genes)
 cat(sprintf("%s genes: %s\n", if (is.null(specified_genes)) "Auto-selected" else "Specified",
             paste(pathway_genes, collapse = ", ")))
@@ -509,11 +835,12 @@ plot_radial_cluster_pathway <- function(gene_name, pw_df, cluster_res, merged_df
   direct <- pw_df %>% filter(affected_gene == gene_name,
     tf_name %in% target_names, !is.na(cluster), is.finite(plot_pathway_weight)) %>%
     mutate(cluster = as.character(cluster)) %>%
-    edge_summary(c("cluster", "peak_id")) %>% mutate(
-      tf_name = target_names[1], direct = TRUE, upstream_tf_coef = tf_coef,
+    edge_summary(c("cluster", "tf_name", "peak_id")) %>% mutate(
+      direct = TRUE, upstream_tf_coef = tf_coef,
       upstream_gene_coef = NA_real_, downstream_tf_coef = tf_coef,
       downstream_gene_coef = gene_coef, route_kind = "direct")
-  upstream <- target_edges %>% edge_summary(c("cluster", "affected_gene", "peak_id")) %>%
+  upstream <- target_edges %>% edge_summary(c("cluster", "tf_name", "affected_gene", "peak_id")) %>%
+    rename(source_ko_tf = tf_name) %>%
     rename(intermediate = affected_gene, peak_a = peak_id,
            upstream_effect = effect, upstream_contribution = contribution,
            upstream_tf_coef = tf_coef, upstream_gene_coef = gene_coef)
@@ -1091,7 +1418,8 @@ plot_radial_cluster_pathway <- function(gene_name, pw_df, cluster_res, merged_df
     scale_size_identity() +
     coord_fixed(xlim = c(-body_outer_r - .20, body_outer_r + .20),
                  ylim = c(card_bottom - .20, cy + max_body_r + .10), clip = "off") +
-    labs(title = paste0(target_label, " KO — Radial Cluster Pathway: ", vis_label(gene_name))) +
+    labs(title = paste(strwrap(paste0(target_label, " KO — Radial Cluster Pathway: ",
+      vis_label(gene_name)), width = 50), collapse = "\n")) +
     theme_void() + theme(plot.title = element_text(face = "bold", size = 20,
       hjust = .5, color = COLORS$ink), plot.subtitle = element_text(size = 11,
       hjust = .5, color = COLORS$muted), plot.margin = margin(10, 14, 12, 14),
@@ -1231,20 +1559,24 @@ if (file.exists(legacy_indirect_file)) unlink(legacy_indirect_file)
 # 3. Supplemental: effect distribution + significance summary
 # ==============================================================================
 
-p_hist <- ggplot(volcano_df, aes(x = mean_delta)) +
+distribution_df <- volcano_df %>%
+  filter(is.finite(mean_delta), !affected_gene %in% target_gene_names) %>%
+  mutate(change = factor(vis_distribution_change(mean_delta), levels = c("Up", "Down", "Stable")))
+
+p_hist <- ggplot(distribution_df, aes(x = mean_delta)) +
   geom_histogram(aes(fill = after_stat(x >= 0)), bins = 80,
                  color = "white", alpha = 0.88) +
   scale_fill_manual(values = c(`TRUE` = COLORS$up, `FALSE` = COLORS$down),
                     guide = "none") +
   geom_vline(xintercept = 0, linewidth = 0.5, color = COLORS$ink) +
   geom_vline(
-    xintercept = median(volcano_df$mean_delta),
+    xintercept = median(distribution_df$mean_delta),
     linetype = "dashed", color = COLORS$up, linewidth = 0.8
   ) +
   annotate("text", x = 0, y = Inf, label = "zero", vjust = 1.4,
            hjust = 1.15, size = 3.4, color = COLORS$ink) +
-  annotate("text", x = median(volcano_df$mean_delta), y = Inf,
-           label = sprintf("median = %.2f", median(volcano_df$mean_delta)),
+  annotate("text", x = median(distribution_df$mean_delta), y = Inf,
+           label = sprintf("median = %.2f", median(distribution_df$mean_delta)),
            vjust = 2.8, hjust = -0.08, size = 3.4, color = COLORS$up) +
   labs(
     x = expression(Delta * " RNA (mean log-fold change)"),
@@ -1255,17 +1587,20 @@ p_hist <- ggplot(volcano_df, aes(x = mean_delta)) +
     panel.grid.major.x = element_blank()
   )
 
-p_bar <- volcano_df %>%
-  count(change) %>%
+p_bar <- distribution_df %>%
+  count(change, .drop = FALSE) %>%
   mutate(change = factor(change, levels = c("Up", "Down", "Stable"))) %>%
   ggplot(aes(x = change, y = n, fill = change)) +
   geom_col(color = "white", linewidth = 0.6, width = 0.66) +
   geom_text(aes(label = n), vjust = -0.45, size = 4.9, fontface = "bold",
             color = COLORS$ink) +
+  scale_y_continuous(expand = expansion(mult = c(0, .14))) +
   scale_fill_manual(
     values = c("Up" = COLORS$up, "Down" = COLORS$down, "Stable" = COLORS$stable),
     guide = "none"
   ) +
+  scale_x_discrete(labels = c(Up = "Up (> 0.1)", Down = "Down (< -0.1)",
+                              Stable = "Stable [-0.1, 0.1]")) +
   labs(
     x = NULL, y = "Number of genes"
   ) +
@@ -1301,28 +1636,15 @@ cat("\n--- Cross-cluster heatmap ---\n")
 
 # Aggregate once per gene/cluster while retaining missing combinations as NA.
 cluster_long <- pert_res %>%
+  filter(plot_available, is.finite(delta_rna), !affected_gene %in% target_gene_names) %>%
   group_by(affected_gene, cluster) %>%
   summarise(delta_rna = mean(delta_rna), .groups = "drop")
 
 # Rank genes by cross-cluster heterogeneity while penalizing sparse coverage.
 # Direction switches receive a modest bonus because they indicate the clearest
-# cluster-specific regulatory response.
-n_cluster_total <- n_distinct(cluster_long$cluster)
-gene_heterogeneity <- cluster_long %>%
-  group_by(affected_gene) %>%
-  summarise(
-    n_observed = n_distinct(cluster),
-    coverage = n_observed / n_cluster_total,
-    effect_range = ifelse(n_observed > 1,
-                          max(delta_rna) - min(delta_rna), 0),
-    effect_sd = ifelse(n_observed > 1, sd(delta_rna), 0),
-    direction_switch = any(delta_rna > 0) & any(delta_rna < 0),
-    heterogeneity_score = coverage * (effect_range + effect_sd) *
-                          ifelse(direction_switch, 1.25, 1),
-    .groups = "drop"
-  ) %>%
-  arrange(desc(heterogeneity_score), desc(effect_range),
-          desc(n_observed), affected_gene)
+# cluster-specific regulatory response. A signed sum closer to zero adds a
+# bounded balance bonus, computed only over observed clusters.
+gene_heterogeneity <- vis_heatmap_gene_ranking(cluster_long)
 
 top_genes <- head(gene_heterogeneity$affected_gene,
                   min(40, nrow(gene_heterogeneity)))
@@ -1358,16 +1680,18 @@ mat_melt <- mat_top %>%
                      levels = paste0("Cl ", cluster_levels))
   )
 
-# Cap extreme values for color scale
-cap_val <- 3
-mat_melt$delta_capped <- pmax(-cap_val, pmin(cap_val, mat_melt$delta_rna))
+# Separate negative/positive normalization, using the actual displayed genes.
+heat_scale <- vis_heatmap_spec(mat_melt$delta_rna, COLORS$down, COLORS$up)
+cat(sprintf("Heatmap finite displayed effect range: [%g, %g]; color limits: [%g, %g]\n",
+  min(mat_melt$delta_rna, na.rm = TRUE), max(mat_melt$delta_rna, na.rm = TRUE),
+  heat_scale$limits[1], heat_scale$limits[2]))
 
-p_heat <- ggplot(mat_melt, aes(x = cluster, y = gene, fill = delta_capped)) +
+p_heat <- ggplot(mat_melt, aes(x = cluster, y = gene, fill = delta_rna)) +
   geom_tile(color = "white", linewidth = 0.45) +
   scale_y_discrete(labels = vis_label) +
-  scale_fill_gradient2(
-    low = COLORS$down, mid = "white", high = COLORS$up,
-    midpoint = 0, limits = c(-cap_val, cap_val), oob = scales::squish,
+  scale_fill_gradientn(
+    colors = heat_scale$colors, values = heat_scale$values,
+    limits = heat_scale$limits, breaks = heat_scale$breaks,
     na.value = "#D9DDE1",
     name = expression(Delta * " RNA"),
     guide = guide_colorbar(barwidth = 0.65, barheight = 8.5, frame.colour = COLORS$grid)
@@ -1926,33 +2250,9 @@ rna_h5ad_path <- file.path(RESULT_DIR, "rna_clustered.h5ad")
 pseudotime_path <- file.path(RESULT_DIR, "intermediate", "pseudotime.csv")
 
 if (file.exists(rna_h5ad_path) && file.exists(pseudotime_path)) {
-  if (!HAS_ANNDATA) {
-    stop(
-      "UMAP effect 图需要 R 包 anndata。安装后请设置 RETICULATE_PYTHON 指向包含 Python anndata 的环境。"
-    )
-  }
-  adata <- anndata::read_h5ad(rna_h5ad_path)
-  obs_df <- as.data.frame(adata$obs)
-  cell_barcodes <- rownames(obs_df)
-
-  umap_key <- NULL
-  for (candidate in c("X_umap", "umap", "X_UMAP")) {
-    if (candidate %in% names(adata$obsm)) {
-      umap_key <- candidate
-      break
-    }
-  }
-  if (is.null(umap_key)) {
-    stop("rna_clustered.h5ad 中未找到 UMAP 坐标")
-  }
-
-  umap_coords <- adata$obsm[[umap_key]][, 1:2]
-  umap_df <- data.frame(
-    cell_barcode = cell_barcodes,
-    UMAP_1 = umap_coords[, 1],
-    UMAP_2 = umap_coords[, 2],
-    stringsAsFactors = FALSE
-  )
+  obs_df <- vis_read_embedding(rna_h5ad_path)
+  cell_barcodes <- obs_df$cell_barcode
+  umap_df <- obs_df[, c("cell_barcode", "UMAP_1", "UMAP_2")]
 
   pseudotime_cells <- read.csv(pseudotime_path, stringsAsFactors = FALSE) %>%
     mutate(cluster = as.character(cluster))
@@ -1977,7 +2277,7 @@ if (file.exists(rna_h5ad_path) && file.exists(pseudotime_path)) {
     }
   }
   if (is.null(cluster_col)) {
-    stop("无法将 pseudotime cluster 与 h5ad obs 聚类列可靠对齐")
+    stop("Cannot reliably align pseudotime clusters with h5ad obs labels")
   }
 
   obs_cluster <- as.character(obs_df[[cluster_col]])
@@ -1993,7 +2293,7 @@ if (file.exists(rna_h5ad_path) && file.exists(pseudotime_path)) {
       cell_idx <- which(obs_cluster == cl)
       if (length(pt_idx) != length(cell_idx)) {
         stop(sprintf(
-          "cluster %s 的 pseudotime 行数 (%d) 与 h5ad 细胞数 (%d) 不一致",
+          "Cluster %s pseudotime rows (%d) differ from h5ad cells (%d)",
           cl, length(pt_idx), length(cell_idx)
         ))
       }
@@ -2001,6 +2301,17 @@ if (file.exists(rna_h5ad_path) && file.exists(pseudotime_path)) {
     }
   }
 
+  history_path <- file.path(RESULT_DIR, "perturbation_projection_bin_history.csv")
+  if (!file.exists(history_path)) history_path <- file.path(RESULT_DIR, "intermediate", "projection_history.csv")
+  if (file.exists(history_path)) {
+    # Saturating models export complete bin states, not allocated pathway RNA
+    # contributions. Use each bin's actual KO−WT response without accumulating
+    # shared pathway links or substituting endpoint log2FC for native states.
+    cluster_bin_effect <- vis_history_bin_effects(
+      read.csv(history_path, stringsAsFactors = FALSE), pseudotime_cells,
+      target_gene_names)
+    bin_join_keys <- c("cluster", "bin", if ("branch" %in% names(pseudotime_cells)) "branch")
+  } else {
   # Pathway records store the first bin in which each persistent downstream
   # effect fires. Reconstruct the cumulative downstream gene effect at every
   # later bin, then sum absolute net effects across genes.
@@ -2009,14 +2320,14 @@ if (file.exists(rna_h5ad_path) && file.exists(pseudotime_path)) {
   } else if ("delta_r_raw" %in% names(pathways)) {
     "delta_r_raw"
   } else {
-    stop("perturbation_pathways.csv 缺少 delta_r_raw(_sum) 列")
+    stop("perturbation_pathways.csv lacks delta_r_raw(_sum)")
   }
   pathway_bin_col <- if ("bin_min" %in% names(pathways)) {
     "bin_min"
   } else if ("bin" %in% names(pathways)) {
     "bin"
   } else {
-    stop("perturbation_pathways.csv 缺少 bin_min/bin 列")
+    stop("perturbation_pathways.csv lacks bin_min/bin")
   }
 
   cluster_bins <- pseudotime_cells %>%
@@ -2029,7 +2340,8 @@ if (file.exists(rna_h5ad_path) && file.exists(pseudotime_path)) {
       onset_bin = as.integer(.data[[pathway_bin_col]]),
       pathway_effect = as.numeric(.data[[pathway_effect_col]])
     ) %>%
-    filter(!affected_gene %in% target_gene_names, !is.na(onset_bin)) %>%
+    filter(!affected_gene %in% target_gene_names, !is.na(onset_bin),
+           is.finite(pathway_effect)) %>%
     group_by(cluster, affected_gene, onset_bin) %>%
     summarise(onset_effect = sum(pathway_effect, na.rm = TRUE),
               .groups = "drop")
@@ -2047,11 +2359,13 @@ if (file.exists(rna_h5ad_path) && file.exists(pseudotime_path)) {
     ) %>%
     right_join(cluster_bins, by = c("cluster", "bin")) %>%
     mutate(
-      downstream_abs_sum = coalesce(downstream_abs_sum, 0),
-      n_affected_genes = coalesce(n_affected_genes, 0L),
-      relative_effect = if (max(downstream_abs_sum) > 0) {
-        downstream_abs_sum / max(downstream_abs_sum)
-      } else 0
+      downstream_abs_sum = if_else(cluster %in% gene_onsets$cluster,
+        coalesce(downstream_abs_sum, 0), NA_real_),
+      n_affected_genes = if_else(cluster %in% gene_onsets$cluster,
+        coalesce(n_affected_genes, 0L), NA_integer_),
+      relative_effect = if (max(c(0, downstream_abs_sum), na.rm = TRUE) > 0) {
+        downstream_abs_sum / max(downstream_abs_sum, na.rm = TRUE)
+      } else if_else(is.finite(downstream_abs_sum), 0, NA_real_)
     ) %>%
     mutate(
       mean_abs_downstream_effect = if_else(
@@ -2059,17 +2373,23 @@ if (file.exists(rna_h5ad_path) && file.exists(pseudotime_path)) {
         downstream_abs_sum / n_affected_genes,
         0
       ),
-      mean_relative_effect = if (max(mean_abs_downstream_effect) > 0) {
-        mean_abs_downstream_effect / max(mean_abs_downstream_effect)
-      } else 0
+      mean_relative_effect = if (max(c(0, mean_abs_downstream_effect), na.rm = TRUE) > 0) {
+        mean_abs_downstream_effect / max(mean_abs_downstream_effect, na.rm = TRUE)
+      } else if_else(is.finite(mean_abs_downstream_effect), 0, NA_real_)
     )
+  bin_join_keys <- c("cluster", "bin")
+  }
 
   umap_effect <- umap_df %>%
     left_join(
-      pseudotime_cells %>% select(cell_barcode, cluster, bin),
+      pseudotime_cells %>% select(cell_barcode, all_of(bin_join_keys)),
       by = c("cell_barcode", "cluster")
     ) %>%
-    left_join(cluster_bin_effect, by = c("cluster", "bin"))
+    left_join(cluster_bin_effect, by = bin_join_keys)
+  cat(sprintf("Cluster-bin state alignment: %d/%d cells with finite colors; %d nonzero; %d unavailable\n",
+    sum(is.finite(umap_effect$relative_effect)), nrow(umap_effect),
+    sum(umap_effect$relative_effect > 0, na.rm = TRUE),
+    sum(!is.finite(umap_effect$relative_effect))))
 
   # Draw unmodeled cells first in gray, then modeled cells from weak to strong
   # so high-effect regions remain visible.
@@ -2197,10 +2517,9 @@ if (file.exists(rna_h5ad_path) && file.exists(pseudotime_path)) {
     nrow(modeled_umap), nrow(cluster_bin_effect)
   ))
 
-  rm(adata, umap_coords)
   gc()
 } else {
-  warning("缺少 rna_clustered.h5ad 或 intermediate/pseudotime.csv，无法生成 UMAP effect 图")
+  warning("Missing rna_clustered.h5ad or intermediate/pseudotime.csv; cannot plot UMAP effects")
 }
 
 # ==============================================================================
@@ -2211,7 +2530,7 @@ if (file.exists(rna_h5ad_path) && file.exists(pseudotime_path)) {
 projection_file <- file.path(RESULT_DIR, "perturbation_cell_projection.csv")
 if (!file.exists(projection_file)) {
   warning(sprintf(
-    "缺少 %s，跳过 projection overview 图",
+    "Missing %s; skip projection overview",
     projection_file
   ))
 } else {
@@ -2225,7 +2544,7 @@ if (!file.exists(projection_file)) {
 
   if (length(missing_projection_cols) > 0) {
     warning(sprintf(
-      "projection overview 缺少列 (%s)，跳过该图",
+      "Projection overview lacks columns (%s); skip",
       paste(missing_projection_cols, collapse = ", ")
     ))
   } else {
@@ -2235,7 +2554,7 @@ if (!file.exists(projection_file)) {
         projection_df$projection_status
       )
     } else {
-      warning("projection_status 列不存在；将仅按数值列和 source_context 过滤")
+      warning("No projection_status column; filter using numerical fields and source_context only")
       projection_df$projection_status <- "ok"
     }
     projection_df <- projection_df %>%
@@ -2263,10 +2582,10 @@ if (!file.exists(projection_file)) {
       )
 
     if (nrow(projection_df) == 0) {
-      warning("没有有效 projection rows，跳过 projection overview 图")
+      warning("No valid projection rows; skip projection overview")
     } else {
       if (!"cell_id" %in% names(projection_df)) {
-        warning("projection overview 缺少 cell_id，无法与 UMAP 坐标对齐；跳过该图")
+        warning("Projection overview lacks cell_id for UMAP alignment; skip")
       } else {
         # Reuse the embedding made by the existing UMAP section when present.
         # If that section was skipped, load only the coordinates needed here.
@@ -2279,35 +2598,22 @@ if (!file.exists(projection_file)) {
               UMAP_1 = as.numeric(UMAP_1),
               UMAP_2 = as.numeric(UMAP_2)
             )
-        } else if (HAS_ANNDATA) {
+        } else {
           rna_h5ad_path <- file.path(RESULT_DIR, "rna_clustered.h5ad")
           if (file.exists(rna_h5ad_path)) {
-            adata_projection <- anndata::read_h5ad(rna_h5ad_path)
-            umap_key_projection <- NULL
-            for (candidate in c("X_umap", "umap", "X_UMAP")) {
-              if (candidate %in% names(adata_projection$obsm)) {
-                umap_key_projection <- candidate
-                break
-              }
-            }
-            if (!is.null(umap_key_projection)) {
-              umap_coords_projection <- adata_projection$obsm[[
-                umap_key_projection
-              ]][, 1:2]
+            embedding <- vis_read_embedding(rna_h5ad_path)
               projection_umap <- data.frame(
-                cell_id = rownames(as.data.frame(adata_projection$obs)),
-                UMAP_1 = as.numeric(umap_coords_projection[, 1]),
-                UMAP_2 = as.numeric(umap_coords_projection[, 2]),
+                cell_id = embedding$cell_barcode,
+                UMAP_1 = embedding$UMAP_1,
+                UMAP_2 = embedding$UMAP_2,
                 stringsAsFactors = FALSE
               )
-            }
-            rm(adata_projection)
           }
         }
 
         if (is.null(projection_umap)) {
           warning(
-            "缺少可用 UMAP 坐标（需要 umap_df 或 rna_clustered.h5ad 中的 UMAP），跳过 projection overview 图"
+            "No usable UMAP coordinates in umap_df or rna_clustered.h5ad; skip projection overview"
           )
         } else {
           projection_umap <- projection_umap %>%
@@ -2326,7 +2632,7 @@ if (!file.exists(projection_file)) {
           ))
 
           if (nrow(projection_df) == 0) {
-            warning("没有 projection rows with matching UMAP coordinates，跳过该图")
+            warning("No projection rows with matching UMAP coordinates; skip")
           } else {
       context_labels <- projection_df %>%
         group_by(source_context) %>%
@@ -2541,7 +2847,8 @@ if (!file.exists(projection_file)) {
         ) +
         coord_equal() +
         labs(
-          title = "Perturbation Projection on UMAP",
+          title = paste0(if (length(target_gene_names) > 1) paste0(target_gene_name, " KO: ") else "",
+            "Perturbation Projection on UMAP"),
           subtitle = "Full embedding; colour shows projected pseudotime − source pseudotime",
           x = "UMAP 1",
           y = "UMAP 2"
@@ -2629,7 +2936,8 @@ if (!file.exists(projection_file)) {
           expand = c(0, 0)
         ) +
         labs(
-          title = "Perturbation Projection Ordered by Source Pseudotime",
+          title = paste0(if (length(target_gene_names) > 1) paste0(target_gene_name, " KO: ") else "",
+            "Perturbation Projection Ordered by Source Pseudotime"),
           subtitle = "Cells are arranged by source context; arrowheads mark increasing source pseudotime",
           x = "Source pseudotime",
           y = "Source context"
@@ -2663,5 +2971,9 @@ if (!file.exists(projection_file)) {
   }
 }
 
+# Generate the original R figures first: large Python checkpoints and history
+# must not delay the first R plot. The Python-only entry above retains its path.
+helper_status <- vis_run_new_visualizations()
 cat(sprintf("\nAll figures saved to: %s/\n", OUTPUT_DIR))
+if (exists("helper_status") && helper_status != 0L) stop("Requested model diagnostic plots failed; see model_diagnostics.log")
 }

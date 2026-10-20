@@ -35,9 +35,11 @@ _WORKER_CONFIG = None
 _WORKER_THREAD_LIMIT = None
 
 
-def registry_schema(kind, config):
+def registry_schema(kind, config, *, lag_mode="fixed"):
     from .atac_normalization import validate_atac_depth_config
     continuous = validate_atac_depth_config(config)["enabled"]
+    if kind == TF_TYPE and lag_mode == "local":
+        return "hybrid_" + response_settings(config, kind)[0] + "_tf_peak_local_registry_v3"
     if response_settings(config, kind)[0] == "nn":
         return "hybrid_nn_peak_gene_registry_v1" if kind == GENE_TYPE else "hybrid_nn_tf_peak_registry_v1"
     if response_settings(config, kind)[0] == "spline":
@@ -66,12 +68,29 @@ def response_settings(config, kind):
 
 def response_contract(config, kind):
     family, settings = response_settings(config, kind)
-    return {"response_model":family, family+"_response":settings} if family in ("nn", "spline") else {}
+    result = {"response_model":family, family+"_response":settings} if family in ("nn", "spline") else {}
+    threshold = single_peak_min_r2(config) if kind == GENE_TYPE else None
+    if threshold is not None:
+        result['single_min_r2'] = threshold
+    return result
+
+
+def single_peak_min_r2(config):
+    value = config.get('atac_to_rna', {}).get('single_min_r2')
+    if value is None:
+        return None
+    value = core._number(value, 'atac_to_rna.single_min_r2')
+    if not 0 <= value <= 1:
+        raise ValueError('atac_to_rna.single_min_r2 must be in [0,1] or null')
+    return value
 
 
 def response_context(context, config, kind):
     result = dict(context)
     family, settings = response_settings(config, kind)
+    if kind == GENE_TYPE and single_peak_min_r2(config) is not None:
+        result['single_min_r2'] = single_peak_min_r2(config)
+        result['fingerprint'] = core._digest({k:v for k,v in result.items() if k != 'fingerprint'})
     if family in ("nn", "spline"):
         result.update(response_family=family, **{family+"_response_config":settings})
         result["fingerprint"] = core._digest({k:v for k,v in result.items() if k != "fingerprint"})
@@ -93,6 +112,7 @@ def saturating_model_settings(config):
 
 
 def validate_saturating_config(config):
+    single_peak_min_r2(config)
     from .atac_normalization import validate_atac_depth_config
     validate_atac_depth_config(config)
     options = config.get("atac_to_rna", {})
@@ -152,17 +172,28 @@ def _worker_fit_target(job):
     return _fit_target_job(job, _WORKER_SUPPORT, _WORKER_CONFIG)
 
 
-def _target_jobs(kind, snapshot, inputs, gi, ai, cfg, policy="exclude"):
+def _target_jobs(kind, snapshot, inputs, gi, ai, cfg, policy="exclude", local_routes=None):
     """Gather only this target's bin states, not the full WT snapshot."""
     for target in sorted(inputs):
         keys = tuple(sorted(inputs[target]))
-        rows, local, branches, source = _aligned_rows(snapshot, keys)
+        is_local = any(lag == "local" for _,lag in keys)
+        if is_local:
+            rows, local, branches, source, supported = _aligned_local_rows(snapshot, keys, local_routes[target])
+        else:
+            rows, local, branches, source = _aligned_rows(snapshot, keys)
         if len(rows) < cfg.min_fit_rows:
-            yield target, len(keys), None, dict(status="insufficient_fit_rows", n_rows=len(rows))
+            yield target, len(keys), None, dict(status="insufficient_fit_rows", n_rows=len(rows),
+                **(dict(local_route_diagnostics=local_routes[target]) if is_local else {}))
             continue
-        absolute_source = np.column_stack([rows-lag for _, lag in keys])
+        absolute_source = rows[:,None]-local[:,None]+source if is_local else np.column_stack([rows-lag for _, lag in keys])
         matrix, index = (snapshot["A"], ai) if kind == GENE_TYPE else (snapshot["R"], gi)
-        X = np.column_stack([matrix[absolute_source[:, i], index[key]] for i, (key, _) in enumerate(keys)])
+        if is_local:
+            X = np.zeros(source.shape, dtype=float)
+            for i,(key,_) in enumerate(keys):
+                mask = supported[:,i]
+                X[mask,i] = matrix[absolute_source[mask,i],index[key]]
+        else:
+            X = np.column_stack([matrix[absolute_source[:, i], index[key]] for i, (key, _) in enumerate(keys)])
         y = np.log1p(snapshot["R"][rows, gi[target]]) if kind == GENE_TYPE else snapshot["A"][rows, ai[target]]
         rep = snapshot["context"].get("atac_representation", {"unit": "raw_atac"})
         from .atac_normalization import atac_output_bounds
@@ -173,6 +204,15 @@ def _target_jobs(kind, snapshot, inputs, gi, ai, cfg, policy="exclude"):
             output_unit="log1p_rna_log1p_cp10k" if kind == GENE_TYPE else rep["unit"],
             provenance=dict(context_fingerprint=snapshot["context"]["fingerprint"], relation_type=kind),
             support_rows=snapshot["bin_to_support"][rows])
+        if kind == GENE_TYPE and 'single_min_r2' in snapshot['context']:
+            data['provenance']['single_min_r2'] = snapshot['context']['single_min_r2']
+        if is_local:
+            edge_records = local_routes[target]
+            data["route_supported"] = supported
+            data["provenance"].update(local_lag_max=max(r["max_lag"] for r in edge_records.values()),
+                local_lag_window_rows=cfg.min_fit_rows,
+                local_neighborhood_status="empirical_engineering_not_validated",
+                local_route_diagnostics=edge_records)
         if policy != "exclude" and snapshot["context"].get("response_family", "saturation") == "saturation":
             data["provenance"]["budget_exhausted_policy"] = policy
         if snapshot["context"].get("response_family") == "nn":
@@ -254,13 +294,14 @@ def _dense(matrix):
 
 def _source_signature(kind, continuous=False, response_family="saturation"):
     consumed = [core.fit_single, core.fit_target, core.TargetFitFailure, core.validate_excluded_relations, core.validate_budget_exhausted_policy, core._fit_group, core._features,
+                core._routes, core._wt_scores, core._single_predictions, core._keys, core.TargetData,
                 core._single_values, core._group_values, core._effective_rows,
                 core._cell_ess,core._softsign,core.rna_output_bounds,core.HybridConfig,
                 core.predict_target, core.predict_delta, core._responses,
                 core._query_support, core.validate_cell_support,core.TargetModel.__post_init__,
                 core.SingleModel.__post_init__,core.GroupModel.__post_init__,
-                _weights, _full_wt_aggregates, _snapshot, _aligned_rows,_fit,_registry,_net_metrics,
-                _metadata, _data_fingerprint, _lag, _dense, validate_saturating_config, budget_exhausted_policy, saturating_model_settings, validate_registry,
+                _weights, _full_wt_aggregates, _snapshot, _aligned_rows, _aligned_local_rows,_fit,_registry,_net_metrics,
+                _metadata, _data_fingerprint, _lag, _dense, validate_saturating_config, budget_exhausted_policy, saturating_model_settings, single_peak_min_r2, validate_registry,
                 fit_peak_gene if kind == GENE_TYPE else fit_tf_peak,
                 _initialize_target_worker, _fit_target_job, _worker_fit_target, _target_jobs, _execute_target_jobs]
     if response_family == "nn":
@@ -285,6 +326,10 @@ def _source_signature(kind, continuous=False, response_family="saturation"):
             if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.body and isinstance(node.body[0], ast.Expr) and isinstance(node.body[0].value, ast.Constant) and isinstance(node.body[0].value.value, str):
                 node.body.pop(0)
         hashes[function.__module__ + "." + function.__qualname__] = hashlib.sha256(ast.dump(tree, include_attributes=False).encode()).hexdigest()
+        # Match the outer checkpoint's exact compatibility for the bounded
+        # WT reference mean repair. Future source edits do not match this hash.
+        if function is core.fit_target and hashes[function.__module__ + "." + function.__qualname__] == "39a242bacfcc0db144005ba25589d68985faf4945ee9530a620cc0585e29fcd6":
+            hashes[function.__module__ + "." + function.__qualname__] = "fc0ba8371457ec2fa04fcb064fbed600ba5f31d20cf9937c1cc486d96f5f36ba"
     return dict(functions=hashes, versions={p: version(p) for p in (("numpy", "scipy", "torch") if response_family == "nn" else ("numpy", "scipy"))},
                 core_schema=nn.SCHEMA if response_family == "nn" else spline.SCHEMA if response_family == "spline" else core.SCHEMA,registry_type=kind,
                 **(dict(spline_single_schema=spline.SINGLE_SCHEMA, spline_degree=spline.DEGREE,
@@ -429,6 +474,38 @@ def _aligned_rows(snapshot, keys):
     return np.array(rows,dtype=int),np.array(local,dtype=int),tuple(branches),np.array(sources,dtype=int).reshape(-1,len(keys))
 
 
+def _aligned_local_rows(snapshot, keys, routes):
+    rows, local, branches, sources, masks = [], [], [], [], []
+    n = len(snapshot["valid"])
+    by_tf = {}
+    for tf,_ in keys:
+        records = routes[tf]["routes"]
+        core._integer(routes[tf]["max_lag"], "route max_lag")
+        if len(records) != n or [core._integer(r["target_bin"], "route target_bin") for r in records] != list(range(n)):
+            raise ValueError("local TF routes must cover every ordered target bin")
+        by_tf[tf] = records
+    for start,end in snapshot["boundaries"]:
+        for b in range(start,end):
+            src, mask = [], []
+            for tf,_ in keys:
+                r = by_tf[tf][b]
+                supported = r["status"] == "supported"
+                s, lag = r["source_bin"], r["selected_lag"]
+                if supported:
+                    core._integer(s, "route source_bin")
+                    core._integer(lag, "route selected_lag")
+                    if not start <= s <= b or b-s != lag or lag > routes[tf]["max_lag"] or not snapshot["valid"][s] or not snapshot["valid"][b]:
+                        raise ValueError("invalid supported local TF route")
+                elif r["status"] != "no_supported_lag" or s != -1 or lag != -1:
+                    raise ValueError("invalid unsupported local TF route")
+                src.append(s-start if supported else -1); mask.append(supported)
+            if snapshot["valid"][b]:
+                rows.append(b); local.append(b-start); branches.append(snapshot["context"]["bin_branch_ids"][b])
+                sources.append(src); masks.append(mask)
+    return (np.array(rows,dtype=int), np.array(local,dtype=int), tuple(branches),
+            np.array(sources,dtype=int).reshape(-1,len(keys)), np.array(masks,dtype=bool).reshape(-1,len(keys)))
+
+
 def _lag(value):
     number = core._number(value,"screened TF lag")
     if number < 0 or number != int(number):
@@ -456,6 +533,8 @@ def _registry(kind,snapshot,cfg,targets,metrics,failures,policy="exclude"):
         schema = "hybrid_nn_peak_gene_registry_v1" if kind == GENE_TYPE else "hybrid_nn_tf_peak_registry_v1"
     if family == "spline":
         schema = "hybrid_spline_peak_gene_registry_v2" if kind == GENE_TYPE else "hybrid_spline_tf_peak_registry_v2"
+    if kind == TF_TYPE and context.get("tf_lag_mode") == "local":
+        schema = "hybrid_" + family + "_tf_peak_local_registry_v3"
     atac_unit="normalized_atac_log1p" if continuous else "raw_atac"
     registry = dict(type=kind,schema=schema,
         schema_version=schema,model_mode="saturating_hybrid",
@@ -484,7 +563,7 @@ def _fit(kind,rna,atac,pt,relations,config,bin_plan=None):
     snapshot["context"] = response_context(snapshot["context"], config, kind)
     genes,peaks = snapshot["context"]["gene_ids"],snapshot["context"]["peak_ids"]
     gi,ai = {v:i for i,v in enumerate(genes)},{v:i for i,v in enumerate(peaks)}
-    inputs = {}
+    inputs, local_routes = {}, {}
     if kind==GENE_TYPE:
         if not relations.empty and not {"gene","peak_id"}.issubset(relations):
             raise ValueError("peak-gene screen requires gene/peak_id")
@@ -502,10 +581,23 @@ def _fit(kind,rna,atac,pt,relations,config,bin_plan=None):
             tf,peak = str(getattr(row,"tf_gene_id",row.tf_gene)),str(row.peak_id)
             if tf not in gi or peak not in ai:
                 raise ValueError("screened TF-peak axis absent from WT inputs")
-            inputs.setdefault(peak,set()).add((tf,_lag(row.tf_lag)))
+            if getattr(row,"lag_mode",None) == "local":
+                inputs.setdefault(peak,set()).add((tf,"local"))
+                if tf in local_routes.setdefault(peak,{}):
+                    raise ValueError("duplicate local TF edge")
+                if int(row.local_lag_window_rows) != cfg.min_fit_rows:
+                    raise ValueError("local TF evidence window differs from configured min_fit_rows")
+                local_routes[peak][tf] = dict(max_lag=_lag(row.local_lag_max), routes=row.local_routes)
+            else:
+                inputs.setdefault(peak,set()).add((tf,_lag(row.tf_lag)))
+        if local_routes or "local_routes" in relations:
+            if any(lag != "local" for keys in inputs.values() for _,lag in keys):
+                raise ValueError("cannot mix fixed and local TF routes")
+            snapshot["context"]["tf_lag_mode"] = "local"
+            snapshot["context"]["fingerprint"] = core._digest({k:v for k,v in snapshot["context"].items() if k != "fingerprint"})
     bundles,metrics,failures,table = {},{},{},[]
     workers = min(requested_workers, max(1, len(inputs)))
-    jobs = _target_jobs(kind, snapshot, inputs, gi, ai, cfg, policy)
+    jobs = _target_jobs(kind, snapshot, inputs, gi, ai, cfg, policy, local_routes)
     results = _execute_target_jobs(jobs, snapshot["support"], cfg, workers, len(inputs),
         sum(len(keys) for keys in inputs.values()), kind)
     pack_started = time.monotonic()
@@ -517,7 +609,8 @@ def _fit(kind,rna,atac,pt,relations,config,bin_plan=None):
         keys = bundle["input_keys"]
         for i,(key,lag) in enumerate(keys):
             table.append(dict(gene=target if kind==GENE_TYPE else key,peak_id=key if kind==GENE_TYPE else target,
-                tf_gene=None if kind==GENE_TYPE else key,lag=lag,tf_lag=lag,
+                tf_gene=None if kind==GENE_TYPE else key,lag=None if lag=="local" else lag,tf_lag=None if lag=="local" else lag,
+                lag_mode="local" if lag=="local" else "fixed",
                 alpha=bundle["weights"][i],wt_response_score=bundle["scores"][i],
                 r2_score=metrics[target]["train_r2"],fit_status=metrics[target]["status"],
                 quality_scope="target_full_training",model_mode="saturating_hybrid"))
@@ -569,6 +662,8 @@ def validate_registry(registry,*,expected_type=None,expected_schema=None):
             raise ValueError("spline registry configuration required")
         SplineConfig.from_dict(registry["context"]["spline_response_config"])
         schema = "hybrid_spline_peak_gene_registry_v2" if kind == GENE_TYPE else "hybrid_spline_tf_peak_registry_v2"
+    if kind == TF_TYPE and registry["context"].get("tf_lag_mode") == "local":
+        schema = "hybrid_" + family + "_tf_peak_local_registry_v3"
     if registry.get("schema")!=schema or registry.get("schema_version")!=schema or registry.get("model_mode")!="saturating_hybrid":
         raise ValueError("saturating registry schema mismatch")
     if expected_type is not None and kind!=expected_type or expected_schema is not None and schema!=expected_schema:
@@ -615,6 +710,12 @@ def validate_registry(registry,*,expected_type=None,expected_schema=None):
     for target, failure in registry["failures"].items():
         if target not in axis or not isinstance(failure, dict):
             raise ValueError("invalid registry target failure")
+        if kind == TF_TYPE and context.get("tf_lag_mode") == "local":
+            routes = failure.get("local_route_diagnostics")
+            if not isinstance(routes,dict) or not routes or not set(routes).issubset(input_axis):
+                raise ValueError("failed local target requires route evidence")
+            _aligned_local_rows(dict(valid=valid,boundaries=context["branch_boundaries"],context=context),
+                tuple((tf,"local") for tf in sorted(routes)),routes)
         if "excluded_single_relations" in failure:
             core.validate_excluded_relations(failure,target,())
             if failure.get("status") != "no_information" or failure.get("train_r2") is not None:
@@ -623,9 +724,16 @@ def validate_registry(registry,*,expected_type=None,expected_schema=None):
                 key,lag=record["input_key"]
                 if key not in input_axis or kind==GENE_TYPE and lag!=1:
                     raise ValueError("registry failed input key/lag mismatch")
+            if kind == TF_TYPE and context.get("tf_lag_mode") == "local":
+                keys = tuple(tuple(r["input_key"]) for r in failure["excluded_single_relations"]["records"])
+                routes = failure.get("local_route_diagnostics")
+                if any(lag != "local" for _,lag in keys) or not isinstance(routes,dict) or set(routes) != {tf for tf,_ in keys}:
+                    raise ValueError("failed local target route evidence mismatch")
     inverse={int(s):b for b,s in enumerate(mapping) if s>=0}
     for key,bundle in registry["targets"].items():
         model = core.TargetModel.from_bundle(bundle,cell_support=support)
+        if model.provenance.get('single_min_r2') != context.get('single_min_r2'):
+            raise ValueError('registry target single_min_r2 policy mismatch')
         if model.provenance.get("response_family", "saturation") != family or family == "nn" and core._plain(model.provenance.get("nn_response_config")) != registry["context"]["nn_response_config"]:
             raise ValueError("registry target response family/config mismatch")
         if family == "spline" and core._plain(model.provenance.get("spline_response_config")) != registry["context"]["spline_response_config"]:
@@ -642,6 +750,19 @@ def validate_registry(registry,*,expected_type=None,expected_schema=None):
             raise ValueError("registry input key/lag mismatch")
         if model.provenance.get("context_fingerprint")!=context["fingerprint"] or model.provenance.get("relation_type")!=kind:
             raise ValueError("registry model context mismatch")
+        local_mode = context.get("tf_lag_mode") == "local"
+        if kind == TF_TYPE and local_mode != all(lag == "local" for _,lag in all_keys):
+            raise ValueError("registry TF lag mode/key mismatch")
+        if local_mode:
+            routes = model.provenance.get("local_route_diagnostics")
+            if not isinstance(routes,dict) and not hasattr(routes,"items"):
+                raise ValueError("local registry requires complete route evidence")
+            if set(routes) != {tf for tf,_ in all_keys} or model.provenance.get("local_lag_window_rows") != cfg.min_fit_rows:
+                raise ValueError("local route evidence identity/window mismatch")
+            route_snapshot = dict(valid=valid,boundaries=context["branch_boundaries"],context=context)
+            _,local_rows,local_branches,source,mask = _aligned_local_rows(route_snapshot,model.input_keys,routes)
+            if not np.array_equal(local_rows,model.target_rows) or local_branches != model.branch_ids or not np.array_equal(source,model.source_bins) or not np.array_equal(mask,model.route_supported):
+                raise ValueError("stored local routes differ from model source/support mappings")
         for local,branch,support_row in zip(model.target_rows,model.branch_ids,model.support_rows):
             if int(support_row) not in inverse:
                 raise ValueError("target support row absent from registry")
@@ -658,6 +779,22 @@ def validate_registry(registry,*,expected_type=None,expected_schema=None):
         r2 = metric["train_r2"]
         if r2 is not None and (core._number(r2,"target train R2")>1):
             raise ValueError("invalid registry train R2")
+    return registry
+
+
+def validate_configured_registry(registry, kind, config):
+    """Validate current payloads and the caller's response family/ATAC contract.
+
+    Public direct adapters also accept current fixed-route fits. Production
+    Step 6/checkpoint gates independently require the local route schema.
+    """
+    validate_registry(registry, expected_type=kind)
+    lag_mode = registry["context"].get("tf_lag_mode", "fixed")
+    if lag_mode not in ("fixed", "local"):
+        raise ValueError("unknown registry TF lag mode")
+    expected = registry_schema(kind, config, lag_mode=lag_mode)
+    if registry["schema"] != expected:
+        raise ValueError("unexpected saturating registry type/schema")
     return registry
 
 

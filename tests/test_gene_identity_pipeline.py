@@ -233,6 +233,7 @@ def test_output_names_ids_multi_targets_and_no_name_grouping(tmp_path):
         saturating_support_diagnostics=pd.DataFrame({"gene": ["E1", "E2"], "target_gene": ["E3,E1", "PEAK:p"]}),
         cluster_results=[{"perturbation_results": frame.copy()}])
     before = frame.copy(deep=True)
+    cfg["output"]["export_details"] = True
     io.save_results(results, cfg, gene_identity=identity)
     out = tmp_path / "results"
     saved = pd.read_csv(out / "perturbation_results.csv")
@@ -240,7 +241,8 @@ def test_output_names_ids_multi_targets_and_no_name_grouping(tmp_path):
     assert set(saved.affected_gene_id) == {"E1", "E2"}
     assert list(saved.affected_gene_name) == ["A", "A"]
     assert len(pd.read_csv(out / "perturbation_merged.csv")) == 2
-    assert len(pd.read_csv(out / "intermediate" / "causal_edges.csv")) == 2
+    assert len(pd.read_csv(out / "causal_peak_gene_edges.csv")) == 2
+    assert not (out / "intermediate" / "causal_edges.csv").exists()
     diagnostics = pd.read_csv(out / "saturating_support_diagnostics.csv")
     assert diagnostics.target_gene.iloc[0] == "RUNX1,A_01"
     assert json.loads(diagnostics.target_gene_ids_json.iloc[0]) == ["E3", "E1"]
@@ -307,10 +309,13 @@ def execute_identity_subset(f):
     n = rna.n_obs
     pt = pd.DataFrame({"pseudotime": np.linspace(0., 1., n), "bin": np.repeat(np.arange(50), n // 50)}, index=rna.obs_names)
     edges = pd.DataFrame({"gene": ["E1", "E2"], "peak_id": ["p", "q"], "is_causal": [True, True]})
-    weights = pd.DataFrame({"tf_gene": ["E3", "E3"], "peak_id": ["p", "q"], "weight": [.1, .1], "tf_lag": [0, 0]})
     def tf_fit(*args, **kwargs):
         assert kwargs["gene_identity"] is identity
         assert kwargs["target_gene_types"] == {"E3": "TF"}
+        snapshot = saturating_transfer._snapshot(args[0],args[1],args[2],args[4])
+        weights = pd.DataFrame(kinetics._fit_tf_peak_regression(
+            {"p":["E3"],"q":["E3"]},args[0],args[1],snapshot["R"],snapshot["A"],
+            max_lag=0,branch_boundaries=snapshot["boundaries"]))
         registry=saturating_transfer.fit_tf_peak(args[0],args[1],args[2],weights,args[4])
         kwargs['tf_model_registry'].update(registry)
         return weights.copy()

@@ -7,7 +7,7 @@ import pytest
 
 from CausalBridge import kinetics as k
 from CausalBridge.io import load_config
-from test_shared_motif_cache import fixture, scan, cache_path
+from test_shared_motif_cache import fixture, scan, cache_path, raw_records
 
 
 def motifs():
@@ -76,17 +76,17 @@ def test_cache_identity_warm_pool_skipped_parent_writer(tmp_path, monkeypatch):
     assert path.read_bytes() == before
     monkeypatch.setattr(k, "ProcessPoolExecutor", original_pool)
     parent = os.getpid()
-    merge = k._merge_raw_motif_cache
+    from CausalBridge._raw_motif_sqlite import Store
+    update = Store.update
     writes = []
-    def guarded_merge(*args):
+    def guarded_update(self, *args):
         assert os.getpid() == parent
         writes.append(parent)
-        return merge(*args)
-    monkeypatch.setattr(k, "_merge_raw_motif_cache", guarded_merge)
+        return update(self, *args)
+    monkeypatch.setattr(Store, "update", guarded_update)
     scan(f, ["A", "B", "ZERO"])
     assert writes == [parent]
-    with path.open("rb") as handle:
-        assert len(pickle.load(handle)["records"]) == 3
+    assert len(raw_records(f)) == 3
 
 
 def test_worker_exception_leaves_cache_intact(tmp_path, monkeypatch):

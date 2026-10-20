@@ -12,6 +12,117 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_r_identity_dedup_keeps_last_valid_label(tmp_path):
+    rscript = shutil.which('Rscript')
+    if not rscript:
+        pytest.skip('Rscript unavailable')
+    code = '''
+source("visualize_perturbation.R")
+d <- data.frame(gene=c("old","old","old",NA,"other"),
+  gene_id=c("G1","G1","G1",NA,"G2"),
+  gene_name=c("first","last",NA,"missing","second"))
+result <- vis_identity(d, "gene")
+stopifnot(identical(result$gene, c("G1","G1","G1",NA,"G2")),
+  identical(result$gene_label, d$gene_name),
+  identical(vis_label(c("G1","G2")), c("last","second")))
+empty <- vis_identity(d[FALSE,], "gene")
+stopifnot(nrow(empty)==0, identical(vis_label("G1"), "last"))
+'''
+    env = dict(os.environ, CAUSALBRIDGE_VIS_ADAPTERS_ONLY='1')
+    subprocess.run([rscript, '-e', code], cwd=ROOT, env=env, check=True,
+                   capture_output=True, text=True)
+
+
+def test_r_heatmap_ranking_rewards_signed_sum_balance(tmp_path):
+    rscript = shutil.which("Rscript")
+    if not rscript:
+        pytest.skip("Rscript unavailable")
+    script = tmp_path / "heatmap_ranking.R"
+    script.write_text(r'''
+source("visualize_perturbation.R")
+x <- data.frame(affected_gene=rep(c("balanced", "shifted", "zero", "tiny", "sparse"), each=2),
+  cluster=rep(c("0", "1"), 5),
+  delta_rna=c(-1, 1, -.5, 1.5, 0, 0, -1e-6, 1e-6, -1, 1))
+x <- x[!(x$affected_gene == "sparse" & x$cluster == "1"), ]
+r <- as.data.frame(vis_heatmap_gene_ranking(x))
+rownames(r) <- r$affected_gene
+stopifnot(r["balanced", "effect_sum"] == 0, r["shifted", "effect_sum"] == 1,
+  r["balanced", "balance_score"] == 1, r["shifted", "balance_score"] == .5,
+  r["balanced", "effect_range"] == r["shifted", "effect_range"],
+  isTRUE(all.equal(r["balanced", "effect_sd"], r["shifted", "effect_sd"])),
+  r["balanced", "heterogeneity_score"] > r["shifted", "heterogeneity_score"],
+  r["zero", "heterogeneity_score"] == 0,
+  r["tiny", "heterogeneity_score"] < r["shifted", "heterogeneity_score"],
+  r["sparse", "coverage"] == .5, r["sparse", "n_observed"] == 1,
+  r["sparse", "effect_sum"] == -1,
+  all(is.finite(r$heterogeneity_score)))
+base <- r$coverage * (r$effect_range + r$effect_sd) * ifelse(r$direction_switch, 1.25, 1)
+stopifnot(isTRUE(all.equal(r$heterogeneity_score, base * (1 + r$balance_score))),
+  all(r$heterogeneity_score <= 2 * base),
+  identical(x$delta_rna, c(-1, 1, -.5, 1.5, 0, 0, -1e-6, 1e-6, -1)))
+''')
+    result = subprocess.run([rscript, str(script)], cwd=ROOT, text=True,
+        capture_output=True, env={**os.environ, "CAUSALBRIDGE_VIS_ADAPTERS_ONLY": "1"},
+        timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_r_plot_signed_scales_distribution_and_bin_states(tmp_path):
+    """Exercise actual R color mapping and state identity, including missing bins."""
+    rscript = shutil.which("Rscript")
+    if not rscript:
+        pytest.skip("Rscript unavailable")
+    script = tmp_path / "plot_contracts.R"
+    script.write_text(r'''
+source("visualize_perturbation.R")
+suppressPackageStartupMessages(library(dplyr))
+stopifnot(identical(vis_distribution_change(c(-.10001, -.1, 0, .1, .10001, NA, Inf)),
+  c("Down", "Stable", "Stable", "Stable", "Up", NA_character_, NA_character_)))
+spec <- vis_heatmap_spec(c(-.2, .8, NA, Inf), "#2166AC", "#B2182B")
+stopifnot(isTRUE(all.equal(spec$limits, c(-.2, .8))))
+scale <- ggplot2::scale_fill_gradientn(colors=spec$colors, values=spec$values,
+  limits=spec$limits, breaks=spec$breaks)
+mapped <- toupper(scale$map(c(-.2, -.1, 0, .4, .8)))
+stopifnot(mapped[1] == "#2166AC", mapped[3] == "#FFFFFF", mapped[5] == "#B2182B")
+stopifnot(identical(mapped[c(2,4)], toupper(scales::gradient_n_pal(
+  c("#2166AC", "white", "#B2182B"))(c(.25,.75)))))
+rounded <- vis_heatmap_spec(c(-.371, .821), "blue", "red")
+stopifnot(rounded$limits[1] <= -.371, rounded$limits[2] >= .821,
+  isTRUE(all.equal(rounded$limits, c(-.38, .83))))
+for (x in list(c(0,0,NA), c(.03,.2), c(-.3,-.1), c(NA,Inf))) {
+  s <- vis_heatmap_spec(x, "blue", "red")
+  stopifnot(all(is.finite(s$values)), !anyDuplicated(s$values),
+    !anyDuplicated(s$breaks), all(x[is.finite(x)] >= s$limits[1]),
+    all(x[is.finite(x)] <= s$limits[2]))
+}
+stopifnot(identical(vis_cluster_ids(c("cluster_0", "PAGA_A", "my_cluster_0"),
+  c("0", "PAGA_A")), c("0", "PAGA_A", "my_cluster_0")))
+h <- data.frame(source_context="cluster_0", branch=0, bin=0,
+  gene=c("display", "same", "target"), gene_id=c("G1", "G2", "T"),
+  control_state=c(1,2,9), state_value=c(1.2,1.6,0),
+  state_unit="rna_log1p_cp10k", native_effect_unit="delta_log1p_rna_log1p_cp10k")
+cells <- data.frame(cluster="0", bin=0:1)
+b <- vis_history_bin_effects(h, cells, "T")
+stopifnot(isTRUE(all.equal(b$downstream_abs_sum[1], .6)),
+  b$n_affected_genes[1] == 2, b$relative_effect[1] == 1,
+  is.na(b$relative_effect[2]), is.na(b$mean_relative_effect[2]))
+h$state_value[1:2] <- NA
+stopifnot(is.na(vis_history_bin_effects(h, cells, "T")$relative_effect[1]))
+h$state_value[1:2] <- h$control_state[1:2]
+stopifnot(vis_history_bin_effects(h, cells, "T")$relative_effect[1] == 0)
+h2 <- rbind(h, transform(h, branch=1))
+stopifnot(inherits(try(vis_history_bin_effects(h2, cells, "T"), silent=TRUE), "try-error"))
+branched <- vis_history_bin_effects(h2, transform(cells, branch=0), "T")
+stopifnot(nrow(branched) == 2, branched$relative_effect[1] == 0)
+''')
+    result = subprocess.run([rscript, str(script)], cwd=ROOT, text=True,
+        capture_output=True, env={**os.environ, "CAUSALBRIDGE_VIS_ADAPTERS_ONLY": "1"},
+        timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 spec = importlib.util.spec_from_file_location("visualization_network", ROOT / "plot_causal_network.py")
 assert spec is not None and spec.loader is not None
 vis = importlib.util.module_from_spec(spec)
@@ -117,8 +228,9 @@ def test_stable_ids_keep_duplicate_symbols_and_combined_network(tmp_path):
     assert graph.nodes["G1"]["label"] == "DUP"
     subgraph, _ = vis.extract_subgraph(graph, ("T1", "T2"), {"G1", "G2"}, set(),
         vis.identity_frame(tf, ("tf_gene",)), vis.identity_frame(edges, ("gene",)))
-    assert subgraph.has_edge(("T1", "T2"), "p1")
-    assert subgraph.has_edge(("T1", "T2"), "p2")
+    assert subgraph.has_edge("T1", "p1") and subgraph.has_edge("T2", "p2")
+    assert ("T1", "T2") not in subgraph
+    assert not subgraph.has_edge("T1", "p2") and not subgraph.has_edge("T2", "p1")
 
 
 def test_agg_plot_smoke_legacy_multiple_targets_and_nonnumeric_clusters(tmp_path, monkeypatch):
@@ -166,7 +278,8 @@ def test_agg_merged_combined_ids_status_and_output_dir(tmp_path, monkeypatch, me
         assert delta == {"G1": -10., "G2": 2.}
         assert "G3" not in graph
         assert graph.nodes["G1"]["label"] == graph.nodes["G2"]["label"] == "DUP"
-        assert graph.nodes[target]["label"] == 'A_B,+ + Q"\\Z'
+        assert graph.nodes["T1"]["label"] == 'A_B,+'
+        assert graph.nodes["T2"]["label"] == 'Q"\\Z'
         assert "partial" in graph.graph["effect_note"]
         assert "0.6" in graph.graph["effect_note"]
     assert (output / "causal_network_top5.png").is_file()

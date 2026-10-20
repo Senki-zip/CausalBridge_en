@@ -1,6 +1,6 @@
-# CausalBridge v2.0
+# CausalBridge v2.1.0
 
-**An ATAC-bridged framework for single-cell perturbation prediction.** CausalBridge uses WT scRNA-seq + scATAC-seq to connect TF→peak→gene through chromatin accessibility and predict RNA and ATAC changes after gene or peak interventions along pseudotime, without perturbation training data. The Python package version is `2.0.0`.
+**An ATAC-bridged framework for single-cell perturbation prediction.** CausalBridge uses WT scRNA-seq and scATAC-seq to connect TF→peak→gene through chromatin accessibility and predict RNA and ATAC changes along pseudotime without perturbation training data. The Python package version is `2.1.0`.
 
 This guide covers the model, input preparation, execution, interpretation, and configuration. See [config.yaml](config.yaml) for the complete configuration. Outputs are conditional predictions: motifs, pseudotime lags, and Granger screening provide directional evidence but cannot independently establish intervention causality. See [FIGUERS_README.md](FIGUERS_README.md) for figure fields and interpretation.
 
@@ -15,6 +15,7 @@ Contents:
 7. [Perturbation engine and examples](#perturbation)
 8. [Units, cell endpoints, and cross-cluster aggregation](#endpoints)
 9. [Outputs, caching, and recovery](#outputs)
+   - [Sequential batch runs](#batch-running)
 10. [Visualization and pathways](#visualization)
 11. [Configuration reference](#configuration)
 12. [Limitations and interpretation](#validation)
@@ -125,6 +126,7 @@ output:
   dir: results/my_run
   cache_dir: cache/my_run
   checkpoint_dir: null
+  export_details: false
   save_intermediate: true
 ```
 
@@ -138,16 +140,16 @@ The Python entry point remains available:
 from CausalBridge import __version__
 from CausalBridge.run import run_pipeline
 
-print(__version__)  # 2.0.0
+print(__version__)  # 2.1.0
 results = run_pipeline("config.local.yaml")
 ```
 
 <a id="data"></a>
 ## 3. Data, gene identity, and reference views
 
-`gtf_gene_id` first audits every input gene, matching `rna_gene_id_column` to GTF gene records and stripping only a trailing numeric ID version. Duplicate IDs after normalization raise an error; counts are not merged automatically. Unmatched features are removed from model eligibility without modifying the original H5AD. Model normalization denominators and raw-count HVG ranking use all GTF-eligible genes before HVG / required-target retention. Retaining extra targets or root markers does not set their `highly_variable` flag to true or bypass expression QC.
+`gtf_gene_id` audits all input genes, matches `rna_gene_id_column` to GTF gene records and strips only trailing numeric ID versions. Duplicate normalized IDs raise an error rather than merging counts. Unmatched features are excluded from model eligibility without modifying the original H5AD. The model starts from GTF-eligible genes before HVG and required-target selection. Required targets and root markers with nonzero counts are rescued even below the expression-QC detection threshold. Rescued genes do not enter HVG ranking or acquire a true `highly_variable` flag. Normalization denominators and HVG selection for other genes still use expression-QC-passing genes; reference clustering does not enable this exception.
 
-Internal calculations, edge keys, cross-cluster merging, and projection feature axes use stable IDs. `gene_name` is the biological symbol; `gene_display_name` is the display label. Different IDs with the same name receive fixed aliases such as `A_01`, `A_02`, ordered by stable ID in the full reference; HVG selection or subsetting does not renumber them. Motif matching still uses native symbols and expands to allowed IDs. Targets and explicit root markers accept stable IDs, versioned IDs, unique symbols, or numbered aliases. Ambiguous symbols must be resolved explicitly; failed required genes or genes removed by QC raise clear errors.
+Internal computation, edge keys, cross-cluster merging and projection feature axes use stable IDs. `gene_name` is the biological symbol and `gene_display_name` the display label. Duplicate symbols receive fixed aliases such as `A_01` and `A_02`, ordered by stable ID in the full reference; HVG selection and subsetting never renumber them. Motifs use native symbols expanded to allowed IDs. Targets and explicit root markers accept stable IDs, versioned IDs, unique symbols or numbered aliases; ambiguous symbols require explicit disambiguation. Unresolved or all-zero required genes raise errors. Rescuing a low-detection target does not establish enough evidence for edges or fitting. The rescue implementation alone does not invalidate checkpoints: identical model matrices, gene/cell axes, configuration and upstream results can pass normal recovery checks. Actually adding a target changes the input and requires recomputation.
 
 The complete GTF gene span is authoritative. Coordinates convert from 1-based closed intervals to 0-based half-open intervals, with original input coordinates stored in `original_*`. Strand-aware TSS uses the start on the positive strand and end minus one on the negative strand for distance screening. Legacy input is limited by its coordinate / strand information; see the limitations.
 
@@ -300,24 +302,49 @@ Parsing retains `all_factors`, allowing cofactors such as LMO2 to associate with
 
 `max_tfs_per_peak` limits the main candidate list; family supplementation is independent, so this is not a hard limit on the final total from all sources. `tf_expression_filter` verifies that the TF exists on the RNA axis. TFs with median-zero or declining expression can still be candidates. Missing motifs can trigger a candidate fallback; preserve its provenance rather than treating it as scan evidence.
 
-### Pearson tests per TF and lag
+### Local TF lag at each target bin
 
-Each TF independently supplies one X column and is tested against the peak at each lag. Independent correlations do not control for other TFs. For fixed maximum lag L:
+Each motif-candidate TF→peak edge independently selects a lag at **every target bin** of each branch, without global Pearson prescreening. Motif, cofactor and family candidate generation follow the rules above. `max_lag` limits lookback only; branch starts are retained. Checking a bin does not force an edge to exist there. Independent Pearson tests do not control confounding by other TFs.
 
 ```text
-Y   = Peak[L:n_bins]
-X_k = TF[L-k:n_bins-k]
-for k in 0..L:
-    r, p = pearsonr(X_k, Y)
-    weight = r*sd(Y)/sd(X_k)
-    Select the first significant lag under the per-lag rule, then filter contribution
+for target b in all bins of each branch:
+    for k in 0..min(max_lag, b-branch_start):
+        times = WT rows with valid target=t and source=t-k in the same branch
+        times = up to min_fit_rows rows nearest b, preferring earlier rows on ties
+        require at least 3 rows; compute Pearson(TF[t-k], Peak[t]) in time order
+        accept the first k with p<=tf_peak_pvalue_threshold and abs(weight)*std(X)>=min_abs_contribution
+    if none passes: record no_supported_lag and source_bin=-1; do not force lag=0
 ```
 
-All lags for a pair share Y and the row count. `min_abs_contribution` prunes weak edges using abs(weight)*std(X); constant / invalid correlations are not treated as ordinary informative edges.
+The evidence window reuses `atac_to_rna.saturating_hybrid.min_fit_rows`, currently12. This engineering neighborhood has not been validated as a biological timescale. Nearby WT evidence may include later rows, but perturbation execution only reads the selected `source_bin=b-k<=b`, never future KO values. Constant or invalid correlations remain unsupported. Default thresholds are p≤0.05 and contribution≥0.01.
 
 `time_lag: false` forces lag=0. `max_lag: auto` derives the maximum from the bin count; zero / negative values also use the automatic route. To fit only contemporaneous relationships, set `time_lag: false`.
 
 Pearson weights record screening direction and magnitude. Perturbation changes come from the bounded response functions in the next section.
+
+Each TF contributes one `(TF, "local")` input to a peak model. `source_bins`, `selected_lag` and `route_supported` store per-bin routes. **One response function is fitted per relationship**, pooling `(TF[source_bin], Peak[target_bin])` across all supported rows, rather than fitting a curve per bin. Local tests require at least3 rows; single-response fitting additionally requires at least `min_fit_rows` supported rows in total, currently12. Insufficient totals exclude the relationship as `insufficient_supported_rows`; no support gives `no_supported_lag`. This does not discard the first12 bins: early bins are tested and can provide training rows.
+
+Section6.6 defines local scoring for frozen WT alpha. Unsupported inputs do not enter fitting or response queries. Their absolute-prediction placeholder is the mean single-response prediction over supported WT training rows; their perturbation contribution is0, without alpha renormalization. Groups are fitted, compared and checked only on jointly supported rows, and queries require support for all members. Excluded relationships retain audit records without executable propagation contributions.
+
+This is a **hypothetical example, not a routing result from D6 or another dataset**. Assume one branch starting at bin0, at least32 valid bins, `max_lag=12`, a12-row neighborhood and finite inputs:
+
+| Target bin | Ordered tests and WT evidence | Execution |
+|---|---|---|
+| 0 | Only `k=0`; nearest WT evidence rows `0..11` | Use `TF[0]→Peak[0]` if thresholds pass; otherwise unsupported |
+| 3 | Try `k=0,1,2,3`; assume0 and1 fail and2 passes | Select `TF[1]→Peak[3]` and stop before3 |
+| 20 | Try `k=0..12`; assume0 through4 fail and5 passes | Select `TF[15]→Peak[20]` and stop |
+
+Bin0 may have contemporaneous support or no edge; `max_lag=12` does not require waiting12 bins. WT neighborhoods may use later WT observations, while KO execution reads only the selected present or past source bin, without negative indices or crossing branches. Relationship-wide supported-row and response-quality checks must also pass before execution.
+
+A real-data local-screening check used D6 cluster0, `ENSMUSG00000061524 → chr1:120626995-120627927`. At bin0, lag0 gave r=-0.491044 and p=0.104996, so it was unsupported; bin1 was also unsupported. At bins2–8 the first passing candidate was lag2 (r=0.717280, p=0.008643, contribution=0.040578). Of50 bins,34 had local support and16 did not. Early bins were tested; negative early correlations need not pass, and adjacent windows need not agree in sign. Screening alone does not validate a fitted response or complete KO endpoint.
+
+An isolated single-input spline was subsequently fitted to the real WT observations:50 target bins,34 supported rows and supported-row training R²=0.597. With single-input alpha=1, all34 supported-bin KO increments were negative and all16 unsupported increments exactly0. For example, target bin2 read TF bin0, with peak WT=0.236424 and KO=0.073801. Zero-strength KO preserved WT and JSON save/load preserved predictions. The upper bound recomputed from all target rows was0.295389; the old truncated-window bound cannot be reused. This check excluded competing TFs, complete peak weights and the downstream network. Training fit is not generalization accuracy, and local Pearson signs need not be preserved by the pooled response curve.
+
+`min_lag_per_peak_filter` compares actual lags among supported TFs at each bin. `tf_peak_weights.csv` summarizes `lag_mode=local` and lag ranges, leaving scalar `tf_lag` empty. `output.export_details: true` adds per-bin `tf_peak_lag_routes.csv`. Contributions, support and pathway events use actual source bins and lags. TF registries use `*_tf_peak_local_registry_v3`; old fixed-route caches require refitting, with a separate output directory recommended.
+
+In local-screening records, `n_lag_attempts` counts lags actually attempted and `n_stat_tests` counts correlation tests actually executed. For supported routes, `n_evidence_rows` is the selected lag's valid neighborhood size; for unsupported routes, it is the largest valid neighborhood across attempted lags. Unsupported correlation statistics remain empty. Failed tests are not represented as zero evidence, and a failed candidate's statistics are not reported as a selected route.
+
+This shared fitting-core signature change affects both Step5 and Step6. Reusing old peak→gene checkpoints or rerunning only Step6 is not guaranteed. Cache files remain untouched; runtime signature validation determines compatibility. Existing figures and results are not automatically updated.
 
 <a id="responses"></a>
 ## 6. Response functions and supported groups
@@ -326,7 +353,7 @@ Pearson weights record screening direction and magnitude. Perturbation changes c
 
 ### 6.1 Notation, units, and output bounds
 
-For one target, let jointly aligned WT data be $(X,y)$ with $n$ rows, where $x_{ij}$ is input $j$ in row $i$. Loss gives these WT bin rows equal weight rather than weighting by cell ESS; ESS is used for group-support checks. TF→peak uses RNA L1 as $x$ and model ATAC as $y$; peak→gene uses model ATAC as $x$ and RNA L2 as $y$. Section 8 defines normalization and endpoint units. All $f,F,\Delta y$ below are in the corresponding layer's **$y$ model units**.
+For one target, let aligned WT data be $(X,y)$ and $x_{ij}$ input j in row i. In the losses below, $n$ is the actual number of fitting rows: supported rows for a local TF→peak single, jointly supported rows for a group, and commonly aligned rows for fixed peak→gene. WT bin rows receive equal loss weights; cell ESS is used for group support checks, not loss weighting. TF→peak uses RNA L1 inputs and model ATAC targets; peak→gene uses model ATAC inputs and RNA L2 targets. See section8 for normalization and endpoint units. Below, $f,F,\Delta y$ use the corresponding layer's **target-model units**.
 
 Let $D=U-L$, $\sigma(t)=(1+e^{-t})^{-1}$, and $h(t)=t/(1+|t|)$. All three families share the same output bounds for a target. The current [bound implementation](CausalBridge/atac_normalization.py) uses:
 
@@ -334,8 +361,8 @@ Let $D=U-L$, $\sigma(t)=(1+e^{-t})^{-1}$, and $h(t)=t/(1+|t|)$. All three famili
 L=0,\qquad
 U=\begin{cases}
 \max_i y_i+\lambda_{\rm RNA}(\max_i y_i-\min_i y_i), & \text{RNA L2},\\
-\min\{\log(1+S),\ \max_i y_i+\lambda_{\rm ATAC}(\max_i y_i-\min_i y_i)\}, & \text{连续 ATAC},\\
-1, & \text{二值 ATAC 比例视图}.
+\min\{\log(1+S),\ \max_i y_i+\lambda_{\rm ATAC}(\max_i y_i-\min_i y_i)\}, & \text{continuous ATAC},\\
+1, & \text{binary ATAC proportion view}.
 \end{cases}
 ```
 
@@ -449,17 +476,37 @@ The interaction penalty is a **sum** of squared coefficients, currently `group_i
 
 ### 6.6 Frozen WT weights, group gain, and query routing
 
-Let $r_i$ be target row indices, $t_{ij}$ each input's source bin, and $b_i$ the branch. After failed relations are removed, define adjacent pairs on common WT rows of the remaining singles:
+peak→gene has two distinct quality thresholds:
+
+| Parameter | Object checked | When applied | Current setting |
+|---|---|---|---|
+| `atac_to_rna.single_min_r2` | Training R² of each peak→gene single response | After single fitting, before alpha normalization and group fitting | `0.3` |
+| `perturbation.min_r2_threshold` | Training R² of the complete gene model over retained inputs | Before Step8 propagation | `0.3` |
+
+The first filter retains relationships with R²≥threshold and excludes undefined R², recording `low_single_r2`. If all relationships are excluded, the target is `no_information`. The second filter does not replace the first: a good overall model may contain poor single responses. Missing or `null` `single_min_r2` disables the first filter only. Both are training-fit measures, not cross-validation or causal confidence. The single-response threshold applies to peak→gene only.
+
+Let $r_i$ denote target rows, $t_{ij}$ input source bins and $b_i$ branches. For **fixed-lag peak→gene**, failed relationships and those below `single_min_r2` are removed before computing weights from the following adjacent pairs and scores. Consecutive source bins remain required:
 
 ![Equation 6.6.1](docs/equations/response-6-6-01.svg)
 
 [LaTeX](docs/equations/response-6-6-01.tex)
 
-Only originally adjacent rows in the same branch are compared; rows are not sorted, and missing rows or branches are not bridged. Weights are neither Pearson coefficients nor training R²; they are the mean absolute adjacent change of the fitted response:
+Only adjacent rows in their original order and branch are compared. Rows are not sorted or paired across gaps or branches. Weights are mean absolute adjacent fitted-response differences, rather than Pearson coefficients or training R². Differences are made absolute before averaging and are not divided by the previous bin's response:
 
 ![Equation 6.6.2](docs/equations/response-6-6-02.svg)
 
 [LaTeX](docs/equations/response-6-6-02.tex)
+
+**Local-lag TF→peak** uses the separate rule below, without requiring consecutive source bins. Target rows must differ by1 and share a branch. A response difference contributes only when both endpoints support that input. The denominator counts all such target-adjacent pairs, rather than that input's supported pairs:
+
+```text
+A = all adjacent supplied row pairs with consecutive target_bin in the same branch
+S[j] = sum(abs(f[j](X[next,j])-f[j](X[prev,j]))
+           for (prev,next) in A if both endpoints have route_supported[:,j]) / len(A)
+alpha[j] = S[j] / sum(S)   # all alpha are0 when the total score is0
+```
+
+With no adjacent pairs the score is0. Source bins may jump as selected lags change. For example, if there are3 target-adjacent pairs and an input supports2 of them with differences2 and1, then `S=3/3=1`, rather than1.5. Missing support reduces the accumulated score without amplifying remaining supported rows.
 
 If $\mathcal A$ is empty, all $S_j=0$. Failed relations have no weight (equivalently $\alpha_j=0$); WT scores / normalization are recomputed over retained relations. If the total score is zero, all weights are zero, the WT mean is returned with `no_information`, and groups are not fitted. **$\alpha$ is frozen during perturbation**, without renormalization for actual changes, enabled lags, or “active” inputs. Under singles routing:
 
@@ -500,7 +547,7 @@ Step 2  Independent reference QC/clustering, model views, axis alignment
 Step 3  Official roots, joint pseudotime, and binning for each cohort
 Step 4  peak→gene distance candidates and Granger
 Step 5  peak→gene response fitting
-Step 6  Motif / per-TF per-lag screening and TF→peak response fitting
+Step 6  motifs / local lag screening per TF and target bin / TF→peak response fitting
 Step 7  Quality-filtered network integration
 Step 8  Gene / peak intervention and bin-wise forward propagation
 Step 9  Cell endpoints, coverage, aggregation, optional projection, export
@@ -532,6 +579,8 @@ Reconstruct cell endpoints, report coverage, aggregate under the selected policy
 ```
 
 Minimum TF-lag filtering does not renormalize α when it masks a relation. Feedback propagates only within the permitted graph / time structure and does not represent true steady-state dynamics. The current propagation_rounds=1; cell CP10k endpoints provide final readout. This workflow requires log_accumulation=true and rejects false.
+
+With local routes, minimum lag is compared among supported TFs **per peak and target bin**. The closure retains the union of executable relationships across bins; lacking support in one bin does not delete valid routes elsewhere. Unsupported or minimum-lag-filtered inputs contribute0 in that bin, without increasing other frozen alpha values. Default peak→gene Granger lag remains1: even if `TF[0]→Peak[0]` is supported, gene bin0 has no earlier peak input and retains baseline; `Peak[0]` can affect gene bin1. Retaining early TF→peak bins does not make every gene change at bin0. Root cells, WT context and Gaussian smoothing are unchanged by local routing.
 
 ### Log-space accumulation and endpoint reconstruction
 
@@ -581,47 +630,174 @@ python run_peak_perturbation.py --config config.local.yaml --peak chr3:123400-12
 <a id="outputs"></a>
 ## 9. Outputs, caching, and recovery
 
-All modes write directly to `output.dir`, without automatically appending `gene_ids`, `joint`, `atac`, or response-family directories. `checkpoint_dir: null` uses `output.dir/checkpoints`; per-cluster modeling uses corresponding subdirectories such as `cluster_N`. To switch modes or retain multiple runs, explicitly choose different output roots and compatible checkpoint directories. Later runs write same-named results; stale condition files are not automatically cleaned, and historical nested directories are not automatically searched or migrated.
+All modes write directly to `output.dir`, without automatic `gene_ids`, `joint`, `atac` or response-family subdirectories. `checkpoint_dir: null` uses `output.dir/checkpoints`, with per-cluster subdirectories such as `cluster_N`. Explicitly choose separate output roots and compatible checkpoint directories when changing modes or preserving runs. Matching filenames can be overwritten; obsolete conditional files are not automatically cleaned, and historical nested directories are not searched or migrated.
+
+When omitted, `output.export_details` defaults to `false` in the library, exporting summaries and primary results. The current supplied configuration explicitly sets it to `true`, adding the details marked below under the same root. The switch controls exports only, without changing fitting, prediction, returned results or checkpoints. Older configurations requiring details must explicitly add `export_details: true`.
+
+`save_intermediate: true` saves only intermediate tables without a formal export. It neither duplicates root results nor separately exports duplicate per-cluster perturbations, and cannot override `export_details: false`. The canonical pathway table is `perturbation_pathways.csv`; an identical `saturating_pathways.csv` is no longer duplicated. Disabling exports does not remove files from previous runs.
 
 | File | Contents |
 |---|---|
-| `hvg_genes.csv` | Actual model HVGs; independent of `save_intermediate` |
-| `gene_identity.csv`, `gene_filter_report.csv`, `gene_target_resolution.csv`, `gene_identity_metadata.json` | Full-input identity, filtering, target resolution, GTF and mapping provenance |
-| `cytotrace_scores_<context>.csv`, `cytotrace_provenance_<context>.json` | Official cohort scores, roots, full raw-count axes, source and R dependency evidence |
-| `causal_peak_gene_edges.csv`, `tf_peak_weights.csv` | Two screened regulatory edge layers |
-| `saturating_gene_metrics.csv`, `saturating_tf_metrics.csv` | WT fit and failure states |
-| `saturating_response_weights.csv`, `saturating_response_curves.csv` | α, excluded relations, family-specific parameters |
-| `saturating_support_diagnostics.csv`, `saturating_gates.csv`, `saturating_contexts.json` | Group support, gates, branches, context evidence |
-| `saturating_endpoints.csv`, `saturating_aggregation_diagnostics.csv`, `l1_floor_diagnostics.csv` | Cell endpoints, coverage, flooring, unavailability reasons |
+| `hvg_genes.csv` | Actual model HVGs, independent of `save_intermediate` |
+| `gene_identity.csv`, `gene_filter_report.csv`, `gene_target_resolution.csv`, `gene_identity_metadata.json` | Input identity, filtering, target resolution, GTF and mapping provenance |
+| `cytotrace_scores_<context>.csv`, `cytotrace_provenance_<context>.json` | Official cohort scores, root, complete raw-count axes, source and R dependency evidence |
+| `causal_peak_gene_edges.csv`, `tf_peak_weights.csv` | Screened regulatory relationships in both layers |
+| `saturating_gene_metrics.csv`, `saturating_tf_metrics.csv` | WT fitting metrics and failure status |
+| `saturating_response_weights.csv`, `saturating_response_curves.csv` | **Details**: alpha, excluded relationships and family-specific parameters |
+| `saturating_support_diagnostics.csv`, `saturating_gates.csv` | **Details**: group-support and gating evidence |
+| `saturating_contexts.json` | Branch and context evidence |
+| `saturating_endpoints.csv`, `saturating_aggregation_diagnostics.csv` | Cell endpoints, coverage and unavailability reasons |
+| `l1_floor_diagnostics.csv` | **Details**: per-bin floor evidence |
 | `perturbation_results.csv`, `perturbation_merged.csv` | Per-context results and cross-context aggregation |
-| `saturating_peak_attributions.csv`, `saturating_tf_peak_contributions.csv` | Event contributions in each layer's native units |
-| `saturating_pathways.csv`, `perturbation_pathways.csv` | Shared temporal-event-link schema; headers retained for empty results |
-| `aggregated_tf_peak_edges.csv`, `atac_changes.csv`, `atac_changes_merged.csv`, `atac_changes.bed` | TF / ATAC results where applicable |
-| `perturbation_cell_projection.csv`, `perturbation_projection_summary.csv`, `perturbation_projection_branch_probabilities.csv` | Optional cell-trajectory projection |
-| `perturbation_projection_bin_history.csv`, `perturbation_projection_bin_metadata.csv`, `perturbation_projection_events.csv` | Optional projection history, bins, events |
+| `saturating_peak_attributions.csv`, `saturating_tf_peak_contributions.csv` | **Details**: event contributions in each layer's native units |
+| `perturbation_pathways.csv` | Temporal event links; empty results retain headers |
+| `aggregated_tf_peak_edges.csv`, `atac_changes.csv`, `atac_changes_merged.csv`, `atac_changes.bed` | TF and ATAC results when applicable |
+| `perturbation_cell_projection.csv`, `perturbation_projection_summary.csv`, `perturbation_projection_branch_probabilities.csv` | Optional cell trajectory projections |
+| `perturbation_projection_bin_metadata.csv` | Optional projection-bin metadata |
+| `perturbation_projection_bin_history.csv`, `perturbation_projection_events.csv` | **Details**: optional projection history and events |
 | `binning_contexts.json`, `intermediate/` | Applicable binning evidence and intermediate tables |
 
-If `rna_clustered.h5ad` is saved, interpret its model axis and reference-coordinate provenance through `clustering_reference`; it cannot replace raw all-gene CytoTRACE input. Peak mode additionally exports `peak_perturbation_results.csv`, `peak_upstream_tfs.csv`, and, when available, `peak_upstream_tfs_merged.csv`. Availability depends on mode, results, and export switches; not every table is guaranteed in every run.
+Interpret the model axes and reference coordinates of saved `rna_clustered.h5ad` together with `clustering_reference`; it does not replace CytoTRACE's original all-gene input. Peak mode additionally exports `peak_perturbation_results.csv`, `peak_upstream_tfs.csv` and, where available, `peak_upstream_tfs_merged.csv`. Modes, available results and export switches determine which files exist; not every run generates every table.
 
-On rerun, the pipeline checks Step 4 / 5 / 6 inputs, response families, configuration, and references against saved results. Upstream changes require affected downstream stages to be recomputed. On incompatibility, choose a new `output.checkpoint_dir`, or back up and move the indicated stage and downstream files before rerunning. Do not edit cache version numbers to bypass checks. The program does not automatically migrate or delete disk caches. Load pickle files only from trusted sources.
+Recovery checks Step4/5/6 inputs, response families, configuration and references against saved results. Upstream changes require affected downstream stages to be recomputed. If incompatible, choose a new `output.checkpoint_dir`, or back up and move the indicated stage and its downstream files before restarting. Do not edit cache version fields to bypass validation. Training checkpoints are not automatically migrated or deleted. Load pickle files only from trusted sources.
 
-Motif scanning and response fitting support parallel execution and terminal progress; results record fitting budgets and convergence. Revalidate caches after resource-content changes and avoid modifying shared references during a run. `workers: 24` controls fitting processes; perturbation Step 8 is single-process.
+Motif scanning and response fitting support parallel execution, progress reporting and saved solver-budget/convergence status. Recheck caches after resource content changes; do not edit shared references during execution. `atac_to_rna.saturating_hybrid.workers` controls Step5/6 fitting processes. Step8 supports independent cluster processes, retaining ordered propagation within each cluster.
+
+Within one fully validated Step8 call, WT single responses are cached using the original single-row shape. Only changed supported inputs are reevaluated, with responses reused for contribution records. WT and KO retain their original weighted-sum and clipping order before subtraction. Frozen alpha, local lags, unsupported masks and supported-group preview/replay remain unchanged. The cache is neither persisted in models/checkpoints nor shared between runs. Complete model loading and validation remain costly, including repeated deserialization in existing loading paths. Step8 currently does not use a GPU.
+
+Granger and TF local-lag screening independently support candidate-block multiprocessing:
+
+```yaml
+execution:
+  granger_workers: 4
+  local_lag_workers: 4
+```
+
+Both settings accept positive integers and default to1, independently of response fitting, motif scanning and Step8 worker counts. Workers are processes with numerical threads limited to1. They share read-only binned matrices rather than copying full single-cell AnnData. Submission is bounded by effective task batches; small inputs run serially to avoid startup costs. Temporary memory-mapped files are removed after screening; do not delete them during execution.
+
+The parent process renders one horizontal progress bar for Step4 Granger or Step6 local-lag screening, showing examined and total valid candidates. Constant or untestable candidates still count as completed. Redirected output records start/end counts, warnings and final statistics without terminal controls. Granger collects results in original order before global FDR correction. Local Pearson retains branch masks, valid bins, neighborhoods and first-passing-lag rules. Worker counts are excluded from scientific signatures. The verified numerically equivalent block implementation preserves the prior screening signature; subsequent kernel changes still invalidate it.
+
+Recovery also checks CytoTRACE provenance. `data_fingerprint` currently includes complete `official_cytotrace` provenance, including descriptive R `r_runtime` text. Changing locale can therefore change a fingerprint even with identical expression matrices and axes. Keep R/Python, references and locale consistent when resuming. This mixture of audit text and numerical provenance remains overly strict and has not yet been separated; validation has not been universally relaxed. Older data, directories or algorithm versions are not automatically accepted.
+
+Each pipeline call computes its numerical-source signatures before loading data and reuses that snapshot across clusters, avoiding source-line mismatches caused by rereading edited files during long runs. The snapshot is released on completion or failure and recomputed on restart. Scientific-parameter, input and checkpoint checks remain active. Source editing is not hot reloading: restart and recover from compatible checkpoints after changes.
+
+Optionally finish training all clusters before parallel simulation:
+
+```yaml
+execution:
+  defer_cluster_simulation: true
+  simulation_workers: 2
+```
+
+With this option omitted, the original sequential flow remains. `simulation_workers` accepts positive integers, defaults to2 and is capped by pending clusters. Each trained cluster saves processed RNA/ATAC, pseudotime, complete binning context and configuration under `simulation_inputs/`, referencing Step4/5/6 checkpoints. CPU simulation processes start only after all training finishes, without retraining or rebinning. Within-cluster propagation remains ordered by bin; the parent aggregates in original cluster order. Scheduling does not change training signatures, but normal checkpoint compatibility checks still apply.
+
+This is a dynamic queue: for9 clusters and4 workers,4 clusters start first, then each free worker takes the next task. Each task loads and validates its data/models before propagation, without a common start barrier. Different model sizes, I/O times, bin counts and effective edges cause different start times and progress. A start log marks entry into loading; completion also includes writing results. Ordered aggregation does not prevent idle workers from accepting tasks.
+
+The parent renders one horizontal Step8 bar per cluster, with completed/total bins for the current propagation pass. Model loading, WT checks, endpoint reconstruction and saving appear as phase states; supported-group replay adds another propagation pass. Warnings, errors and summaries retain cluster labels. Redirected logs contain only start/completion/error summaries, without terminal controls. Existing processes must restart to use the display changes.
+
+Simulation inputs and results require disk space. Deferred workers store fields under `result_fields/`, while `result.pkl` contains references only. The parent loads fields on demand rather than retaining every cluster's complete results. Final aggregation processes one table at a time, storing merged fields under `simulation_results/merged/result_*/` and reading them separately for CSV export. A large table and temporary concatenation copies still need memory; this is not unlimited-scale streaming.
+
+The returned object and its `cluster_results` entries are key-addressable `DiskResults` mappings. `results["perturbation_merged"]` still returns a DataFrame, but each read is a snapshot; assign changes back to persist them. Materializing `dict(results)` or gathering every field still consumes memory. These persistent results are separate from training checkpoints: retain their directories for future reads. Missing references raise errors rather than silently recomputing. Public CSV fields, ordering and values retain existing behavior.
+
+Every active worker loads a complete cluster model; concurrency is not an automatic memory budget. Disk storage reduces completed-result residency but active models and simulation state still require separate memory. Use1 worker when memory is limited. Missing, replaced or invalid files raise errors without automatic retraining or deletion. Running processes do not automatically adopt new scheduling.
 
 ### Additional outputs and motif reuse
 
-The original workflow's `rna_clustered.h5ad`, `cluster_top50_genes.csv`, `atac_changes_significant.bed`, `atac_changes_significant_merged.bed`, and `peak_perturbation_report.txt` remain useful where applicable. Markers help inspect cluster mapping, BED files support coordinate / IGV comparisons, and peak reports include targets, upstream support, direct effects, and summaries. Do not assume every run generates them.
+`rna_clustered.h5ad`, `cluster_top50_genes.csv`, `atac_changes_significant.bed`, `atac_changes_significant_merged.bed` and `peak_perturbation_report.txt` remain useful when applicable. Markers help check cluster mapping; BED files support coordinate/IGV comparisons; peak reports include targets, upstream support, direct effects and summaries. These are not guaranteed for every run.
 
+ATAC z is change divided by WT between-bin standard deviation. A threshold of2 screens against natural variation; correlated bins are not an independent null distribution, so this does not establish calibrated95% significance or FDR control. Standard cluster/bin UMAPs are also distinct from cell-level reference projection.
 
 | Cache under output.cache_dir | Evidence and reuse limits |
 |---|---|
-| peak_motif_raw_v1/<scan_key>.pkl | Complete pre-top-N threshold-passing hits and successful zero hits; verifies genome, PWM / mappings, threshold, implementation |
+| peak_motif_raw_v1/<scan_key>.sqlite | Per-peak indexed complete above-threshold hits before top-N and successful zero-hit coverage; validates genome, PWM/mapping, thresholds and implementation |
 | peak_family_motif_v2/<scan_key>.pkl | Independent family scan; candidates do not replace actual DNA evidence |
+| peak_tf_cache_v2.pkl | Legacy candidates assuming unchanged resources; not promoted to raw or negative evidence |
 
-Contexts reconstruct candidates from raw hits. Changing top-N does not require rescanning complete raw caches. Extraction failures / missing sequences are not negatives; partial coverage scans only missing peaks. Old family v1 is not migrated automatically; the first v2 scan is cold.
+Contexts rebuild candidates from raw hits. Changing top-N does not require rescanning complete raw caches. Missing sequences and extraction failures are not negative evidence; partial coverage scans missing peaks only. Legacy family v1 is not automatically migrated; the first v2 scan is cold.
 
-The current 24 fitting workers control Step 5/6; 24 main motif workers control only missing main scans, not family scans or NN epochs. Actual processes depend on CPU / task count, and full cache hits do not create a scan pool. With threadpoolctl available, each fit worker limits underlying libraries to one thread. Worker failure aborts without saving a partial registry. Startup costs can outweigh parallel gains on small tasks.
+On first use, legacy raw `<scan_key>.pkl` files undergo two streaming validation/migration passes to a sibling `.sqlite`; the original remains. Subsequent runs query SQLite on demand rather than loading the complete raw cache. First migration still reads the entire old file and requires additional disk space for the database.
 
-Python multiprocessing callers need an `__main__` guard; use workers=1 in daemon processes. Worker count is a runtime parameter and normally does not invalidate scientific checkpoints. Changes to NN restarts / spline starts / solver budgets must distinguish scientific contracts from actual computation cost.
+Current fitting uses24 workers for Step5/6, and the24 main-motif workers handle only missing primary scans, not family scans or NN epochs. Effective processes are bounded by CPU/task availability; complete cache coverage creates no scan pool. With threadpoolctl available, fitting workers use one numerical thread. Worker failure aborts without producing a partial registry. Startup costs can outweigh parallel gains for small tasks.
+
+Protect Python multiprocessing entry points with `__main__`; use workers=1 inside daemons. Worker counts are runtime settings and normally do not invalidate scientific checkpoints. NN restarts, spline starts and solver budgets require separate consideration of scientific contracts and computational cost.
+
+<a id="batch-running"></a>
+### Sequential batch runs
+
+Use root-level `run_batch.py` and `batch.example.yaml` to run experiments sequentially. Each task can set `input` (RNA, ATAC, GTF, genome), `output.dir`, `output.cache_dir`, `knockout_genes`, `joint_knockout` and other pipeline parameters under `overrides`. Merge priority is base configuration, shared defaults, then task fields. Manifest-relative paths resolve against the manifest directory; base-config-relative paths resolve against its directory.
+
+```bash
+python run_batch.py batch.example.yaml --dry-run
+python run_batch.py batch.example.yaml
+python run_batch.py batch.example.yaml --order D6_Zic2 D3_Zic2
+```
+
+A task template with editable paths:
+
+```yaml
+base_config: config.yaml
+
+defaults:
+  joint_knockout: true
+  overrides:
+    atac_to_rna:
+      single_min_r2: 0.3
+    execution:
+      granger_workers: 4
+      local_lag_workers: 4
+      simulation_workers: 2
+      defer_cluster_simulation: true
+
+tasks:
+  - name: mouse_Zic2
+    knockout_genes: [Zic2]  # Multiple targets: [Zic2, Runx1]; default type TF
+    input:
+      rna_h5ad: /data/mouse/rna_adata.h5ad
+      atac_h5ad: /data/mouse/atac_adata.h5ad
+      annotation_gtf: /reference/mm10/genes.gtf.gz
+      genome_fasta: /reference/mm10/genome.fa
+    output:
+      dir: results/batch/mouse_Zic2
+      cache_dir: cache_mouse
+  - name: human_RUNX1
+    knockout_genes: [{gene: RUNX1, type: TF}]
+    input:
+      rna_h5ad: /data/human/rna_adata.h5ad
+      atac_h5ad: /data/human/atac_adata.h5ad
+      annotation_gtf: /reference/GRCh38/genes.gtf.gz
+      genome_fasta: /reference/GRCh38/genome.fa
+    output:
+      dir: results/batch/human_RUNX1
+      cache_dir: cache_human
+```
+
+Specify each task's GTF and FASTA explicitly to avoid inheriting the wrong species reference after changing RNA/ATAC. Mouse examples use mm10 and human examples GRCh38; the actual assembly must match peak coordinates. `name` is a task label; `knockout_genes` determines the intervention. Use actual genes rather than family abbreviations, such as KLF1 rather than KLF. Trailing directory slashes are optional; file paths must not end in a slash.
+
+```bash
+# Run in the background; detailed logs remain in each task's batch_runs directory
+nohup python -u run_batch.py batch.example.yaml > batch.log 2>&1 < /dev/null &
+tail -f batch.log
+# Rerun only the failed task, without rerunning completed tasks
+python run_batch.py batch.example.yaml --order KLF1
+```
+
+The `tasks` list defines execution order; `--order` runs only named tasks in the supplied order. Each task runs the full pipeline in its own Python child process; the next starts after it exits. By default failure stops the batch; `--continue-on-error` continues but still returns a nonzero final exit code. `--python` selects the CausalBridge interpreter. `--dry-run` checks tasks, input paths and the plan without creating result directories, running models or validating biological contents.
+
+Each invocation saves `config.yaml`, `target_genes.txt`, `pipeline.log` and `status.json` (PID, start/end time and exit code) under each task's `output.dir/batch_runs/<timestamp>/<task>/`. Project configuration/target files remain untouched, with checkpoint validation retained. Tasks need distinct output directories but may share compatible caches. Each task defaults to its own checkpoints, resetting any inherited explicit checkpoint path unless the task sets `output.checkpoint_dir`. Rerunning a task resumes through compatible checkpoints. The current pipeline applies single-response R² filtering but does not automatically migrate old singles into newly composed models.
+
+`atac_to_rna.single_min_r2` controls per-relationship peak→gene quality, explicitly0.3 in the current project and batch configurations. Missing/null retains historical behavior. After fitting singles, low or undefined R² is recorded as `low_single_r2` in `excluded_single_relations`. Those inputs are removed before renormalizing alpha from retained WT response-variation scores and selecting/fitting groups. Equality to the threshold passes. If all inputs are excluded, the target becomes `no_information`. Overall R² is recomputed and must separately pass `perturbation.min_r2_threshold`. TF→peak is unaffected by this single-response threshold; training R² is neither independent validation nor causal evidence.
+
+This scientific rule is included in provenance, contexts and checkpoint contracts. Recovery after enabling per-relationship R² filtering follows these boundaries:
+
+| Existing artifact | Action |
+|---|---|
+| Step4 Granger checkpoint | Reusable when data, parameters, environment and numerical signatures match |
+| Step5 ATAC→RNA checkpoint | Old combinations do not satisfy the new rule; recompute through the normal entry point rather than editing alpha CSVs |
+| Step6 RNA→ATAC checkpoint | No new TF→peak R² threshold, but shared signatures and Step5 upstream contracts changed; normal execution also requires recomputation |
+| Step8 results, summaries and figures | Recompute simulation, aggregation and figures because weights and propagation change |
+| Motif cache | Reusable with compatible resources and scanning settings, independently of training checkpoints |
+
+The normal entry point does not automatically reconstruct/migrate old fits. Use a separate checkpoint directory, or, if deliberately retraining in place, back up and move or explicitly authorize deletion of this run's `step5_atac_to_rna.pkl` and `step6_rna_to_atac.pkl`, including cluster subdirectories, retaining Step4 before restarting. `simulation_inputs/` contains old invocation snapshots and cannot substitute for Step8 with new models; a fresh invocation saves new inputs. Changing output directories does not automatically search elsewhere for checkpoints.
 
 <a id="visualization"></a>
 ## 10. Visualization and pathway interpretation
@@ -631,12 +807,66 @@ Pathways use a **radial cluster hierarchy**, with a separate panel for each sele
 ```bash
 Rscript visualize_perturbation.R results/my_run
 Rscript visualize_perturbation.R --result-dir results/my_run --output-dir results/my_run/figures_custom --genes ENSG00000123456
+Rscript visualize_perturbation.R results/my_run --output-dir /tmp/my_new_figures --new-visualizations-only --trajectory-genes NOLC1 --tf-response-top-n 10
 python plot_causal_network.py 5 --result-dir results/my_run --output-dir results/my_run/network_figures
 ```
 
 R configuration precedence is CLI > `CAUSALBRIDGE_RESULT_DIR` / `CAUSALBRIDGE_OUTPUT_DIR` / `CAUSALBRIDGE_PATHWAY_GENES` > manual settings at the script top. `PATHWAY_GENES` / `--genes` accept stable IDs or display names; use IDs for duplicate names. Automatic selection uses finite `|delta_rna_signed|` and `TOP_PATHWAY_N`; `--genes __AUTO__` restores it. Manual selection can retain unavailable-effect genes with their status. Absent genes trigger warnings or errors. Images default to `figures_R` under the final input directory.
 
+Additional figures are controlled by the script-top `TRAJECTORY_GENES`, `TRAJECTORY_PEAKS`, `TRAJECTORY_TOP_PATHS`, `TF_RESPONSE_TOP_N`, `TF_RESPONSE_MIN_R2`, `VIS_WORKERS` and `MODEL_DIAGNOSTIC_PLOTS`. These editable local examples may change genes, species or directories; the rules below describe enablement rather than personal settings. `--new-visualizations-only` runs only additional figures; missing or unverifiable data are explicitly skipped. See [additional-figure units and parameters](FIGUERS_README.md#12-wtko-pseudotime-trajectories-for-selected-downstream-genes).
+
+Setting `TRAJECTORY_GENES` or `--trajectory-genes` retains the response galleries and adds two single-relationship figures for each trajectory actually generated, suffixed `_tf_response` and `_peak_gene_response`. They use the exact same cluster, TF, peak, gene and saved lag. These saved single-model curves are unweighted by alpha and are not filtered again by gallery R² or top-N thresholds. Titles show training R² and alpha; no refitting occurs. Existing trajectory ranking and counts remain, default3, with joint KO counts grouped by context/TF.
+
+When neither genes nor peaks are selected (set both R variables to `NULL`, or pass `--trajectory-genes NULL --trajectory-peaks NULL`), each cluster displays its5 highest-training-R² single relationships separately in each layer. Candidates require alpha>0 and finite R²; the extra gallery0.5 threshold is not applied, and fewer available candidates yield fewer plots. TF candidates include all saved TFs in that cluster, beyond KO TFs. Filenames start with `top5_tf_response_` or `top5_peak_gene_`; selections are saved to `top5_tf_response_selected.csv` and `top5_peak_gene_selected.csv`. Old figures are not automatically removed.
+
+Specify intermediate peaks using R `TRAJECTORY_PEAKS <- "chr3:122032995-122033878"` or `c("peak1", "peak2")`; default `NULL` imposes no peak restriction. The CLI accepts `--trajectory-peaks chr3:122032995-122033878`, with multiple IDs comma-separated; coordinates themselves must not contain thousands separators. Gene and peak selections intersect saved pathways. For peak-only selection, also set genes to `NULL`; downstream genes are inferred from saved KO pathways. IDs must match exactly; missing IDs raise errors without nearest-peak substitution. Filtering precedes ranking and path caps, so multiple peaks still share each gene's top-path limit and need not all appear. Each emitted trajectory also gets both response companions. Peak-only selection uses pathway mode rather than per-cluster top5 mode.
+
+```bash
+Rscript visualize_perturbation.R --trajectory-genes Abca4 --trajectory-peaks chr3:122032995-122033878
+Rscript visualize_perturbation.R --trajectory-genes NULL --trajectory-peaks chr3:122032995-122033878
+```
+
 Adapters join by ID and label with symbols. A path label `cluster_0` is aligned only when results actually contain corresponding `0`; distinct clusters must not be merged. Python network plotting likewise recognizes the current schema, units, and signed effects. The effect / fit plot's y-axis is R², not a p-value. Missing values are not stable or zero effects.
+
+Repeated aliases are registered once, preserving ambiguous candidates and existing label overwrite order. Response and trajectory plots reuse selected pathways. Current models undergo complete production validation once; legacy graphical archives retain their own fingerprint checks. Authentication is not bypassed. Python logs separately time each cluster's checkpoint loading, validation and figure stages; the R `model_diagnostics.log` includes these records to identify the bottleneck.
+
+R `VIS_WORKERS` or CLI `--workers 2` controls visualization process count, independently of pipeline settings. Python CLI defaults to2; R uses the actual script-top value;1 is serial. TF→peak models are loaded, fully validated and extracted per cluster in parallel; peak→gene plots are also generated per cluster in parallel. Numerical threads per worker are limited to1. Temporary disk files carry intermediate results, and the parent retains selected models and plotting context rather than complete registries. More workers load more large models concurrently, so choose according to memory. CSV merging retains cluster order. Per-cluster images are collected from separate temporary directories to prevent concurrent overwrites. Other figures sharing data still run sequentially in the parent.
+
+### Response and trajectory selection and interpretation
+
+| Figure | Selection | Counts and limits |
+|---|---|---|
+| TF response gallery for selected genes | TF→peak edges on saved KO paths, alpha>0, status ok and single training R²≥`TF_RESPONSE_MIN_R2` | Up to `TF_RESPONSE_TOP_N` distinct peaks per KO TF/cluster |
+| peak→gene gallery for selected genes | Selected gene's peak→gene edges on saved KO paths, using the same alpha/status/plot-R² conditions | Up to top-N per downstream gene/cluster |
+| Trajectory | Descending `abs(peak_input_contribution_mean)`, falling back to `abs(delta_r_raw_sum)` only when the preferred field is absent; not R²/p ranking | Deduplicate context/TF/peak; single KO takes top-paths across clusters per gene, joint KO within each gene/context/TF group |
+| Trajectory response companions | Exact cluster/TF/peak/gene/lag of each trajectory actually drawn | Two figures per path without another gallery-R² cutoff |
+| top5 without selected genes/peaks | Per-cluster, per-layer saved singles ranked by finite training R², alpha>0 | At most5 per layer/cluster, individually plotted; not limited to KO TFs |
+
+Gallery ties use smaller saved FDR, then p, then peak/lag. Both galleries currently share `TF_RESPONSE_TOP_N` (default10) and `TF_RESPONSE_MIN_R2` (default0.5), distinct from the0.3 single-peak fitting and0.3 overall-model thresholds. A missing cluster figure does not imply missing simulation. Trajectory ranking takes the absolute value after averaging signed contributions, so opposite-sign bins can cancel; it does not rank mean absolute effects. Top paths are selected before checking plot eligibility, without backfilling invalid paths. If ranking fields are absent or unusable, table order has no effect-size or confidence interpretation.
+
+**The bottom trajectory panel is the gene's total state after full-network propagation; the middle panel shows just one peak.** Other peaks can change the gene even if this peak's WT/KO curves overlap. The bottom change is not exclusive to the displayed TF→peak→gene path or a single-peak KO experiment. Saved lags are preserved without shifting peaks into alignment. Response companions show absolute single-model `f(x)`, before alpha weighting, rather than intervention contributions.
+
+For per-bin contributions of one peak to a gene, read:
+
+```text
+saturating_peak_attributions.csv
+```
+
+Filter by `source_context`, `gene_id`/`gene_name`, `peak_id` and `bin`. `bin` is the downstream gene's target bin; fixed peak→gene lag1 uses the preceding source bin. `delta_l2` is an RNA L2 (`log1p_rna_log1p_cp10k`) difference, not final CP10k change or log2FC. `method=frozen_alpha_single_response` means `alpha × [f(A_KO)-f(A_WT)]`; `ordered_telescoping_not_causal` decomposes a group in fixed input order and is not an independent causal effect. Check clipping when comparing contribution sums with network changes: bounded final states can differ from sums before clipping. TF→peak native contributions are in `saturating_tf_peak_contributions.csv`; gene endpoint effects are in `perturbation_results.csv`/`perturbation_merged.csv`. These large detail tables require `output.export_details: true`. Plotting does not recompute models or propagation.
+
+### Visualization errors and outputs
+
+`Requested model diagnostic plots failed` summarizes a nonzero Python exit in R. First inspect `model_diagnostics.log` in the output directory; the wrapper message alone is not a reason to change interpreters. The log includes the actual command, environment selection, per-cluster loading/validation, plot timings and traceback. R currently collects Python output and prints it after the child completes, so a silent interval does not establish that execution stopped.
+
+| Error or symptom | Check |
+|---|---|
+| `No saved pathway for requested peak IDs` | Check chromosome, coordinates, selected genes and saved pathways. Matching is exact, without nearest-peak lookup; chr15 and chr4 remain different even at identical numeric coordinates |
+| ATAC source/count/axis fingerprint mismatch | `TRAJECTORY_ATAC_FILE` must be the original complete ATAC used for that run, not a different day or preprocessed subset |
+| Some figures exist but another category failed | Other categories continue after a plotting failure, with a nonzero final exit. Partial output does not establish complete success; prior figures may remain |
+| `Invalid cross-device link` | Parallel peak→gene plotting now creates temporary directories inside the output filesystem and cleans them after collection; older scripts can fail when `/tmp` and `/home` are on different devices |
+| Model validation, field or unit errors | Preserve the traceback and check actual model provenance; do not edit CSVs or disable authentication to force plotting |
+
+`trajectory_trace_data.csv` stores trajectory data. `tf_response_selected.csv` and `peak_gene_response_selected.csv` record gallery choices with single-model R², alpha and screening evidence; top5 mode writes two separate `top5_*_selected.csv` files. Companion names append `_tf_response.png` or `_peak_gene_response.png` to trajectory prefixes, and figures show R², alpha and lag. Output directories are not cleared between modes; use separate directories or check filenames/timestamps. `--new-visualizations-only` regenerates diagnostics without rerunning the pipeline.
 
 Hybrid pathways temporally link nonzero TF→peak events and nonzero events at the next gene bin within the same branch / context / intervention, exporting `pathway_type=temporal_event_link`, `causal_claim=False`. Native contributions describe their own layer only. Multiple TFs passing through one peak can share the same peak→gene response; this is not TF-exclusive allocation of RNA effects. Complete `endpoint_delta_rna_log2fc` is a shared gene endpoint and cannot be summed over TF paths. Historical RNA-allocation fields such as `delta_r_raw_sum` / `delta_r_total` remain NaN / unavailable. Figures do not invent flows or add different-layer units.
 
@@ -757,6 +987,7 @@ Optional BinningConfig parameters live directly under pseudotime.adaptive_binnin
 |---|---|---|
 | model_mode | saturating_hybrid | Only supported mode; also the missing-key default |
 | response_model | nn | peak→gene response |
+| single_min_r2 | 0.3 | Single-peak training R² threshold before alpha/groups; null/missing disables |
 | log_normalize_rna | true | L1→L2 log1p |
 
 Each layer has independent nn_response / spline_response settings under atac_to_rna and rna_to_atac, active only when that family is selected:
@@ -788,7 +1019,7 @@ These are shared fitting / support settings for both layers; they do not require
 | budget_exhausted_policy | best_finite | Saturation exhaustion policy; exclude if omitted |
 | det_starts | 3 | saturation starts |
 | rna_cap_lambda | 0.25 | RNA WT-span cap |
-| min_fit_rows | 12 | Rows per target |
+| min_fit_rows | 12 | Minimum single-response supported rows; also the local TF-lag evidence-window size |
 | group_sizes | [2,3] | Input-group sizes |
 | max_groups | 2 | Candidate-group count |
 | polynomial_degree | 2 | Corresponding group-response complexity |
@@ -825,11 +1056,12 @@ These are shared fitting / support settings for both layers; they do not require
 | perturbation_mode | bin_forward | Current propagation entry point |
 | joint_knockout | true | Joint multiple targets |
 | ko_strength | 1 | Gene KO strength |
+| propagation_rounds | 1 | More rounds do not guarantee accuracy |
 | subnetwork_depth | unlimited | Executable downstream closure / finite integer |
 | subnetwork_unlimited_max_edges | 250000 | Final-edge limit |
 | subnetwork_unlimited_max_work_edges | 250000 | Traversal-candidate limit |
-| min_r2_threshold | 0.3 | peak→gene quality |
-| min_lag_per_peak_filter | true | Minimum TF lag per peak |
+| min_r2_threshold | 0.3 | Overall combined gene-model training R² threshold, separate from per-peak filtering |
+| min_lag_per_peak_filter | true | Actual minimum supported TF lag per peak/bin, without alpha renormalization |
 | log_accumulation | true | Must be true for hybrid |
 | min_delta_threshold | 0 | Implementation still enforces at least 1e-6 |
 | atac_significance_zscore | 2 | Screening relative to WT variation |
@@ -848,6 +1080,20 @@ These are shared fitting / support settings for both layers; they do not require
 
 If the traversal budget is omitted, it derives as max(max_edges*10,max_edges+100). Candidate rows differ from final edges.
 
+### Independent pipeline and visualization parallel settings
+
+| Parameter | Missing-key behavior/default | Purpose |
+|---|---|---|
+| `execution.granger_workers` | 1 | Step4 peak→gene candidate-testing processes |
+| `execution.local_lag_workers` | 1 | Step6 per-target-bin local Pearson screening processes |
+| `atac_to_rna.saturating_hybrid.workers` | 1 | Step5/6 response-fitting processes |
+| `rna_to_atac.motif_scan_workers` | 1 | Missing primary-motif scans, independent of cache hits and later fitting |
+| `execution.defer_cluster_simulation` | false | Parallel Step8 after all training; false retains original per-cluster flow |
+| `execution.simulation_workers` | 2 | Maximum deferred concurrent clusters; any positive integer, no longer restricted to1 or2 |
+| Visualization `VIS_WORKERS`/`--workers` | Python CLI2; R uses script-top setting | Per-cluster model loading/validation and peak→gene plotting, independent of model configuration |
+
+These are process counts rather than threads within one process. Parallel execution neither lowers scientific thresholds nor automatically reduces concurrency according to memory. Pipeline settings do not change visualization workers or vice versa. New settings take effect in newly started processes.
+
 ### output and missing-key fallbacks
 
 | output parameter | Current configuration | Meaning |
@@ -855,7 +1101,8 @@ If the traversal budget is omitted, it derives as max(max_edges*10,max_edges+100
 | dir | Machine-specific path; replace | Results written directly here |
 | cache_dir | Machine-specific path; replace | Motifs / shared resources |
 | checkpoint_dir | null | output.dir/checkpoints |
-| save_intermediate | true | Does not control actual-HVG export |
+| export_details | true | Additional diagnostics, attributions, response curves and projection history/events |
+| save_intermediate | true | Intermediate tables without formal exports only; no duplicate results, detail-switch bypass or HVG control |
 
 Important missing-key values follow. Reducing the configuration to minimal paths does not guarantee the same experiment:
 
@@ -923,6 +1170,9 @@ CausalBridge/
 ├── adaptive_binning.py         WT plans and support
 ├── binning_adapter.py          Shared-plan / embedding adapter
 ├── atac_normalization.py       Full-depth continuous ATAC
+├── screening_parallel.py       Block multiprocessing for Granger/local-lag screening
+├── simulation_queue.py         Per-cluster Step8 queue and input snapshots
+├── result_store.py             Disk-backed result mappings and lazy loading
 ├── kinetics.py                 Layer scheduling, motifs, Pearson
 ├── saturating_hybrid.py        Hybrid settings, saturation, support
 ├── saturating_transfer.py      Layer registries and fitting
@@ -937,6 +1187,8 @@ CausalBridge/
 └── terminal_progress.py        Terminal progress
 
 run_example.py                  Main CLI; positional configuration
+run_batch.py                    Sequential batch CLI
+batch.example.yaml              Annotated task manifest: inputs/references/outputs/cache/KO
 run_peak_perturbation.py         Peak-intervention CLI
 convert_10x_to_CausalBridge.py   10x conversion
 plot_causal_network.py          Python network plots
@@ -960,137 +1212,120 @@ This repository has no separate LICENSE file. External dependency licenses are n
 <a id="changelog"></a>
 ## 14. Release history
 
-The v2.0 entries below describe the current implementation, followed by all 51 historical version records and technical updates from v1.40 through v0.3. Historical records describe behavior at the time; removed models, root-baseline scaling, and dependency instructions are not current features or installation requirements. The corresponding main sections define current algorithms, units, and configuration.
+The current version is **v2.1.0**. The23 original v2.0 topics have been grouped by theme and their recorded order into v2.0.0–v2.0.7 for navigation. These patch numbers retrospectively organize the history; they do not represent packages or Git tags individually published at the time, so unverified release dates are not invented. Version1.40 and earlier retain their original entries. Current documentation and the latest release notes take precedence over historical behavior.
 
-### v2.0 / 2.0.0
+### v2.1.0 — Parallel scheduling, per-relationship quality filters and model diagnostics (2026-10-20)
 
-v2.0 provides stable gene IDs, independently bounded responses in both layers, a continuous ATAC model view, and cell-endpoint aggregation. Existing results must be rerun with the intended configuration to reflect these features.
+This release collects recent batch execution, memory/performance, quality-filtering, target-retention and visualization updates. The Python package version is `2.1.0`. Package, checkpoint-schema and registry versions are managed separately; changing the package version does not migrate models.
 
-#### v2.0-01: Enabled route and principal behavior changes
+#### Scheduling and memory
 
-This release connects gene identity, reference views, response functions, cell endpoints, and provenance checks into an auditable workflow. The table describes explicit settings in the supplied [config.yaml](config.yaml). Compatibility defaults for omitted keys can differ; see [section 11](#configuration).
+- Add `run_batch.py` and annotated `batch.example.yaml`: custom task order and independent RNA/ATAC, GTF/FASTA, KO, output and cache settings. Save configurations, targets, logs and exit status; stop on failure by default.
+- Step4 Granger and Step6 local-lag Pearson use separate `execution.granger_workers` and `execution.local_lag_workers`. The parent renders progress; Granger applies global multiple-testing correction after collecting results.
+- Step8 queues clusters dynamically after training, accepting positive `simulation_workers` with one progress bar per cluster. Fields are written to disk and loaded on demand through `DiskResults`, reducing completed-result residency. Active models and single-table merges still require memory; concurrency is not automatically memory-budgeted.
+- Raw motifs use per-peak SQLite lookup and batched scan writes. Legacy raw `.pkl` files undergo two streaming migration/validation passes and remain intact. Primary scans, family scans and legacy candidate caches retain separate provenance contracts.
 
-| Module | Historical behavior / compatibility route | Current configuration and changes |
-|---|---|---|
-| Gene axis | Input names and legacy coordinates remain optional | `gtf_gene_id`: stable-ID computation, symbol display, authoritative GTF coordinates |
-| Root selection | Historical global mapping or approximate scores | Official CytoTRACE 0.3.1 in each actual modeling cohort |
-| Response | Legacy shared PairEmbeddingNN | Hybrid; `nn` for peak→gene, `spline` for TF→peak |
-| ATAC | Binary open proportions | Continuous log1p model view normalized by full input depth |
-| Binning | Fixed Gaussian smoothing | Fixed gaussian remains enabled; shared adaptive plan explicitly disabled |
-| Aggregation | Historical effect aggregation | `valid_cell_means`, reporting the same valid cell set and exclusion reasons |
-| Result directory | Previously mode-dependent directory conventions | Direct `output.dir`; users explicitly separate runs |
+#### Model quality and recovery
 
-`saturating_hybrid` is the only supported model and the missing-key default. It names the singles / supported-group workflow and does not require saturation in both layers. Legacy coordinate compatibility for gene identity is distinct from the removed model. After changing identity axes, ATAC representation, roots, or response families, revalidate scientific checkpoints rather than reusing old curves and effect tables directly.
+- Rescue required targets from eligible original inputs when expression QC/HVG selection would remove them. Stable-ID resolution and actual input-presence checks remain.
+- Add peak→gene `atac_to_rna.single_min_r2`, explicitly0.3 in current configuration. Filter single training R² before alpha normalization and group fitting. `perturbation.min_r2_threshold` separately controls complete-model quality. TF→peak does not use this per-peak threshold.
+- Snapshot numerical-source signatures at pipeline entry to avoid repeated `inspect` source-line errors during long runs. Only verified equivalent changes reuse old signatures; real scientific-input and calculation changes remain checked.
+- Clip generated local WT reference means to physical bounds, fixing floating-point rounding excursions that raised `invalid local single WT references`. Saved-model boundary validation remains strict.
+- The new single-R² rule changes training contracts. The normal entry point requires old Step5/6 fits to be recomputed. Step4 may remain reusable when data, settings and numerical provenance match. Regenerate Step8, summaries and figures; reuse motifs independently according to their resource contracts. See [recovery guidance](#batch-running).
 
-#### v2.0-02: GTF stable IDs, duplicate symbols, and complete identity audits
+#### Visualization and interpretation
 
-Added `input.gene_identity_mode: gtf_gene_id`, auditing all input features before model filtering and removing only trailing numeric stable-ID versions. Collisions after normalizing versioned and unversioned IDs raise explicit errors rather than silently summing counts. Features unmatched to GTF retain filtering reasons; original H5AD files remain unchanged.
+- Select intermediate peaks for trajectories, with separate TF→peak and peak→gene response companions per emitted path. With neither gene nor peak selected, each cluster shows its5 highest finite-training-R² relationships with alpha>0 in each layer.
+- Retain selected-downstream-gene galleries and distinguish their ranking/filtering from trajectories and default top5 figures. The trajectory gene panel shows full-network changes; read `saturating_peak_attributions.csv` for individual peak contributions.
+- Parallelize per-cluster loading/validation and peak→gene plotting through independent `VIS_WORKERS`/`--workers`. Avoid duplicate alias registration and authentication. Create temporary plotting directories on the output filesystem to fix cross-device rename failures.
+- Document staggered progress starts, memory limits, detail exports, error logs and recovery restrictions. Local performance observations do not promise a universal speedup.
 
-Model edge keys, fitting, projection feature axes, and cross-cluster merging use stable IDs. CSV saving adds name and display fields only in copies. Different IDs sharing a name receive fixed numbered aliases ordered by stable ID in the complete reference; HVG or cluster subsets do not renumber them. Motifs still match native symbols and expand to allowed IDs.
+### Organized v2.0 history
 
-Targets and explicit root markers accept stable IDs, versioned IDs, unique symbols, and resolved numbered aliases. Ambiguous symbols must be specified explicitly. Added `gene_identity.csv`, `gene_filter_report.csv`, `gene_target_resolution.csv`, and `gene_identity_metadata.json` for identity, eligibility filtering, target resolution, and provenance. See [gene_identity.py](CausalBridge/gene_identity.py), [identity tests](tests/test_gene_identity.py), and [model identity tests](tests/test_gene_identity_modeling.py).
+Versions appear newest first. Expand entries for preserved technical explanations; historical configuration values describe their original context. See the main guide for current settings.
 
-#### v2.0-03: Authoritative gene spans, coordinate conversion, and strand-aware TSS
+### v2.0.7 — Per-bin TF lag and support routes
 
-GTF mode uses the complete gene-record span rather than incomplete or inconsistent input start / end coordinates. It converts 1-based closed intervals to 0-based half-open intervals and retains old coordinates in `original_*`. Positive-strand TSS is the converted start; negative-strand TSS is the converted end minus one.
+Replace fixed TF→peak relationship lags with local searches at each target bin, retaining one fitted response per relationship, support masks and frozen WT weights.
 
-This directly changes peak-midpoint–TSS distance candidates, especially on the negative strand; the current threshold is 200000 bp. Coordinate corrections require candidates and downstream models to be recomputed. This remains a single gene-level TSS approximation, without transcript-specific promoters; mixed unknown-strand legacy fallback limitations remain. See [gene_identity.py](CausalBridge/gene_identity.py) and [test_strand_tss.py](tests/test_strand_tss.py).
+<details>
+<summary>Technical details</summary>
 
-#### v2.0-04: Independent reference clustering, model normalization, and actual-HVG export
+#### Per-bin TF lag, support masks and fixed-response propagation
 
-To prevent model GTF eligibility from redefining reference clusters, existing QC / HVG / target retention and RNA clustering first run on an original-RNA copy before GTF filtering. Model RNA is prepared independently. ATAC is preprocessed once. The model does not repeat cell QC after reducing its gene axis; it strictly aligns reference barcodes and separately records reference-coordinate and model-axis provenance.
+For every target bin of each branch, TF→peak tests `k=0..min(max_lag, b-branch_start)` and selects the first lag passing local Pearson and contribution thresholds. There is no global Pearson prescreening, early-bin truncation or forced contemporaneous edge after failure. Evidence uses up to12 nearest valid WT aligned rows in the same branch, reusing `min_fit_rows`, and requires at least3. Later WT evidence may be included, but KO execution only reads present/past source bins. The12-row engineering neighborhood is not12 independent biological samples or a validated timescale. Gaussian overlap correlates rows, so local p-values and lag selection do not guarantee pipeline-wide FDR.
 
-Model normalization denominators and raw-count HVG ranking use **all GTF-eligible genes**, followed by the current 3000 HVGs and required targets / root markers passing expression QC. Additional non-HVG retention does not set `highly_variable` to true. Step 6 TF-presence checks can access the full eligible input axis, avoiding confusion between “non-HVG” and “absent from RNA input.”
+Local Pearson reuses neighborhood indices for finite candidates and batches SciPy calls by evidence size. Temporary correlation arrays are limited to one TF→peak candidate rather than all genes×peaks. NaN/Inf candidates use the scalar path; near-constant inputs and values near significance/contribution thresholds are recomputed scalarly. Standard-deviation screening retains the scalar reduction. First-supported lag, branch and valid-row rules remain. `n_lag_attempts` and `n_stat_tests` count logically visited tests before the first pass, excluding unvisited precomputed lags; they are not SciPy call counts. Progress distinguishes raw candidates, processed valid deduplicated pairs and supported pairs. Source changes remain subject to checkpoint signatures, without changing model or storage versions for this numerical batching optimization.
 
-`hvg_genes.csv` is independent of `save_intermediate` and contains only actual HVGs, with `gene_id`, `gene_name`, and available original names. Reference `X_pca` / `X_umap` provenance is recorded in `uns['clustering_reference']`; these cannot be read as PCA loadings on the model stable-ID axis. See [reference_clustering.py](CausalBridge/reference_clustering.py), [run.py](CausalBridge/run.py), and [HVG-order checks](tests/test_identity_hvg_order.py).
+One response function is fitted over all selected supported pairs for each TF→peak relationship. Routing varies per bin without refitting. Insufficient relationships retain exclusion reasons; unsupported positions are neither fitted nor queried and contribute0. WT alpha sums supported endpoint differences over adjacent target rows, divides by all same-branch adjacent target pairs and freezes. Consecutive local source bins are not required, and query support never renormalizes alpha. Groups use common support for fitting and comparison. Minimum lag is filtered per peak/bin and closure retains the union of executable relationships. Default peak→gene lag1, root selection and smoothing remain; see sections5–7 for examples and scoring pseudocode.
 
-#### v2.0-05: Official CytoTRACE per cohort and complete raw-RNA transfer
+Detail exports include `tf_peak_lag_routes.csv`; summary `tf_lag` no longer denotes one fixed lag. TF registries use `*_tf_peak_local_registry_v3`. Relabeling old fixed-route registries does not make them local models. Old Step6 registries are incompatible; other stages depend on actual signatures, so Step5 reuse is not guaranteed. Existing figures/results are not automatically updated, removed or migrated. The original entry documented source behavior before all review and new-run checks were complete; small-instance checks and separate output/checkpoint directories remain appropriate, and hypothetical examples are not empirical validation.
 
-Replaced approximate scores and global score mapping. Each actual modeling cluster / lineage runs official GCS→NNLS→diffusion on QC-retained cohort cells × raw RNA counts for **all genes**. Zero-expression genes remain for official internal filtering. Model HVGs, model log expression, and unverified input `obs` scores are not used. Separate cohort runs do not establish a common global score scale.
+</details>
 
-Pinned official 2020 / 0.3.1 source commit `f4ff6c0ab93cc704eef44e17adcd5c6baf09703a`, verifying `R/CytoTRACE.R` SHA256 `7dafcfa42c792eaffe1048f4716cb54105b31f2ad01c4f0c26868c10593b155d`. Sparse integer MatrixMarket transfer checks order and count sums on both axes. Fixed settings are `batch=NULL, enableFast=FALSE, ncores=1, subsamplesize=1000`; returned scores must be finite and cell-aligned.
+### v2.0.6 — Model cleanup and optional detail exports
 
-Score argmax selects the root; subsequent DPT / Palantir still uses the joint representation. Explicit marker, min_umi, and auto routes remain. `cytotrace_n_top_genes` is read only for compatibility. Official failure raises an error rather than falling back to approximate CytoTRACE or fabricated global caches. See [cytotrace.py](CausalBridge/cytotrace.py), [cytotrace_runner.R](CausalBridge/cytotrace_runner.R), and [official root tests](tests/test_official_cytotrace.py).
+Remove shared NN and ATAC root-baseline scaling, standardize the hybrid entry point and add optional details with deduplicated results.
 
-#### v2.0-06: R, package libraries, and native libraries in one conda environment
+<details>
+<summary>Technical details</summary>
 
-Completed R installation instructions for the `CausalBridge` conda environment. Direct-source core dependencies include Matrix, HiClimR, ccaPP, and nnls; Rcpp / ncdf4 and transitive or native dependencies such as pcaPP, robustbase, and netCDF must resolve in the same environment. Installing the complete official R package additionally requires every `DESCRIPTION` Imports dependency, including Bioconductor `sva`. Sourcing pinned code and installing the full package differ; `pip install` does not install R dependencies.
+#### Removal of the shared NN and ATAC root-baseline scaling
 
-The runner prioritizes configured Rscript. Otherwise, conda Python uses its own environment's `bin/Rscript`; other environments search PATH. Package and native libraries bind to the selected Rscript environment's `lib/R/library` and `lib`, without mixing environments. Startup clears inherited `R_HOME`, `R_ARCH`, and `R_LIBS`, sets `R_LIBS_SITE` / `R_LIBS_USER` / `LD_LIBRARY_PATH`, and uses `--vanilla`.
+Deleted `legacy_pair_nn` / PairEmbeddingNN, old ATAC root-baseline scaling, and their dedicated parameters and modules. `model_mode` accepts only `saturating_hybrid`, also used when omitted. Torch remains for independent NN CPU training; inference uses NumPy. Independent `nn | spline | saturation` in both layers, fixed WT α, output bounds, RNA CP10k, and continuous ATAC depth normalization remain, as does official CytoTRACE root selection per cohort.
 
-R loading failures retain package names and underlying messages; Python exceptions include selected Rscript and R output to distinguish missing namespaces, shared libraries, and source-validation failures. Relative source paths resolve from the repository root. Replace or remove personal absolute runtime paths after copying configuration; YAML `$CONDA_PREFIX` has no guaranteed shell expansion. See [section 2](#installation) and [cytotrace.py](CausalBridge/cytotrace.py). Installation verified on one machine does not guarantee dependencies elsewhere.
+Old-model checkpoints are rejected. Choose a new checkpoint directory or back up and manually move invalid stages before rerunning. There is no automatic migration, result movement, or disk-cache deletion. Legacy gene-coordinate input, existing motif-candidate compatibility, and historical-result plotting each follow their own contracts; they do not imply that the old model remains executable.
 
-#### v2.0-07: Granger SSE and tail-probability corrections with screening retained
+#### Default summaries, optional details and deduplicated results
 
-Fixed squaring `lstsq` residuals again: the returned values already represent SSE and are now summed directly. The standard one-step model still compares reduced / full models containing self-lag on identical valid rows, using `F=((SSE_r-SSE_f)/1)/(SSE_f/(n-3))`. Tail probability now uses `scipy.stats.f.sf` to avoid numerical loss in `1-cdf`. The lag-0 ablation receives the same correction with n-2 degrees of freedom.
+Introduce `output.export_details`, defaulting to `false` in the library and the example configuration at the time. Enable it for nine categories of support/gates, response parameters/curves, event attribution, floor diagnostics and projection history/events. Summaries retain networks, perturbations, pathways, endpoints, fitting metrics and applicable cell-projection summaries. See [section9](#outputs) for classification. Export options do not change calculations or in-memory results.
 
-`delta_r2=1-SSE_f/SSE_r` is explicitly a partial R² form, not an ordinary R² difference. Low variance, low SSE, rank-deficiency, and valid-row skip rules remain. Current `fdr_bh`, base p threshold 0.01, effect threshold 0.1, soft-score weights 0.4 / 0.6, base composite threshold 0.3, and historical degrees-of-freedom scaling remain active.
+Formal results are saved once under the output root; `intermediate/` receives only tables lacking formal exports, and `save_intermediate` cannot override the detail switch. `perturbation_pathways.csv` is the unique canonical pathway filename. Old detail files/copies are not automatically cleaned, and caches, checkpoints and user paths are unchanged. Explicitly enable details for response curves, input support, bin histories or event trajectories. Regression coverage includes summary/detail exports, alias deduplication, identity columns, empty schemas and old-file preservation; see [test_export_details.py](tests/test_export_details.py).
 
-The correction can change selected edges and downstream perturbations. It does not biologically calibrate old thresholds or automatically recompute existing results. Correlated bins, candidate selection, and soft screening still limit overall BH interpretation; historical `is_causal` does not establish intervention causality. See [granger.py](CausalBridge/granger.py), [test_granger_sse.py](tests/test_granger_sse.py), and [section 5](#edges).
+</details>
 
-#### v2.0-08: Fixed smoothing retained; shared adaptive binning explicitly optional
+### v2.0.5 — Temporal pathways, plotting entry points and migration
 
-Fixed gaussian remains configured. `n_bins: 50` is an upper limit, adapted to cohort size and `min_cells_per_bin: 10`; `smooth_overlap_factor: 2` constrains overlap. Optional shared adaptive binning freezes one WT plan for Granger, both response fits, and perturbation, aligning centers, membership weights, and branch lag pairing instead of rebinning between stages.
+Unify temporal event links and radial pathway figures; document plotting precedence, migration steps and outstanding limitations.
 
-Currently `adaptive_binning.enabled: false`. When enabled, state / ess bandwidth and split_noise / none boundaries are available; the supplied settings are state, split_noise, rna. `state_modality: rna` restricts only state / boundary decisions and does not remove ATAC from joint pseudotime. Budgets of 5 PCs, 512 features per modality, and 2000000 total dense elements limit embedding cost; excess raises an error.
+<details>
+<summary>Technical details</summary>
 
-`binning_contexts.json` and per-context diagnostics retain ESS, support, bandwidths, and boundaries. Kernel participation, cell ESS, and effective kernel rank do not add independent samples; synthetic checks do not establish real-data optimality. Shared adaptive binning and hybrid do not support shuffle ablation. See [adaptive_binning.py](CausalBridge/adaptive_binning.py), [binning_adapter.py](CausalBridge/binning_adapter.py), and [section 4](#pseudotime).
+#### Temporal pathways, original radial figures, and configurable plotting
 
-#### v2.0-09: Independent response families and solver budgets in both layers
+`saturating_pathways.csv` / `perturbation_pathways.csv` share temporal event links: nonzero TF→peak events are linked to nonzero peak→gene events at the next gene bin in the same branch / context / intervention, explicitly marked `pathway_type=temporal_event_link, causal_claim=False`. TFs sharing a peak share its downstream RNA response; this is not exclusive TF RNA allocation. Complete `endpoint_delta_rna_log2fc` cannot be summed across paths; old `delta_r_raw_sum` / `delta_r_total` remain NaN / unavailable.
 
-Each layer accepts `spline | nn | saturation`; omitted keys default to saturation. The supplied file explicitly selects peak→gene NN and TF→peak spline. NN uses an independent network per relation, Torch CPU float64 training and NumPy inference, with tanh hidden activations and bounded sigmoid output. Current settings are `hidden_width: 4, epochs: 300, lr: 0.01, l2: 0.01, seed: 42, restarts: 1`.
+R restores and retains the original radial cluster hierarchy, with separate panels per selected gene. Detailed method notes below figures move to [FIGUERS_README.md](FIGUERS_README.md); figures retain necessary labels and status. Stable IDs join data, symbols label it, and `cluster_0` is corrected only when the corresponding cluster exists in results, avoiding accidental cluster merging.
 
-NN retains the best WT normalized-error-plus-parameter-penalty snapshot. Every WT row is used for training, without independent validation; fixed-epoch completion is not reported as solver convergence. saturation independently uses `max_nfev: 500, det_starts: 3`. Current `best_finite` retains finite valid budget-exhausted candidates while recording `solver_converged=False`, raw status, and evaluation count; numerical failure is not relabeled success.
+Input / output / gene selection support script-top manual configuration, environment variables, and CLI, with precedence CLI > `CAUSALBRIDGE_RESULT_DIR` / `CAUSALBRIDGE_OUTPUT_DIR` / `CAUSALBRIDGE_PATHWAY_GENES` > manual settings. `PATHWAY_GENES` / `--genes` and automatic TOP-N remain; `--genes __AUTO__` restores automatic selection. Default output is `figures_R` under the final input directory.
 
-spline budgets and restarts are independently configured and do not inherit saturation's best-finite policy. Family-specific curves / weights / metrics and checkpoints prevent NN weights or spline coefficients from being treated as saturation parameters. See [nn_hybrid.py](CausalBridge/nn_hybrid.py), [saturating_hybrid.py](CausalBridge/saturating_hybrid.py), and [saturating_transfer.py](CausalBridge/saturating_transfer.py).
+Python network plots likewise adapt to current schema, signed effects, units, and missing states, retaining legacy compatibility. Adapter and formatting fixes do not recompute or reallocate scientific effects. See [saturating_pathways.py](CausalBridge/saturating_pathways.py), [visualize_perturbation.R](visualize_perturbation.R), [plot_causal_network.py](plot_causal_network.py), and [test_visualization_schema.py](tests/test_visualization_schema.py).
 
-#### v2.0-10: Bounded splines, continuous tails, and experimental weak smoothing
+#### Dependencies, verification scope, migration, and unfinished issues
 
-Added cubic latent B-splines within standardized WT ranges, mapped through expit to existing output bounds, with value- and first-derivative-continuous (C1) exponential tails outside the range. Responses may be nonmonotonic and extrapolate toward learned finite plateaus without being forced to fixed L / U. Boundedness does not validate a distant KO mechanism.
+[requirements.txt](requirements.txt) includes threadpoolctl for worker thread limits and tqdm for progress. NumPy / SciPy support response evaluation and optimization. Torch remains the independent NN's CPU training dependency; fit workers limit its threads through `initialize_worker_torch`. Removing the shared NN does not remove Torch or require CUDA. R namespaces, native libraries, runtime selection, output schemas / strings / cluster labels have implementations and checks; this does not establish that every execution route is free of errors.
 
-Both layers currently use `smoothness: 1e-6, tail_scale: 0.5, internal_knots: 2, max_nfev: 1000, restarts: 3, seed: 42`. Single-relation objectives penalize latent curvature and boundary slopes, with 12-point Gauss quadrature per knot interval. Weak smoothing is provisional and experimental; production does not cross-validate every relation, so an optimal λ is not claimed.
+Before running, prepare Python and R dependencies. Afterward, inspect identity resolution, fit status, support diagnostics, and endpoint coverage to determine applicability to the target cells. Software behavior checks do not replace independent biological validation.
 
-Two- / three-input spline groups use natural cubic additive bases, centered pairwise interactions, and optional third-order interaction, with 6 / 11 parameters and `group_interaction_penalty: 0.01`. Group objectives also include Hessian / boundary-slope penalties and complexity cost relative to the frozen baseline. See [spline_hybrid.py](CausalBridge/spline_hybrid.py), [single-relation tests](tests/test_spline_hybrid.py), and [group-response tests](tests/test_spline_groups.py).
+For migration from an older run, check in this order:
 
-#### v2.0-11: Fixed WT weights, supported-group replacement, and explicit fallback
+1. Copy the full configuration; replace input / GTF / FASTA / target / output paths, verify the stable-ID column and assembly, replace or remove local R absolute paths, and prepare pinned official source and same-environment dependencies.
+2. Explicitly choose identity mode, ATAC representation, both response families, root / binning, and aggregation policy. The old shared NN and `joint_gene` are unsupported; `joint_knockout` still controls multiple-target KO.
+3. Set new `output.dir` / checkpoint roots to retain old results, or back up and move incompatible stages and invalid downstream files as directed. Do not edit schemas to bypass checks; old CSVs are not moved automatically.
+4. Check identity / target resolution, HVGs, and cohort-root provenance first, then edges, fit status, group gates, endpoints, and coverage. Compare signed effects across runs only over explicitly consistent valid cell and gene scopes.
 
-Singles are scored on WT to determine within-target α. Failed relations are removed before weights are recomputed over remaining WT relations. Perturbation freezes α without renormalizing “currently active inputs”; filtering one event does not inflate the remaining inputs' weights. Changes use `Σα_j[f_j(x'_j)-f_j(x_j)]`.
+The [known issues in section 12](#validation) remain: narrow-input NN group exceptions, PCA “full rank” detection possibly disabling residual OOD, incomplete reference fingerprints, and at least `1e-6` filtering despite `min_delta_threshold: 0`. Constant pseudotime, all-small branches, and some strict_complete diagnostic boundaries remain unfixed. These are future audit items, not resolved v2.0 features. Training / validation and snapshot-audit issues in the old shared NN ceased to be current-model limitations when that implementation was removed.
 
-Two- / three-input groups become candidates only after passing row-count, parameter-count, effective-kernel-row, cell-ESS, geometry, penalized-gain, and multistart-spread gates. Base thresholds include 24 rows, group cell ESS 30, query cell ESS 10, effective rows 12, condition number at most 10000, and gain 0.05. NN / spline also require at least twice as many rows as parameters; kernel support does not replace genuinely independent cells.
+</details>
 
-A query group replaces the entire target batch of singles only if it covers all changed inputs and both WT and intervention satisfy branch-local support. Group corrections are not added on top. Otherwise, routing falls back to singles and records why. One changed input can still use a covering, supported group. Rejection of every group means data and thresholds supply insufficient support. See [saturating_transfer.py](CausalBridge/saturating_transfer.py), [changed-input tests](tests/test_saturating_changed_inputs.py), and [failed-relation tests](tests/test_saturating_failed_relations.py).
+### v2.0.4 — Stage contracts, cache provenance and output management
 
-#### v2.0-12: Continuous ATAC inputs, full depth, and representation boundaries
+Refine Step4/5/6 dependencies and motif provenance, add parallel response fitting/progress and unify output roots.
 
-Added a continuous model view enabled by `preprocess.atac_depth_normalization.enabled: true`. Before QC it saves original integer counts and per-cell depth D over every original input peak. Model values are `log1p(10000*C/D)`. Peak filtering, cluster subsetting, and intervention do not recompute D, avoiding passive increases in other peaks after deletion. D remains a peak-count proxy rather than measured total fragments.
+<details>
+<summary>Technical details</summary>
 
-Reference QC retains `atac.binarize: true`, separating continuous model values from binary reference processing. The continuous upper bound is `min(log1p(S), WTmax+0.25*WTspan)`, without [0,1] clipping. Added original-axis / depth / retained-count and per-cell provenance checks. Conflicting raw layers and zero depth raise errors. Custom subsets must be finalized against the complete source; slicing cannot fabricate proof.
-
-Relative peak intervention applies strength to normalized counts before log1p; absolute uses current model units. Disabling the continuous view still permits the binary route, but checkpoints from another representation cannot be reused. No current response family uses root-baseline piecewise scaling. See [atac_normalization.py](CausalBridge/atac_normalization.py) and [test_atac_normalization.py](tests/test_atac_normalization.py).
-
-#### v2.0-13: Propagation constraints, joint KO, and removed entry points
-
-Retained bin-wise forward propagation, TF lag, advancement to the next gene bin, and executable TF cascades along target TF→peak→gene closure. Current `propagation_rounds: 1`; unlimited subnetworks still have final-edge / traversal-candidate budgets of 250000 and explicitly fail on excess. Hybrid requires `log_accumulation: true` so old propagation switches cannot silently select another numerical route.
-
-`joint_gene` and the old shared NN model mode are removed; **multiple-target joint KO through `perturbation.joint_knockout: true` remains supported**. Direct gene targets are strength-constrained at cell CP10k level and not reported again as downstream responses. TARGET / proxy TFs are unsupported. See [perturbation.py](CausalBridge/perturbation.py), [saturating_perturbation.py](CausalBridge/saturating_perturbation.py), and [propagation-depth tests](tests/test_propagation_depth.py).
-
-#### v2.0-14: RNA units, cell endpoints, and effect fields
-
-Explicitly distinguished cell CP10k (L0), `log1p(CP10k)` (L1; smoothed model state and TF→peak RNA input), and additional `log1p(L1)` (L2; current peak→gene target). Native L2 changes accumulate before conversion to L1, nonnegative flooring, and cell CP10k reconstruction. This reduces bias from transforming and adding each edge separately, but is neither an exact binning inverse nor raw-UMI recovery.
-
-Final log2FC uses reconstructed WT / perturbed cell CP10k means. Bin means or native contributions from one layer cannot replace it. Merged `delta_rna_signed` retains direction, while `delta_rna` is absolute effect / ranking. Where available, `l0_log2fc_unclipped` and `display_clipped` distinguish unclipped effects from display clipping.
-
-`l1_floor_diagnostics.csv` and endpoint status preserve flooring, failure, and unavailability evidence. Nonpositive means, nonfinite values, and invalid support are not ordinary zero effects. Direct KO constraints and downstream exclusion need separate interpretation; absence of downstream records does not imply KO was not applied. See [saturating_perturbation.py](CausalBridge/saturating_perturbation.py) and the [section 8 unit table](#endpoints).
-
-#### v2.0-15: Valid-cell mean aggregation, coverage, and unchanged baselines
-
-Added and enabled `aggregation_policy: valid_cell_means` in the supplied configuration. For each gene, WT and perturbed means use the same valid context / cell subset, weighted by cell count before taking a log2 ratio. Quality-filtered, missing-endpoint, failed, and nonpositive-mean contexts are excluded from both sides, avoiding cluster-log2FC averaging or zero-filling missing effects.
-
-Exports include `aggregation_scope=full/partial/unavailable`, used / total / excluded cells, cell fraction, context counts, and explicit exclusions. Valid unaffected genes in the quality-pruned network can provide WT=perturbed unchanged baselines, with assumptions and context counts listed separately. partial represents only that valid subset; cross-condition comparisons should verify the same cell set.
-
-The missing-key policy remains `strict_complete`, differing from the explicit current setting; some diagnostic boundaries remain unfixed. See [run.py](CausalBridge/run.py), [test_saturating_merge.py](tests/test_saturating_merge.py), and [test_saturating_merge_config.py](tests/test_saturating_merge_config.py).
-
-#### v2.0-16: Staged checkpoints and motif-provenance caches
+#### Staged checkpoints and motif-provenance caches
 
 Identity / hybrid / adaptive routes establish Step 4 / 5 / 6 contracts checking schema, model / response families, root selection, HVGs / canonical axes, coordinates, numerical inputs, configuration dependencies, references, and source signatures. Upstream changes invalidate affected downstream stages. Spline target / registry schemas are v2; old v1, other-family, or unsigned historical caches cannot be reused by editing version numbers. There is no automatic remap or migration.
 
@@ -1098,15 +1333,15 @@ Raw motif caches store complete pre-top-N threshold-passing hits and successful 
 
 Incompatibility produces stage-rerun guidance; checkpoints from removed models are explicitly rejected. Choose a new checkpoint directory or back up and move the indicated invalid stage and downstream files. The program does not move / delete old results or disk caches. See [run.py](CausalBridge/run.py), [kinetics.py](CausalBridge/kinetics.py), [staged tests](tests/test_staged_checkpoints.py), [resource-provenance tests](tests/test_resource_provenance.py), and [shared-motif tests](tests/test_shared_motif_cache.py).
 
-#### v2.0-17: Parallel fitting, progress, and bounded computational optimizations
+#### Parallel fitting, progress, and bounded computational optimizations
 
-Current `atac_to_rna.saturating_hybrid.workers: 24` schedules Step 5 / 6 fitting. `rna_to_atac.motif_scan_workers: 24` controls only missing main motif scans, not family scans, NN epochs, or Step 8. Actual processes are limited by tasks / CPUs; complete cache hits do not create pools. Fit workers limit underlying threads through threadpoolctl to prevent process × BLAS oversubscription. Step 8 remains single-process.
+At the time, `atac_to_rna.saturating_hybrid.workers: 24` scheduled Step5/6 fitting and `rna_to_atac.motif_scan_workers: 24` controlled missing primary motif scans only, excluding family scans, NN epochs and Step8. Effective concurrency depends on tasks/CPU; complete scan coverage creates no pool. threadpoolctl limits underlying fitting threads to avoid process×BLAS oversubscription. These fitting workers do not control Step8; per-cluster parallel simulation is grouped under v2.1.0.
 
 Added fitting / scan progress, serial / parallel consistency checks, and exception propagation. Worker failure aborts without saving a partial registry as a complete success. Python multiprocessing requires an `__main__` guard; daemons use workers=1. Startup cost can outweigh gains on small jobs. Worker count normally does not change scientific result contracts, while restart / solver budgets require separate validation.
 
 Endpoint reuse, vectorized cell means, and column-wise projection-history construction reduce repeated calculations and temporary objects. See [saturating_perturbation.py](CausalBridge/saturating_perturbation.py), [saturating_projection.py](CausalBridge/saturating_projection.py), [parallel tests](tests/test_saturating_parallel.py), and [progress tests](tests/test_terminal_progress.py).
 
-#### v2.0-18: Unified output roots, table schemas, and provenance files
+#### Unified output roots, table schemas, and provenance files
 
 Every mode writes directly to `output.dir`, without automatic gene_ids / joint / atac / response-family namespaces. `checkpoint_dir: null` uses `checkpoints` there; per-cluster models use corresponding `cluster_N` subdirectories. Users must explicitly separate roots to retain runs. Same-named files can be overwritten; stale condition files are not cleaned automatically, and historical nested directories are not searched.
 
@@ -1123,40 +1358,167 @@ Every mode writes directly to `output.dir`, without automatic gene_ids / joint /
 
 Applicable schemas are retained for empty exports, so file existence alone does not establish valid effects. See [section 9](#outputs) for optional projection, ATAC, BED, and intermediate files. Model-reference H5AD cannot replace official CytoTRACE raw all-gene counts. See [io.py](CausalBridge/io.py), [test_output_paths.py](tests/test_output_paths.py), and [test_h5ad_string_compat.py](tests/test_h5ad_string_compat.py).
 
-#### v2.0-19: Temporal pathways, original radial figures, and configurable plotting
+</details>
 
-`saturating_pathways.csv` / `perturbation_pathways.csv` share temporal event links: nonzero TF→peak events are linked to nonzero peak→gene events at the next gene bin in the same branch / context / intervention, explicitly marked `pathway_type=temporal_event_link, causal_claim=False`. TFs sharing a peak share its downstream RNA response; this is not exclusive TF RNA allocation. Complete `endpoint_delta_rna_log2fc` cannot be summed across paths; old `delta_r_raw_sum` / `delta_r_total` remain NaN / unavailable.
+### v2.0.3 — Continuous ATAC, cell endpoints and cross-cluster aggregation
 
-R restores and retains the original radial cluster hierarchy, with separate panels per selected gene. Detailed method notes below figures move to [FIGUERS_README.md](FIGUERS_README.md); figures retain necessary labels and status. Stable IDs join data, symbols label it, and `cluster_0` is corrected only when the corresponding cluster exists in results, avoiding accidental cluster merging.
+Use full-input depth for continuous ATAC, define propagation constraints and RNA units, reconstruct cell endpoints and aggregate valid-cell means.
 
-Input / output / gene selection support script-top manual configuration, environment variables, and CLI, with precedence CLI > `CAUSALBRIDGE_RESULT_DIR` / `CAUSALBRIDGE_OUTPUT_DIR` / `CAUSALBRIDGE_PATHWAY_GENES` > manual settings. `PATHWAY_GENES` / `--genes` and automatic TOP-N remain; `--genes __AUTO__` restores automatic selection. Default output is `figures_R` under the final input directory.
+<details>
+<summary>Technical details</summary>
 
-Python network plots likewise adapt to current schema, signed effects, units, and missing states, retaining legacy compatibility. Adapter and formatting fixes do not recompute or reallocate scientific effects. See [saturating_pathways.py](CausalBridge/saturating_pathways.py), [visualize_perturbation.R](visualize_perturbation.R), [plot_causal_network.py](plot_causal_network.py), and [test_visualization_schema.py](tests/test_visualization_schema.py).
+#### Continuous ATAC inputs, full depth, and representation boundaries
 
-#### v2.0-20: Dependencies, verification scope, migration, and unfinished issues
+Added a continuous model view enabled by `preprocess.atac_depth_normalization.enabled: true`. Before QC it saves original integer counts and per-cell depth D over every original input peak. Model values are `log1p(10000*C/D)`. Peak filtering, cluster subsetting, and intervention do not recompute D, avoiding passive increases in other peaks after deletion. D remains a peak-count proxy rather than measured total fragments.
 
-[requirements.txt](requirements.txt) includes threadpoolctl for worker thread limits and tqdm for progress. NumPy / SciPy support response evaluation and optimization. Torch remains the independent NN's CPU training dependency; fit workers limit its threads through `initialize_worker_torch`. Removing the shared NN does not remove Torch or require CUDA. R namespaces, native libraries, runtime selection, output schemas / strings / cluster labels have implementations and checks; this does not establish that every execution route is free of errors.
+Reference QC retains `atac.binarize: true`, separating continuous model values from binary reference processing. The continuous upper bound is `min(log1p(S), WTmax+0.25*WTspan)`, without [0,1] clipping. Added original-axis / depth / retained-count and per-cell provenance checks. Conflicting raw layers and zero depth raise errors. Custom subsets must be finalized against the complete source; slicing cannot fabricate proof.
 
-Before running, prepare Python and R dependencies. Afterward, inspect identity resolution, fit status, support diagnostics, and endpoint coverage to determine applicability to the target cells. Software behavior checks do not replace independent biological validation.
+Relative peak intervention applies strength to normalized counts before log1p; absolute uses current model units. Disabling the continuous view still permits the binary route, but checkpoints from another representation cannot be reused. No current response family uses root-baseline piecewise scaling. See [atac_normalization.py](CausalBridge/atac_normalization.py) and [test_atac_normalization.py](tests/test_atac_normalization.py).
 
-For migration from an older run, check in this order:
+#### Propagation constraints, joint KO, and removed entry points
 
-1. Copy the full configuration; replace input / GTF / FASTA / target / output paths, verify the stable-ID column and assembly, replace or remove local R absolute paths, and prepare pinned official source and same-environment dependencies.
-2. Explicitly choose identity mode, ATAC representation, both response families, root / binning, and aggregation policy. The old shared NN and `joint_gene` are unsupported; `joint_knockout` still controls multiple-target KO.
-3. Set new `output.dir` / checkpoint roots to retain old results, or back up and move incompatible stages and invalid downstream files as directed. Do not edit schemas to bypass checks; old CSVs are not moved automatically.
-4. Check identity / target resolution, HVGs, and cohort-root provenance first, then edges, fit status, group gates, endpoints, and coverage. Compare signed effects across runs only over explicitly consistent valid cell and gene scopes.
+Retained bin-wise forward propagation, TF lag, advancement to the next gene bin, and executable TF cascades along target TF→peak→gene closure. Current `propagation_rounds: 1`; unlimited subnetworks still have final-edge / traversal-candidate budgets of 250000 and explicitly fail on excess. Hybrid requires `log_accumulation: true` so old propagation switches cannot silently select another numerical route.
 
-The [known issues in section 12](#validation) remain: narrow-input NN group exceptions, PCA “full rank” detection possibly disabling residual OOD, incomplete reference fingerprints, and at least `1e-6` filtering despite `min_delta_threshold: 0`. Constant pseudotime, all-small branches, and some strict_complete diagnostic boundaries remain unfixed. These are future audit items, not resolved v2.0 features. Training / validation and snapshot-audit issues in the old shared NN ceased to be current-model limitations when that implementation was removed.
+`joint_gene` and the old shared NN model mode are removed; **multiple-target joint KO through `perturbation.joint_knockout: true` remains supported**. Direct gene targets are strength-constrained at cell CP10k level and not reported again as downstream responses. TARGET / proxy TFs are unsupported. See [perturbation.py](CausalBridge/perturbation.py), [saturating_perturbation.py](CausalBridge/saturating_perturbation.py), and [propagation-depth tests](tests/test_propagation_depth.py).
 
-Python `__version__` is `2.0.0`. All 51 historical version records and technical updates from v1.40 through v0.3 follow. They describe behavior at the time; old models, root algorithms, or thresholds do not override the current main text.
+#### RNA units, cell endpoints, and effect fields
 
-#### v2.0-21: Removal of the shared NN and ATAC root-baseline scaling
+Explicitly distinguished cell CP10k (L0), `log1p(CP10k)` (L1; smoothed model state and TF→peak RNA input), and additional `log1p(L1)` (L2; current peak→gene target). Native L2 changes accumulate before conversion to L1, nonnegative flooring, and cell CP10k reconstruction. This reduces bias from transforming and adding each edge separately, but is neither an exact binning inverse nor raw-UMI recovery.
 
-Deleted `legacy_pair_nn` / PairEmbeddingNN, old ATAC root-baseline scaling, and their dedicated parameters and modules. `model_mode` accepts only `saturating_hybrid`, also used when omitted. Torch remains for independent NN CPU training; inference uses NumPy. Independent `nn | spline | saturation` in both layers, fixed WT α, output bounds, RNA CP10k, and continuous ATAC depth normalization remain, as does official CytoTRACE root selection per cohort.
+Final log2FC uses reconstructed WT / perturbed cell CP10k means. Bin means or native contributions from one layer cannot replace it. Merged `delta_rna_signed` retains direction, while `delta_rna` is absolute effect / ranking. Where available, `l0_log2fc_unclipped` and `display_clipped` distinguish unclipped effects from display clipping.
 
-Old-model checkpoints are rejected. Choose a new checkpoint directory or back up and manually move invalid stages before rerunning. There is no automatic migration, result movement, or disk-cache deletion. Legacy gene-coordinate input, existing motif-candidate compatibility, and historical-result plotting each follow their own contracts; they do not imply that the old model remains executable.
+`l1_floor_diagnostics.csv` and endpoint status preserve flooring, failure, and unavailability evidence. Nonpositive means, nonfinite values, and invalid support are not ordinary zero effects. Direct KO constraints and downstream exclusion need separate interpretation; absence of downstream records does not imply KO was not applied. See [saturating_perturbation.py](CausalBridge/saturating_perturbation.py) and the [section 8 unit table](#endpoints).
 
----
+#### Valid-cell mean aggregation, coverage, and unchanged baselines
+
+Added and enabled `aggregation_policy: valid_cell_means` in the supplied configuration. For each gene, WT and perturbed means use the same valid context / cell subset, weighted by cell count before taking a log2 ratio. Quality-filtered, missing-endpoint, failed, and nonpositive-mean contexts are excluded from both sides, avoiding cluster-log2FC averaging or zero-filling missing effects.
+
+Exports include `aggregation_scope=full/partial/unavailable`, used / total / excluded cells, cell fraction, context counts, and explicit exclusions. Valid unaffected genes in the quality-pruned network can provide WT=perturbed unchanged baselines, with assumptions and context counts listed separately. partial represents only that valid subset; cross-condition comparisons should verify the same cell set.
+
+The missing-key policy remains `strict_complete`, differing from the explicit current setting; some diagnostic boundaries remain unfixed. See [run.py](CausalBridge/run.py), [test_saturating_merge.py](tests/test_saturating_merge.py), and [test_saturating_merge_config.py](tests/test_saturating_merge_config.py).
+
+</details>
+
+### v2.0.2 — Independent response families and frozen WT weights
+
+Choose nn/spline/saturation separately for each layer, add bounded splines and supported-group gates, and freeze WT alpha during perturbation.
+
+<details>
+<summary>Technical details</summary>
+
+#### Independent response families and solver budgets in both layers
+
+Each layer accepts `spline | nn | saturation`; omitted keys default to saturation. The supplied file explicitly selects peak→gene NN and TF→peak spline. NN uses an independent network per relation, Torch CPU float64 training and NumPy inference, with tanh hidden activations and bounded sigmoid output. Current settings are `hidden_width: 4, epochs: 300, lr: 0.01, l2: 0.01, seed: 42, restarts: 1`.
+
+NN retains the best WT normalized-error-plus-parameter-penalty snapshot. Every WT row is used for training, without independent validation; fixed-epoch completion is not reported as solver convergence. saturation independently uses `max_nfev: 500, det_starts: 3`. Current `best_finite` retains finite valid budget-exhausted candidates while recording `solver_converged=False`, raw status, and evaluation count; numerical failure is not relabeled success.
+
+spline budgets and restarts are independently configured and do not inherit saturation's best-finite policy. Family-specific curves / weights / metrics and checkpoints prevent NN weights or spline coefficients from being treated as saturation parameters. See [nn_hybrid.py](CausalBridge/nn_hybrid.py), [saturating_hybrid.py](CausalBridge/saturating_hybrid.py), and [saturating_transfer.py](CausalBridge/saturating_transfer.py).
+
+#### Bounded splines, continuous tails, and experimental weak smoothing
+
+Added cubic latent B-splines within standardized WT ranges, mapped through expit to existing output bounds, with value- and first-derivative-continuous (C1) exponential tails outside the range. Responses may be nonmonotonic and extrapolate toward learned finite plateaus without being forced to fixed L / U. Boundedness does not validate a distant KO mechanism.
+
+Both layers currently use `smoothness: 1e-6, tail_scale: 0.5, internal_knots: 2, max_nfev: 1000, restarts: 3, seed: 42`. Single-relation objectives penalize latent curvature and boundary slopes, with 12-point Gauss quadrature per knot interval. Weak smoothing is provisional and experimental; production does not cross-validate every relation, so an optimal λ is not claimed.
+
+Two- / three-input spline groups use natural cubic additive bases, centered pairwise interactions, and optional third-order interaction, with 6 / 11 parameters and `group_interaction_penalty: 0.01`. Group objectives also include Hessian / boundary-slope penalties and complexity cost relative to the frozen baseline. See [spline_hybrid.py](CausalBridge/spline_hybrid.py), [single-relation tests](tests/test_spline_hybrid.py), and [group-response tests](tests/test_spline_groups.py).
+
+#### Fixed WT weights, supported-group replacement, and explicit fallback
+
+Singles are scored on WT to determine within-target α. Failed relations are removed before weights are recomputed over remaining WT relations. Perturbation freezes α without renormalizing “currently active inputs”; filtering one event does not inflate the remaining inputs' weights. Changes use `Σα_j[f_j(x'_j)-f_j(x_j)]`.
+
+Two- / three-input groups become candidates only after passing row-count, parameter-count, effective-kernel-row, cell-ESS, geometry, penalized-gain, and multistart-spread gates. Base thresholds include 24 rows, group cell ESS 30, query cell ESS 10, effective rows 12, condition number at most 10000, and gain 0.05. NN / spline also require at least twice as many rows as parameters; kernel support does not replace genuinely independent cells.
+
+A query group replaces the entire target batch of singles only if it covers all changed inputs and both WT and intervention satisfy branch-local support. Group corrections are not added on top. Otherwise, routing falls back to singles and records why. One changed input can still use a covering, supported group. Rejection of every group means data and thresholds supply insufficient support. See [saturating_transfer.py](CausalBridge/saturating_transfer.py), [changed-input tests](tests/test_saturating_changed_inputs.py), and [failed-relation tests](tests/test_saturating_failed_relations.py).
+
+</details>
+
+### v2.0.1 — Granger numerical corrections and shared binning
+
+Correct Granger SSE and tail probabilities, retain fixed Gaussian binning and offer an optional shared WT adaptive plan.
+
+<details>
+<summary>Technical details</summary>
+
+#### Granger SSE and tail-probability corrections with screening retained
+
+Fixed squaring `lstsq` residuals again: the returned values already represent SSE and are now summed directly. The standard one-step model still compares reduced / full models containing self-lag on identical valid rows, using `F=((SSE_r-SSE_f)/1)/(SSE_f/(n-3))`. Tail probability now uses `scipy.stats.f.sf` to avoid numerical loss in `1-cdf`. The lag-0 ablation receives the same correction with n-2 degrees of freedom.
+
+`delta_r2=1-SSE_f/SSE_r` is explicitly a partial R² form, not an ordinary R² difference. Low variance, low SSE, rank-deficiency, and valid-row skip rules remain. Current `fdr_bh`, base p threshold 0.01, effect threshold 0.1, soft-score weights 0.4 / 0.6, base composite threshold 0.3, and historical degrees-of-freedom scaling remain active.
+
+The correction can change selected edges and downstream perturbations. It does not biologically calibrate old thresholds or automatically recompute existing results. Correlated bins, candidate selection, and soft screening still limit overall BH interpretation; historical `is_causal` does not establish intervention causality. See [granger.py](CausalBridge/granger.py), [test_granger_sse.py](tests/test_granger_sse.py), and [section 5](#edges).
+
+#### Fixed smoothing retained; shared adaptive binning explicitly optional
+
+Fixed gaussian remains configured. `n_bins: 50` is an upper limit, adapted to cohort size and `min_cells_per_bin: 10`; `smooth_overlap_factor: 2` constrains overlap. Optional shared adaptive binning freezes one WT plan for Granger, both response fits, and perturbation, aligning centers, membership weights, and branch lag pairing instead of rebinning between stages.
+
+Currently `adaptive_binning.enabled: false`. When enabled, state / ess bandwidth and split_noise / none boundaries are available; the supplied settings are state, split_noise, rna. `state_modality: rna` restricts only state / boundary decisions and does not remove ATAC from joint pseudotime. Budgets of 5 PCs, 512 features per modality, and 2000000 total dense elements limit embedding cost; excess raises an error.
+
+`binning_contexts.json` and per-context diagnostics retain ESS, support, bandwidths, and boundaries. Kernel participation, cell ESS, and effective kernel rank do not add independent samples; synthetic checks do not establish real-data optimality. Shared adaptive binning and hybrid do not support shuffle ablation. See [adaptive_binning.py](CausalBridge/adaptive_binning.py), [binning_adapter.py](CausalBridge/binning_adapter.py), and [section 4](#pseudotime).
+
+</details>
+
+### v2.0.0 — Stable gene identity and independent reference foundations
+
+Establish GTF stable IDs, strand-aware TSS, independent reference clustering, actual-HVG exports and official CytoTRACE root selection per cohort.
+
+<details>
+<summary>Technical details</summary>
+
+#### Enabled route and principal behavior changes
+
+This release connects gene identity, reference views, response functions, cell endpoints, and provenance checks into an auditable workflow. The table describes explicit settings in the supplied [config.yaml](config.yaml). Compatibility defaults for omitted keys can differ; see [section 11](#configuration).
+
+| Module | Historical behavior / compatibility route | Current configuration and changes |
+|---|---|---|
+| Gene axis | Input names and legacy coordinates remain optional | `gtf_gene_id`: stable-ID computation, symbol display, authoritative GTF coordinates |
+| Root selection | Historical global mapping or approximate scores | Official CytoTRACE 0.3.1 in each actual modeling cohort |
+| Response | Legacy shared PairEmbeddingNN | Hybrid; `nn` for peak→gene, `spline` for TF→peak |
+| ATAC | Binary open proportions | Continuous log1p model view normalized by full input depth |
+| Binning | Fixed Gaussian smoothing | Fixed gaussian remains enabled; shared adaptive plan explicitly disabled |
+| Aggregation | Historical effect aggregation | `valid_cell_means`, reporting the same valid cell set and exclusion reasons |
+| Result directory | Previously mode-dependent directory conventions | Direct `output.dir`; users explicitly separate runs |
+
+`saturating_hybrid` is the only supported model and the missing-key default. It names the singles / supported-group workflow and does not require saturation in both layers. Legacy coordinate compatibility for gene identity is distinct from the removed model. After changing identity axes, ATAC representation, roots, or response families, revalidate scientific checkpoints rather than reusing old curves and effect tables directly.
+
+#### GTF stable IDs, duplicate symbols, and complete identity audits
+
+Added `input.gene_identity_mode: gtf_gene_id`, auditing all input features before model filtering and removing only trailing numeric stable-ID versions. Collisions after normalizing versioned and unversioned IDs raise explicit errors rather than silently summing counts. Features unmatched to GTF retain filtering reasons; original H5AD files remain unchanged.
+
+Model edge keys, fitting, projection feature axes, and cross-cluster merging use stable IDs. CSV saving adds name and display fields only in copies. Different IDs sharing a name receive fixed numbered aliases ordered by stable ID in the complete reference; HVG or cluster subsets do not renumber them. Motifs still match native symbols and expand to allowed IDs.
+
+Targets and explicit root markers accept stable IDs, versioned IDs, unique symbols, and resolved numbered aliases. Ambiguous symbols must be specified explicitly. Added `gene_identity.csv`, `gene_filter_report.csv`, `gene_target_resolution.csv`, and `gene_identity_metadata.json` for identity, eligibility filtering, target resolution, and provenance. See [gene_identity.py](CausalBridge/gene_identity.py), [identity tests](tests/test_gene_identity.py), and [model identity tests](tests/test_gene_identity_modeling.py).
+
+#### Authoritative gene spans, coordinate conversion, and strand-aware TSS
+
+GTF mode uses the complete gene-record span rather than incomplete or inconsistent input start / end coordinates. It converts 1-based closed intervals to 0-based half-open intervals and retains old coordinates in `original_*`. Positive-strand TSS is the converted start; negative-strand TSS is the converted end minus one.
+
+This directly changes peak-midpoint–TSS distance candidates, especially on the negative strand; the current threshold is 200000 bp. Coordinate corrections require candidates and downstream models to be recomputed. This remains a single gene-level TSS approximation, without transcript-specific promoters; mixed unknown-strand legacy fallback limitations remain. See [gene_identity.py](CausalBridge/gene_identity.py) and [test_strand_tss.py](tests/test_strand_tss.py).
+
+#### Independent reference clustering, model normalization, and actual-HVG export
+
+To prevent model GTF eligibility from redefining reference clusters, existing QC / HVG / target retention and RNA clustering first run on an original-RNA copy before GTF filtering. Model RNA is prepared independently. ATAC is preprocessed once. The model does not repeat cell QC after reducing its gene axis; it strictly aligns reference barcodes and separately records reference-coordinate and model-axis provenance.
+
+Model normalization denominators and raw-count HVG ranking use **all GTF-eligible genes**, followed by the current 3000 HVGs and required targets / root markers passing expression QC. Additional non-HVG retention does not set `highly_variable` to true. Step 6 TF-presence checks can access the full eligible input axis, avoiding confusion between “non-HVG” and “absent from RNA input.”
+
+`hvg_genes.csv` is independent of `save_intermediate` and contains only actual HVGs, with `gene_id`, `gene_name`, and available original names. Reference `X_pca` / `X_umap` provenance is recorded in `uns['clustering_reference']`; these cannot be read as PCA loadings on the model stable-ID axis. See [reference_clustering.py](CausalBridge/reference_clustering.py), [run.py](CausalBridge/run.py), and [HVG-order checks](tests/test_identity_hvg_order.py).
+
+#### Official CytoTRACE per cohort and complete raw-RNA transfer
+
+Replaced approximate scores and global score mapping. Each actual modeling cluster / lineage runs official GCS→NNLS→diffusion on QC-retained cohort cells × raw RNA counts for **all genes**. Zero-expression genes remain for official internal filtering. Model HVGs, model log expression, and unverified input `obs` scores are not used. Separate cohort runs do not establish a common global score scale.
+
+Pinned official 2020 / 0.3.1 source commit `f4ff6c0ab93cc704eef44e17adcd5c6baf09703a`, verifying `R/CytoTRACE.R` SHA256 `7dafcfa42c792eaffe1048f4716cb54105b31f2ad01c4f0c26868c10593b155d`. Sparse integer MatrixMarket transfer checks order and count sums on both axes. Fixed settings are `batch=NULL, enableFast=FALSE, ncores=1, subsamplesize=1000`; returned scores must be finite and cell-aligned.
+
+Score argmax selects the root; subsequent DPT / Palantir still uses the joint representation. Explicit marker, min_umi, and auto routes remain. `cytotrace_n_top_genes` is read only for compatibility. Official failure raises an error rather than falling back to approximate CytoTRACE or fabricated global caches. See [cytotrace.py](CausalBridge/cytotrace.py), [cytotrace_runner.R](CausalBridge/cytotrace_runner.R), and [official root tests](tests/test_official_cytotrace.py).
+
+#### R, package libraries, and native libraries in one conda environment
+
+Completed R installation instructions for the `CausalBridge` conda environment. Direct-source core dependencies include Matrix, HiClimR, ccaPP, and nnls; Rcpp / ncdf4 and transitive or native dependencies such as pcaPP, robustbase, and netCDF must resolve in the same environment. Installing the complete official R package additionally requires every `DESCRIPTION` Imports dependency, including Bioconductor `sva`. Sourcing pinned code and installing the full package differ; `pip install` does not install R dependencies.
+
+The runner prioritizes configured Rscript. Otherwise, conda Python uses its own environment's `bin/Rscript`; other environments search PATH. Package and native libraries bind to the selected Rscript environment's `lib/R/library` and `lib`, without mixing environments. Startup clears inherited `R_HOME`, `R_ARCH`, and `R_LIBS`, sets `R_LIBS_SITE` / `R_LIBS_USER` / `LD_LIBRARY_PATH`, and uses `--vanilla`.
+
+R loading failures retain package names and underlying messages; Python exceptions include selected Rscript and R output to distinguish missing namespaces, shared libraries, and source-validation failures. Relative source paths resolve from the repository root. Replace or remove personal absolute runtime paths after copying configuration; YAML `$CONDA_PREFIX` has no guaranteed shell expansion. See [section 2](#installation) and [cytotrace.py](CausalBridge/cytotrace.py). Installation verified on one machine does not guarantee dependencies elsewhere.
+
+</details>
 
 ### v1.40 — Optional shared binning, motif-evidence caches, and staged provenance tracking (2026-10-07)
 

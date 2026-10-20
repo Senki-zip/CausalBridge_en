@@ -1,6 +1,5 @@
 """Unrelated shared TF inputs must remain exact WT under direct RNA clamps."""
 import copy
-from types import SimpleNamespace
 
 import anndata as ad
 import numpy as np
@@ -48,17 +47,18 @@ def test_public_ko_preserves_unselected_shared_tf_inputs_exactly(continuous,smoo
     assert np.any(np.log1p(np.expm1(cells[:,2])) != cells[:,2])
     snapshot=transfer._snapshot(rna,atac,pt,cfg)
     calls=[]
-    proxy=SimpleNamespace(**core.__dict__)
-    def checked(model,old,new,**kwargs):
+    actual_predict=simulation._SinglesPlan.predict
+    def checked(plan,position,new):
+        model=plan.model
+        old=plan.old[position:position+1]
         if model.target_id=="p0":
-            assert kwargs["changed_inputs"]==(("A",0),)
+            assert plan.declared=={("A",0)}
             for index,key in enumerate(model.input_keys):
                 if key[0]=="C":
                     np.testing.assert_array_equal(new[:,index],old[:,index])
             calls.append(True)
-        return core.predict_delta(model,old,new,**kwargs)
-    proxy.predict_delta=checked
-    monkeypatch.setattr(simulation,"core",proxy)
+        return actual_predict(plan,position,new)
+    monkeypatch.setattr(simulation._SinglesPlan,"predict",checked)
     result=perturbation.propagate_perturbation(["A"],rna,atac,pt,edges,table,screen,cfg,
         transfer_models=genes,tf_model_registry=tfs)
     assert calls and not result["atac_unavailable_mask"].any()
@@ -75,6 +75,24 @@ def test_public_ko_preserves_unselected_shared_tf_inputs_exactly(continuous,smoo
         transfer_models=genes,tf_model_registry=tfs)
     np.testing.assert_array_equal(zero["rna_state_history"],snapshot["R"])
     np.testing.assert_array_equal(zero["atac_state_history"],snapshot["A"])
+
+
+@pytest.mark.parametrize("mutation",["response_family","schema","source_signature"])
+def test_public_fixed_adapter_preserves_registry_validation(mutation):
+    rna,atac,pt,edges,screen,cfg,table,genes,tfs=fitted(False,"hard")
+    if mutation=="response_family":
+        cfg=copy.deepcopy(cfg)
+        cfg.setdefault("rna_to_atac",{})["response_model"]="spline"
+    else:
+        tfs=copy.deepcopy(tfs)
+        if mutation=="schema":
+            tfs["schema"]=tfs["schema_version"]="hybrid_saturation_tf_peak_local_registry_v3"
+        else:
+            tfs["numerical_signature"]={}
+        tfs["fingerprint"]=core._digest({k:v for k,v in tfs.items() if k!="fingerprint"})
+    with pytest.raises(ValueError,match="registry.*schema|source/version"):
+        perturbation.propagate_perturbation(["A"],rna,atac,pt,edges,table,screen,cfg,
+            transfer_models=genes,tf_model_registry=tfs)
 
 
 def test_strict_core_still_rejects_real_undeclared_shared_input_change():

@@ -308,15 +308,16 @@ def test_only_enabled_lag_input_failures_taint_tf_peak(lag_failure_fit, monkeypa
     model = core.TargetModel.from_bundle(f[-1]["targets"]["p0"])
     assert model.input_keys == (("A", 0), ("B", 1))
     assert 0 < model.weights[0] < 1 and 0 < model.weights[1] < 1
-    proxy = SimpleNamespace(**core.__dict__)
+    actual_predict = pert._SinglesPlan.predict
     injected = []
-    def fail_gene(m, old, new, **kwargs):
+    def fail_gene(plan, position, new):
+        m = plan.model
+        old = plan.old[position:position+1]
         if m.target_id == failed_gene and m.output_unit == "log1p_rna_log1p_cp10k" and len(old) == 1:
             injected.append(True)
             raise FloatingPointError("synthetic gene query failure")
-        return core.predict_delta(m, old, new, **kwargs)
-    proxy.predict_delta = fail_gene
-    monkeypatch.setattr(pert, "core", proxy)
+        return actual_predict(plan, position, new)
+    monkeypatch.setattr(pert._SinglesPlan, "predict", fail_gene)
     out = execute(f, targets=("D",))
     assert len(injected) == 19
     assert out["rna_unavailable_mask"][1:, ["D", "A", "B"].index(failed_gene)].all()
@@ -361,16 +362,17 @@ def test_peak_failure_abstains_in_aggregate_and_durable_projection_disabled_audi
     f = independent_peak_fit
     baseline = execute(f)
     reference = transfer._snapshot(f[0], f[1], f[2], f[5])["R"][5, 0]
-    proxy = SimpleNamespace(**core.__dict__)
+    actual_predict = pert._SinglesPlan.predict
     injected = []
-    def fail_peak(m, old, new, **kwargs):
+    def fail_peak(plan, position, new):
+        m = plan.model
+        old = plan.old[position:position+1]
         if m.target_id == "p0" and m.output_unit == "raw_atac" and len(old) == 1 and (
                 not partial or old[0, 0] == reference):
             injected.append(True)
             raise FloatingPointError("synthetic peak query failure")
-        return core.predict_delta(m, old, new, **kwargs)
-    proxy.predict_delta = fail_peak
-    monkeypatch.setattr(pert, "core", proxy)
+        return actual_predict(plan, position, new)
+    monkeypatch.setattr(pert._SinglesPlan, "predict", fail_peak)
     out = execute(f)
     expected_count = 1 if partial else 20
     assert len(injected) == expected_count == int(out["atac_unavailable_mask"][:, 0].sum())
@@ -396,7 +398,7 @@ def test_peak_failure_abstains_in_aggregate_and_durable_projection_disabled_audi
     assert (row["chr"], row.start, row.end) == ("1", 10, 20)
     context = dict(out, cluster="fault")
     tables = run._collect_saturating_tables([context])
-    cfg = copy.deepcopy(f[5]); cfg["output"] = {"dir": str(tmp_path), "save_intermediate": False}
+    cfg = copy.deepcopy(f[5]); cfg["output"] = {"dir": str(tmp_path), "save_intermediate": False, "export_details": True}
     io.save_results(dict(tables, atac_changes=out["atac_changes"]), cfg)
     directory = tmp_path
     saved = pd.read_csv(directory / "saturating_support_diagnostics.csv")

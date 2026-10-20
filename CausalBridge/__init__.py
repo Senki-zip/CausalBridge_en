@@ -18,7 +18,7 @@ from .granger import infer_pseudotime, granger_test, build_causal_grn
 from .kinetics import fit_atac_to_rna, fit_rna_to_atac
 from .perturbation import propagate_perturbation, perturb_peak
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 __all__ = [
     "load_config", "load_data", "save_results",
     "preprocess_rna", "preprocess_atac", "match_cells",

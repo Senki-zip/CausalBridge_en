@@ -3,7 +3,7 @@
 import numpy as np
 import pandas as pd
 from scipy.sparse import issparse
-from scipy.stats import pearsonr
+from scipy.stats import pearsonr, NearConstantInputWarning
 import logging
 import pickle
 import warnings
@@ -70,34 +70,43 @@ def _init_motif_scan_worker(motifs, threshold):
 
 def _scan_motif_batch(batch):
     return [(key, _scan_one_sequence(sequence, _MOTIF_WORKER_DB,
-                                     _MOTIF_WORKER_THRESHOLD)) for key, sequence in batch]
+                                     _MOTIF_WORKER_THRESHOLD)) for key, sequence in batch
+            if sequence is not None]
 
 
-def _scan_sequence_records(tasks, motif_db, threshold, workers=1):
+def _scan_sequence_records(tasks, motif_db, threshold, workers=1, *, record_store=None,
+                           task_count=None):
     """按输入顺序扫描，最多保留两倍 worker 数量的在途批次。"""
     requested = _validate_motif_scan_workers(workers)
-    if not tasks:
+    total = len(tasks) if task_count is None else task_count
+    if not total:
         logger.info("Primary motif scan: requested_workers=%d effective_workers=0 peaks=0", requested)
         return {}
     try:
         available = len(os.sched_getaffinity(0))
     except AttributeError:
         available = os.cpu_count() or 1
-    effective = min(requested, available, len(tasks))
+    effective = min(requested, available, total)
     logger.info("Primary motif scan: requested_workers=%d effective_workers=%d peaks=%d",
-                requested, effective, len(tasks))
-    records = {}
-    def collect(batch):
+                requested, effective, total)
+    records = {} if record_store is None else record_store
+    initial_count = len(records)
+    completed = 0
+    def collect(batch, attempted):
+        nonlocal completed
         records.update(batch)
-        progress.update(len(records))
+        completed += attempted
+        progress.update(completed)
 
-    with TerminalProgress(len(tasks), "Step 6 扫描", logger=logger) as progress:
+    with TerminalProgress(total, "Step 6 扫描", logger=logger) as progress:
         if effective == 1:
             for key, sequence in tasks:
-                collect([(key, _scan_one_sequence(sequence, motif_db, threshold))])
+                collect([] if sequence is None else [(key, _scan_one_sequence(sequence, motif_db, threshold))], 1)
         else:
-            batch_size = min(16, max(1, len(tasks) // (effective * 4)))
-            batches = iter(tasks[i:i + batch_size] for i in range(0, len(tasks), batch_size))
+            from itertools import islice
+            batch_size = min(16, max(1, total // (effective * 4)))
+            task_iterator = iter(tasks)
+            batches = iter(lambda: list(islice(task_iterator, batch_size)), [])
             motifs = tuple((key, np.asarray(info["pwm"])) for key, info in motif_db.items())
             variables = ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "OMP_NUM_THREADS",
                          "BLIS_NUM_THREADS", "NUMEXPR_NUM_THREADS")
@@ -113,7 +122,7 @@ def _scan_sequence_records(tasks, motif_db, threshold, workers=1):
                         for name in variables:
                             os.environ[name] = "1"
                         for batch in batches:
-                            pending.append(pool.submit(_scan_motif_batch, batch))
+                            pending.append((pool.submit(_scan_motif_batch, batch), len(batch)))
                             if len(pending) >= effective * 2:
                                 break
                     finally:
@@ -123,11 +132,13 @@ def _scan_sequence_records(tasks, motif_db, threshold, workers=1):
                             else:
                                 os.environ[name] = value
                 while pending:
-                    collect(pending.popleft().result())
+                    future, attempted = pending.popleft()
+                    collect(future.result(), attempted)
                     batch = next(batches, None)
                     if batch is not None:
-                        pending.append(pool.submit(_scan_motif_batch, batch))
-    logger.info("Primary motif scan complete: peaks=%d/%d", len(records), len(tasks))
+                        pending.append((pool.submit(_scan_motif_batch, batch), len(batch)))
+    logger.info("Primary motif scan complete: scanned_peaks=%d requested_peaks=%d missing_sequence=%d",
+                len(records) - initial_count, total, total - (len(records) - initial_count))
     return records
 
 
@@ -221,62 +232,44 @@ def _scan_one_sequence(sequence, motif_db, threshold):
     return hits
 
 
-def _read_raw_motif_cache(path, descriptor, motif_db):
-    if not path.exists():
-        return {}
-    try:
-        with path.open("rb") as handle:
-            payload = pickle.load(handle)
-        if (not isinstance(payload, dict) or payload.get("schema") != RAW_MOTIF_SCHEMA
-                or payload.get("identity") != descriptor["identity"]
-                or payload.get("scan_key") != descriptor["scan_key"]
-                or not isinstance(payload.get("records"), dict)):
-            raise ValueError("schema/identity mismatch")
-        order = {motif: i for i, motif in enumerate(motif_db)}
-        for key, hits in payload["records"].items():
-            if (not isinstance(key, tuple) or len(key) != 4
-                    or not all(isinstance(x, str) for x in key[:2])
-                    or not all(type(x) is int for x in key[2:])
-                    or key[2] < 0 or key[3] <= key[2] or not isinstance(hits, list)):
-                raise ValueError("invalid peak record")
-            previous = -1
-            for hit in hits:
-                if (not isinstance(hit, dict) or set(hit) != {"motif_id", "p_value", "max_score"}
-                        or hit["motif_id"] not in order or order[hit["motif_id"]] <= previous
-                        or not isinstance(hit["p_value"], (float, int))
-                        or not 0 <= hit["p_value"] < descriptor["identity"]["threshold"]
-                        or not isinstance(hit["max_score"], (float, int))
-                        or not np.isfinite(hit["max_score"])):
-                    raise ValueError("invalid motif hit")
-                previous = order[hit["motif_id"]]
-        return payload["records"]
-    except Exception as exc:
-        logger.warning("Ignoring invalid shared raw motif cache %s: %s; rescanning requested peaks", path, exc)
-        return {}
+def _read_raw_motif_cache(path, descriptor, motif_db, *, requested_keys=None, max_tfs=None):
+    from ._raw_motif_io import Records
+    from ._raw_motif_sqlite import Store
+    result = Records()
+    with Store(path, descriptor, _raw_motif_validator(descriptor, motif_db)) as store:
+        for key, hits in store.get(requested_keys):
+            result[key] = hits if max_tfs is None else _materialize_raw_motif_hits(hits, motif_db, max_tfs)
+    result.valid = True
+    logger.info("Indexed raw motif cache: matched_peaks=%d", len(result))
+    return result
+
+
+def _raw_motif_validator(descriptor, motif_db):
+    order = {motif: i for i, motif in enumerate(motif_db)}
+    def validate(key, hits):
+        if (not isinstance(key, tuple) or len(key) != 4
+                or not all(isinstance(x, str) for x in key[:2])
+                or not all(type(x) is int for x in key[2:])
+                or key[2] < 0 or key[3] <= key[2] or not isinstance(hits, list)):
+            raise ValueError("invalid peak record")
+        previous = -1
+        for hit in hits:
+            if (not isinstance(hit, dict) or set(hit) != {"motif_id", "p_value", "max_score"}
+                    or hit["motif_id"] not in order or order[hit["motif_id"]] <= previous
+                    or not isinstance(hit["p_value"], (float, int))
+                    or not 0 <= hit["p_value"] < descriptor["identity"]["threshold"]
+                    or not isinstance(hit["max_score"], (float, int))
+                    or not np.isfinite(hit["max_score"])):
+                raise ValueError("invalid motif hit")
+            previous = order[hit["motif_id"]]
+    return validate
 
 
 def _merge_raw_motif_cache(path, descriptor, motif_db, additions):
-    """Scan outside the short lock; reload/merge latest union and replace atomically."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = None
-    with path.with_suffix(".lock").open("a+b") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        try:
-            records = _read_raw_motif_cache(path, descriptor, motif_db)
-            records.update(additions)
-            payload = {"schema": RAW_MOTIF_SCHEMA, "scan_key": descriptor["scan_key"],
-                       "identity": descriptor["identity"], "records": records}
-            with tempfile.NamedTemporaryFile(mode="wb", dir=path.parent, prefix=path.name + ".", delete=False) as handle:
-                temporary = Path(handle.name)
-                pickle.dump(payload, handle)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, path)
-            temporary = None
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
-            fcntl.flock(lock, fcntl.LOCK_UN)
+    """Insert only new peak records, preserving the legacy file unchanged."""
+    from ._raw_motif_sqlite import Store
+    with Store(path, descriptor, _raw_motif_validator(descriptor, motif_db)) as store:
+        store.update(additions.items())
 
 
 def _materialize_raw_motif_hits(hits, motif_db, max_tfs):
@@ -681,32 +674,36 @@ def fit_rna_to_atac(
 
     if time_lag:
         logger.info(
-            f"RNA→ATAC 阶段2: motif 候选 TF 逐 TF、逐 lag 单特征 Pearson 检验 "
+            f"RNA→ATAC 阶段2: motif 候选 TF 逐目标 bin 局部批量 Pearson 检验 "
             f"TF(t-lag)→peak(t), lag=0..{max_lag_cfg}, "
-            f"每边独立搜索, 第一个显著 lag 胜出"
+            f"每个目标 bin 独立搜索, 第一个通过显著性及贡献量门槛的 lag 胜出"
         )
     else:
         logger.info(
             f"RNA→ATAC 阶段2: 单特征 Pearson 检验 TF→peak 权重 "
             f"(无时间滞后, TF(t)→peak(t), max_lag=0)"
         )
-    results = _fit_tf_peak_regression(
+    from .screening_parallel import local_lag_candidates, screening_workers
+    results = local_lag_candidates(
         peak_to_tfs, rna_adata, atac_adata, rna_binned, atac_binned,
         max_lag=max_lag_cfg if time_lag else 0,
         pvalue_threshold=cfg.get("tf_peak_pvalue_threshold", 0.05),
         branch_boundaries=branch_boundaries,
-        min_abs_contribution=cfg.get("min_abs_contribution", 0.0),
+        min_abs_contribution=cfg.get("min_abs_contribution", 0.01),
+        local_lag_window_rows=config.get("atac_to_rna", {}).get("saturating_hybrid", {}).get("min_fit_rows", 12),
+        workers=screening_workers(config, "local_lag_workers"),
         **({"bin_plan": bin_plan} if bin_plan is not None else {}),
     )
 
     logger.info(f"RNA→ATAC 拟合完成: {len(results)} 条 TF→peak 调控关系")
-    frame = pd.DataFrame(results)
+    frame = pd.DataFrame(results, columns=["peak_id", "tf_gene", "tf_lag", "lag_mode", "lag_min", "lag_max",
+        "weight", "p_value", "abs_contribution", "local_lag_max", "local_lag_window_rows", "local_routes"])
     if base_map is not None:
         for column in ("tf_gene_name", "tf_mapping_count", "alias_candidate"):
             frame[column] = [mapping_metadata[(row["peak_id"], row["tf_gene"])][column]
                              for row in results]
         frame.attrs["tf_mapping_diagnostics"] = mapping_diagnostics
-    frame["screening_status"] = "linear_pearson_screen"
+    frame["screening_status"] = "local_pearson_routes"
     if continuous:
         frame["atac_state_unit"] = "normalized_atac_log1p"
     registry = fit_tf_peak(rna_adata, atac_adata, pseudotime_df, frame, config,
@@ -1219,7 +1216,6 @@ def _scan_peaks_with_jaspar(
         raise ValueError("raw motif scan descriptor differs from current resources/parameters")
     base = Path(descriptor["base_cache_dir"])
     path = base / "peak_motif_raw_v1" / (descriptor["scan_key"] + ".pkl")
-    records = _read_raw_motif_cache(path, descriptor, motif_db)
     if not atac_adata.var_names.is_unique:
         raise ValueError("raw motif cache requires unique peak IDs")
     requested = [peak for peak in causal_edges["peak_id"].unique() if peak in atac_adata.var_names]
@@ -1230,27 +1226,40 @@ def _scan_peaks_with_jaspar(
         if key[2] < 0 or key[3] <= key[2]:
             raise ValueError("invalid peak coordinates")
         keys[peak] = key
+    # Only requested rows are read; raw hits remain on disk independently of top-N.
+    records = _read_raw_motif_cache(path, descriptor, motif_db,
+                                   requested_keys=keys.values(), max_tfs=max_tfs)
     legacy_path = base / "peak_tf_cache_v2.pkl"
     raw_missing = [peak for peak in requested if keys[peak] not in records]
     legacy_result = _read_legacy_peak_tf_candidates(
         legacy_path, threshold, raw_missing, max_tfs) if raw_missing else {}
     missing = [peak for peak in requested
                if keys[peak] not in records and peak not in legacy_result]
-    additions = {}
+    additions_count = 0
     if missing:
-        sequences = _extract_peak_sequences(atac_adata, config, requested_peaks=missing) or {}
-        tasks = [(keys[peak], sequences[peak]) for peak in missing if sequences.get(peak)]
-        additions = _scan_sequence_records(tasks, motif_db, threshold, workers)
-        if additions:
-            _merge_raw_motif_cache(path, descriptor, motif_db, additions)
-            records.update(additions)
+        from ._raw_motif_sqlite import Store
+        with Store(path, descriptor, _raw_motif_validator(descriptor, motif_db)) as store, _peak_genome_index(config) as genome_index:
+            # Bound sequence strings as well as worker results. Successful batches
+            # commit directly to the indexed cache, including verified empty hits.
+            def tasks():
+                for offset in range(0, len(missing), 256):
+                    batch = missing[offset:offset + 256]
+                    sequences = _extract_peak_sequences(atac_adata, config, requested_peaks=batch,
+                                                       genome_index=genome_index) or {}
+                    for peak in batch:
+                        yield keys[peak], sequences.get(peak) or None
+            _scan_sequence_records(tasks(), motif_db, threshold, workers,
+                                   record_store=store, task_count=len(missing))
+            additions_count = len(store)
+            for key, hits in store.get(keys[peak] for peak in missing):
+                records[key] = _materialize_raw_motif_hits(hits, motif_db, max_tfs)
     else:
         logger.info("Primary motif scan: requested_workers=%d effective_workers=0 peaks=0 (cache covered)", workers)
 
     result = dict(legacy_result)
     for peak in requested:
         if keys[peak] in records:
-            names = _materialize_raw_motif_hits(records[keys[peak]], motif_db, max_tfs)
+            names = records[keys[peak]]
             if names:
                 result[peak] = names
     uncovered = [peak for peak in missing if keys[peak] not in records]
@@ -1262,7 +1271,7 @@ def _scan_peaks_with_jaspar(
             **({"tf_database": frozen_tf_database} if frozen_tf_database is not _UNSET_TF_DATABASE else {})))
     logger.info("Shared motif candidates: requested=%d verified_raw=%d reused_legacy=%d scanned=%d missing_failed=%d",
                 len(requested), sum(keys[p] in records for p in requested),
-                len(legacy_result), len(additions), len(uncovered))
+                len(legacy_result), additions_count, len(uncovered))
     return result
 
 
@@ -1718,8 +1727,29 @@ def _extract_peak_sequences_from_causal(
     return sequences
 
 
+def _peak_genome_index(config):
+    """Open one lazy FASTA index across bounded extraction batches."""
+    from contextlib import contextmanager
+    @contextmanager
+    def opened():
+        index = None
+        path = config.get("input", {}).get("genome_fasta")
+        try:
+            if path and Path(path).exists():
+                from Bio import SeqIO
+                index = SeqIO.index(str(path), "fasta")
+        except Exception as exc:
+            logger.warning("Unable to index genome FASTA: %s", exc)
+        try:
+            yield index
+        finally:
+            if index is not None:
+                index.close()
+    return opened()
+
+
 def _extract_peak_sequences(
-    atac_adata, config: dict, requested_peaks=None
+    atac_adata, config: dict, requested_peaks=None, *, genome_index=None
 ) -> Optional[Dict[str, str]]:
     """
     从基因组 FASTA 提取 peak 的 DNA 序列。
@@ -1739,26 +1769,28 @@ def _extract_peak_sequences(
 
         # 构建染色体 → 序列的索引（仅加载所需染色体）
         logger.info(f"  加载基因组: {genome_path}")
-        genome = SeqIO.to_dict(SeqIO.parse(genome_path, "fasta"))
+        genome = genome_index if genome_index is not None else SeqIO.index(str(genome_path), "fasta")
 
         sequences = {}
-        for peak_id in (atac_adata.var_names if requested_peaks is None else requested_peaks):
-            info = atac_adata.var.loc[peak_id]
-            chrom = info["chr"]
-            # 尝试多种染色体命名格式
-            for chrom_fmt in [chrom, f"chr{chrom}", chrom.replace("chr", "")]:
-                if chrom_fmt in genome:
-                    try:
-                        start, end = int(info["start"]), int(info["end"])
-                        if requested_peaks is not None and not 0 <= start < end <= len(genome[chrom_fmt].seq):
+        try:
+            for peak_id in (atac_adata.var_names if requested_peaks is None else requested_peaks):
+                info = atac_adata.var.loc[peak_id]
+                chrom = info["chr"]
+                # Try alternative chromosome naming conventions
+                for chrom_fmt in [chrom, f"chr{chrom}", chrom.replace("chr", "")]:
+                    if chrom_fmt in genome:
+                        try:
+                            start, end = int(info["start"]), int(info["end"])
+                            record = genome[chrom_fmt]
+                            if requested_peaks is not None and not 0 <= start < end <= len(record.seq):
+                                continue
+                            sequences[peak_id] = str(record.seq[start:end])
+                            break
+                        except Exception:
                             continue
-                        seq = str(genome[chrom_fmt].seq[
-                            start : end
-                        ])
-                        sequences[peak_id] = seq
-                        break
-                    except Exception:
-                        continue
+        finally:
+            if genome_index is None:
+                genome.close()
 
         if len(sequences) == 0:
             logger.warning(
@@ -2000,168 +2032,261 @@ def _fit_tf_peak_regression(
     min_abs_contribution: float = 0.0,
     *,
     bin_plan=None,
+    local_lag_window_rows=12,
 ) -> List[dict]:
     """
-    对 motif 选出的候选 TF，做逐 TF、逐 lag 单特征 Pearson 检验:
-    TF(t-lag) → A_peak(t)。
-
-    对 lag=0..max_lag 逐个独立拟合（每个 lag 只有 1 列 X），
-    第一个显著 lag 胜出 → 输出该 (TF, peak, lag)。
-    无 lag 间共线性；自相关高的 TF 自然取 lag=0，
-    真延迟调控 TF 拿到真 lag。max_lag=0 时等价于 TF(t)→peak(t)。
+    每个目标 bin 独立选择第一个通过附近 WT 数据 Pearson 检验的 lag。
+    max_lag 只限制向后查找范围，不裁剪分支开头的目标 bin。
+    每个 motif 候选边返回全部 bin 的路由和明确的无支持状态。
     """
-    rna_var_names = list(rna_adata.var_names)
-    atac_var_names = list(atac_adata.var_names)
-    n_bins = len(rna_binned)
+    return _local_tf_peak_routes(peak_to_tfs, rna_adata, atac_adata,
+        rna_binned, atac_binned, max_lag, pvalue_threshold, branch_boundaries,
+        min_abs_contribution, bin_plan, local_lag_window_rows)
+
+
+def _local_tf_peak_routes(peak_to_tfs, rna_adata, atac_adata, rna_binned,
+                          atac_binned, max_lag, pvalue_threshold,
+                          branch_boundaries, min_abs_contribution, bin_plan,
+                          window_rows):
+    """Batch finite neighborhoods, preserving scalar first-supported-lag routes.
+
+    Work arrays expire after each candidate pair. Counts describe the visited
+    first-pass trajectory, including when an eagerly computed test is unused.
+    Nonfinite pairs use the scalar reference because their row masks differ.
+    """
+    # SciPy before 1.14 and scalar-only replacement callables retain support.
+    if "axis" not in inspect.signature(pearsonr).parameters:
+        return _local_tf_peak_routes_scalar(peak_to_tfs, rna_adata, atac_adata,
+            rna_binned, atac_binned, max_lag, pvalue_threshold,
+            branch_boundaries, min_abs_contribution, bin_plan, window_rows)
+    if isinstance(window_rows, bool) or int(window_rows) != window_rows or window_rows < 3:
+        raise ValueError("local lag neighborhood requires at least three rows")
+    window_rows = int(window_rows)
+    if isinstance(max_lag, bool) or int(max_lag) != max_lag or max_lag < 0:
+        raise ValueError("max_lag must be a nonnegative integer")
+    max_lag = int(max_lag)
+    n = len(rna_binned)
+    if len(atac_binned) != n:
+        raise ValueError("RNA/ATAC bin axes differ")
+    valid = np.ones(n, dtype=bool)
     if bin_plan is not None:
         from .binning_adapter import plan_branch_boundaries
-        if n_bins != bin_plan.n_bins or len(atac_binned) != n_bins:
+        if bin_plan.n_bins != n:
             raise ValueError("TF regression bin count differs from supplied bin_plan")
         branch_boundaries = plan_branch_boundaries(bin_plan)
-
+        valid = np.asarray(bin_plan.valid, dtype=bool)
+    boundaries = branch_boundaries if branch_boundaries is not None else [(0, n)]
+    if [b for s, e in boundaries for b in range(s, e)] != list(range(n)):
+        raise ValueError("TF route branches must partition the ordered bin axis")
+    genes, peaks = list(rna_adata.var_names), list(atac_adata.var_names)
+    gi, ai = {g:i for i,g in enumerate(genes)}, {p:i for i,p in enumerate(peaks)}
+    upper = {g.upper():g for g in genes}
+    layouts, contexts = {}, {}
+    for start, end in boundaries:
+        for k in range(min(max_lag, end-start-1)+1):
+            ts = np.arange(start+k, end)
+            ts = ts[valid[ts] & valid[ts-k]]
+            for b in range(start+k, end):
+                nearest = np.lexsort((ts, np.abs(ts-b)))[:window_rows]
+                times = np.sort(ts[nearest])
+                key = (k, tuple(times))
+                layouts[(start, end, k, b)] = (times, key)
+                if len(times) >= 3:
+                    contexts[key] = times
+    last_progress = time.monotonic()
+    processed = supported_pairs = 0
+    total = sum(len(candidates) for candidates in peak_to_tfs.values())
+    logger.info("TF local lag batch Pearson: raw_candidates=%d bins=%d", total, n)
     results = []
-    rna_upper_map = {g.upper(): g for g in rna_var_names}
-
-    for peak_id, candidate_tfs in peak_to_tfs.items():
-        if not candidate_tfs:
+    for peak, candidates in peak_to_tfs.items():
+        if peak not in ai:
             continue
-
-        candidate_tfs = list(dict.fromkeys(candidate_tfs))
-
-        try:
-            peak_idx = atac_var_names.index(peak_id)
-        except ValueError:
-            continue
-
-        # 大小写不敏感匹配
-        valid_tfs = []
-        tf_indices = []
-        for tf in candidate_tfs:
-            actual_name = tf if tf in rna_var_names else rna_upper_map.get(tf.upper())
-            if actual_name is not None:
-                valid_tfs.append(actual_name)
-                tf_indices.append(rna_var_names.index(actual_name))
-        if len(valid_tfs) == 0:
-            continue
-
-        # ================================================================
-        # 逐 TF 独立构建单特征输入 + 逐 lag 独立 Pearson 检验
-        #
-        # 对每个候选 TF 独立拟合（一个 TF 一个模型），
-        # 对每个 lag 0..max_lag 独立检验, 取第一个显著 lag。
-        #   每个 lag 的回归只有 1 列 X → 无 lag 间共线性 →
-        #   自相关高的 TF 自然取 lag=0, 延迟调控 TF 取真 lag。
-        #   (「反时向」: 从 peak(t) 出发, 找最先遇到的显著 TF(t-lag))
-        #
-        # per_lag 模式: Y 在 lag 循环内按 lag 对齐（所有 lag 共用
-        # 同一 Y = Peak[max_lag:], 相同行数, 统计效力可比）。
-        # ================================================================
-        # 验证 lag=0 至少可行 (最大行数)
-        if n_bins < 3:
-            continue
-
-        for tf_name, tf_idx_global in zip(valid_tfs, tf_indices):
-            _found_sig = False  # early-stop flag
-            _branch_Y_cache = None  # 复用共享 Y
-
-            for k in range(0, max_lag + 1):
-                if _found_sig:
-                    break
-
-                # ---- 单 lag 独立 X 构建 (所有 lag 共用 Y, 相同行数) ----
-                _shared_rows = n_bins - max_lag  # 所有 lag 统一行数
-                if _shared_rows < 3:
-                    continue
-
-                if branch_boundaries is not None and len(branch_boundaries) > 1:
-                    # 预计算共享 Y (所有 lag 相同)
-                    if k == 0:
-                        _Y_shared_parts = []
-                        _X_info_parts = []  # [(start, br_usable_shared), ...]
-                        for start, end in branch_boundaries:
-                            br_len = end - start
-                            br_usable_shared = br_len - max_lag
-                            if br_usable_shared < 3:
+        tfs = dict.fromkeys(g if g in gi else upper.get(g.upper()) for g in candidates)
+        for tf in tfs:
+            if tf is None:
+                continue
+            x, y = rna_binned[:,gi[tf]], atac_binned[:,ai[peak]]
+            if not (np.isfinite(x).all() and np.isfinite(y).all()):
+                edge = _local_tf_peak_routes_scalar({peak: [tf]}, rna_adata,
+                    atac_adata, rna_binned, atac_binned, max_lag,
+                    pvalue_threshold, branch_boundaries, min_abs_contribution,
+                    bin_plan, window_rows)[0]
+            else:
+                cache, groups = {}, {}
+                for key, times in contexts.items():
+                    xx, yy = x[times-key[0]], y[times]
+                    # Keep scalar reductions, including the exact std gate.
+                    sx, sy = float(np.std(xx)), float(np.std(yy))
+                    if sx < 1e-6 or sy == 0:
+                        cache[key] = None
+                    else:
+                        groups.setdefault(len(times), []).append((key, xx, yy, sx, sy))
+                near_constant = False
+                for group in groups.values():
+                    with warnings.catch_warnings(record=True) as caught:
+                        warnings.simplefilter("ignore", RuntimeWarning)
+                        warnings.simplefilter("always", NearConstantInputWarning)
+                        rr, pp = pearsonr(np.stack([z[1] for z in group]),
+                                          np.stack([z[2] for z in group]), axis=-1)
+                    near_constant |= any(issubclass(w.category, NearConstantInputWarning) for w in caught)
+                    for (key, xx, yy, sx, sy), r, p in zip(group, rr, pp):
+                        weight = float(r*sy/sx)
+                        contribution = abs(weight)*sx
+                        # Scalar decisions at either configured gate protect
+                        # against floating point differences in batched SciPy.
+                        if (abs(p-pvalue_threshold) <= 1e-14+1e-10*abs(pvalue_threshold)
+                                or abs(contribution-min_abs_contribution)
+                                    <= 1e-14+1e-10*abs(min_abs_contribution)):
+                            with warnings.catch_warnings():
+                                warnings.simplefilter("ignore", RuntimeWarning)
+                                r, p = pearsonr(xx, yy)
+                            weight = float(r*sy/sx)
+                            contribution = abs(weight)*sx
+                        cache[key] = (r, p, weight, contribution)
+                if near_constant:
+                    # Re-evaluate all testable contexts for this pair with the
+                    # scalar norm/reduction path when SciPy flags cancellation.
+                    for group in groups.values():
+                        for key, xx, yy, sx, sy in group:
+                            with warnings.catch_warnings():
+                                warnings.simplefilter("ignore", RuntimeWarning)
+                                r, p = pearsonr(xx, yy)
+                            weight = float(r*sy/sx)
+                            cache[key] = (r, p, weight, abs(weight)*sx)
+                routes = []
+                for start, end in boundaries:
+                    for b in range(start, end):
+                        route = dict(target_bin=b, source_bin=-1, selected_lag=-1,
+                            status="no_supported_lag", weight=None, p_value=None,
+                            abs_contribution=None, n_evidence_rows=0,
+                            n_lag_attempts=0, n_stat_tests=0)
+                        for k in range(min(max_lag, b-start)+1):
+                            if not valid[b] or not valid[b-k]:
                                 continue
-                            _Y_shared_parts.append(
-                                atac_binned[start + max_lag : end, peak_idx]
-                            )
-                            _X_info_parts.append((start, br_usable_shared))
-                        if not _Y_shared_parts:
+                            times, key = layouts[(start, end, k, b)]
+                            route["n_lag_attempts"] += 1
+                            route["n_evidence_rows"] = max(route["n_evidence_rows"], len(times))
+                            if len(times) < 3 or cache[key] is None:
+                                continue
+                            route["n_stat_tests"] += 1
+                            r, p, weight, contribution = cache[key]
+                            if np.isfinite(r) and p <= pvalue_threshold and contribution >= min_abs_contribution:
+                                route.update(source_bin=b-k, selected_lag=k, status="supported",
+                                    weight=weight, p_value=float(p), abs_contribution=contribution,
+                                    n_evidence_rows=len(times))
+                                break
+                        routes.append(route)
+                supported = [r for r in routes if r["status"] == "supported"]
+                edge = dict(peak_id=peak, tf_gene=tf, tf_lag=None,
+                    lag_mode="local", lag_min=min((r["selected_lag"] for r in supported), default=None),
+                    lag_max=max((r["selected_lag"] for r in supported), default=None),
+                    weight=float(np.mean([r["weight"] for r in supported])) if supported else 0.,
+                    p_value=max((r["p_value"] for r in supported), default=None),
+                    abs_contribution=float(np.mean([r["abs_contribution"] for r in supported])) if supported else 0.,
+                    local_lag_max=max_lag, local_lag_window_rows=window_rows,
+                    local_routes=routes)
+            results.append(edge)
+            processed += 1
+            supported_pairs += edge["lag_min"] is not None
+            if processed % 128 == 0 and time.monotonic()-last_progress >= 5:
+                logger.info("TF local lag progress: processed_pairs=%d supported_pairs=%d raw_candidates=%d",
+                            processed, supported_pairs, total)
+                last_progress = time.monotonic()
+    logger.info("TF local lag complete: processed_pairs=%d supported_pairs=%d raw_candidates=%d",
+                processed, supported_pairs, total)
+    return results
+
+
+def _local_tf_peak_routes_scalar(peak_to_tfs, rna_adata, atac_adata, rna_binned,
+                          atac_binned, max_lag, pvalue_threshold,
+                          branch_boundaries, min_abs_contribution, bin_plan,
+                          window_rows):
+    """First supported lag separately at every bin; nearby WT rows are evidence.
+
+    Twelve nearest valid rows is an empirical engineering neighborhood, not a
+    validated biological time scale. Neighbor ties prefer the earlier row.
+    Evidence may include later WT bins; each executed source is strictly <= b.
+    n_evidence_rows counts the selected lag's valid pairs when supported, or the
+    maximum valid-pair neighborhood examined when unsupported (even if too small
+    or constant for Pearson). n_lag_attempts counts neighborhoods examined after
+    checking the target/source pair; n_stat_tests counts actual Pearson calls.
+    Unsupported routes retain no selected weight, p-value, or contribution.
+    """
+    if isinstance(window_rows, bool) or int(window_rows) != window_rows or window_rows < 3:
+        raise ValueError("local lag neighborhood requires at least three rows")
+    window_rows = int(window_rows)
+    if isinstance(max_lag, bool) or int(max_lag) != max_lag or max_lag < 0:
+        raise ValueError("max_lag must be a nonnegative integer")
+    max_lag = int(max_lag)
+    n = len(rna_binned)
+    if len(atac_binned) != n:
+        raise ValueError("RNA/ATAC bin axes differ")
+    valid = np.ones(n, dtype=bool)
+    if bin_plan is not None:
+        from .binning_adapter import plan_branch_boundaries
+        if bin_plan.n_bins != n:
+            raise ValueError("TF regression bin count differs from supplied bin_plan")
+        branch_boundaries = plan_branch_boundaries(bin_plan)
+        valid = np.asarray(bin_plan.valid, dtype=bool)
+    boundaries = branch_boundaries if branch_boundaries is not None else [(0, n)]
+    if [b for s, e in boundaries for b in range(s, e)] != list(range(n)):
+        raise ValueError("TF route branches must partition the ordered bin axis")
+    genes, peaks = list(rna_adata.var_names), list(atac_adata.var_names)
+    gi, ai = {g:i for i,g in enumerate(genes)}, {p:i for i,p in enumerate(peaks)}
+    upper = {g.upper():g for g in genes}
+    results = []
+    for peak, candidates in peak_to_tfs.items():
+        if peak not in ai:
+            continue
+        tfs = dict.fromkeys(g if g in gi else upper.get(g.upper()) for g in candidates)
+        for tf in tfs:
+            if tf is None:
+                continue
+            x, y = rna_binned[:,gi[tf]], atac_binned[:,ai[peak]]
+            routes = []
+            for start, end in boundaries:
+                for b in range(start, end):
+                    route = dict(target_bin=b, source_bin=-1, selected_lag=-1,
+                        status="no_supported_lag", weight=None, p_value=None,
+                        abs_contribution=None, n_evidence_rows=0,
+                        n_lag_attempts=0, n_stat_tests=0)
+                    for k in range(min(max_lag, b-start)+1):
+                        if not valid[b] or not valid[b-k] or not np.isfinite(x[b-k]) or not np.isfinite(y[b]):
                             continue
-                        _Y = np.concatenate(_Y_shared_parts)
-                        # 保存供后续 lag 复用
-                        _branch_Y_cache = _Y
-                        _branch_X_info_cache = _X_info_parts
-                    else:
-                        if _branch_Y_cache is None:
+                        times = np.arange(start+k, end)
+                        times = times[valid[times] & valid[times-k] &
+                                      np.isfinite(x[times-k]) & np.isfinite(y[times])]
+                        nearest = np.lexsort((times, np.abs(times-b)))[:window_rows]
+                        times = np.sort(times[nearest])
+                        route["n_lag_attempts"] += 1
+                        route["n_evidence_rows"] = max(route["n_evidence_rows"], len(times))
+                        if len(times) < 3:
                             continue
-                        _Y = _branch_Y_cache
-                        _X_info_parts = _branch_X_info_cache
-
-                    X_parts = []
-                    for start, br_usable_shared in _X_info_parts:
-                        # TF[t-k] for t in [start+max_lag, end)
-                        # = TF[start + max_lag - k : end - k]
-                        # Supplied-plan execution uses this branch's endpoint,
-                        # not the final `end` left over from the Y-building loop.
-                        slice_end = start + max_lag + br_usable_shared if bin_plan is not None else end
-                        X_parts.append(
-                            rna_binned[start + max_lag - k : slice_end - k,
-                                       tf_idx_global]
-                        )
-                    col = np.concatenate(X_parts)
-                else:
-                    # 非分支: 共享 Y = Peak[max_lag:], X = TF 按 lag 偏移
-                    if k == 0:
-                        _Y = atac_binned[max_lag:, peak_idx]
-                        _branch_Y_cache = _Y  # 复用给后续 lag
-                    else:
-                        _Y = _branch_Y_cache
-                    # TF[t-k] for t in [max_lag, n_bins)
-                    col = rna_binned[max_lag - k : n_bins - k, tf_idx_global]
-
-                if np.std(col) < 1e-6:
-                    continue
-                X = col.reshape(-1, 1)
-
-                # 确保 X, Y 行数一致
-                if X.shape[0] != len(_Y):
-                    min_rows = min(X.shape[0], len(_Y))
-                    if min_rows < 3:
-                        continue
-                    X = X[:min_rows]
-                    _Y = _Y[:min_rows]
-
-                # ============================================================
-                # 逐 lag 单特征 Pearson 检验
-                # ============================================================
-                # 每个 lag 的 X 只有 1 列，直接用 pearsonr + t 检验给出
-                # r / p / weight / contribution：单特征下 w = r·σ_Y/σ_X 与
-                # weight = r·σ(Y)/σ(X)，各 lag 的 p 值可直接比较。
-                _px = X[:, 0]
-                _py = np.asarray(_Y).ravel()
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", category=RuntimeWarning)
-                    _r, _p = pearsonr(_px, _py)
-                if not np.isnan(_r) and _p <= pvalue_threshold:
-                    _x_std = float(np.std(_px))
-                    _y_std = float(np.std(_py))
-                    if _x_std > 1e-10:
-                        _w = float(_r * _y_std / _x_std)
-                        _contrib = float(np.abs(_w) * _x_std)
-                        if _contrib >= min_abs_contribution:
-                            result = {
-                                "peak_id": peak_id,
-                                "tf_gene": tf_name,
-                                "weight": _w,
-                                "abs_contribution": _contrib,
-                                "p_value": float(_p),
-                                "tf_lag": k,
-                            }
-                            results.append(result)
-                            _found_sig = True
-
+                        xx, yy = x[times-k], y[times]
+                        sx, sy = float(np.std(xx)), float(np.std(yy))
+                        if sx < 1e-6 or sy == 0:
+                            continue
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore", RuntimeWarning)
+                            route["n_stat_tests"] += 1
+                            r, p = pearsonr(xx, yy)
+                        weight = float(r*sy/sx)
+                        contribution = abs(weight)*sx
+                        if np.isfinite(r) and p <= pvalue_threshold and contribution >= min_abs_contribution:
+                            route.update(source_bin=b-k, selected_lag=k, status="supported",
+                                weight=weight, p_value=float(p), abs_contribution=contribution,
+                                n_evidence_rows=len(times))
+                            break
+                    routes.append(route)
+            supported = [r for r in routes if r["status"] == "supported"]
+            results.append(dict(peak_id=peak, tf_gene=tf, tf_lag=None,
+                lag_mode="local", lag_min=min((r["selected_lag"] for r in supported), default=None),
+                lag_max=max((r["selected_lag"] for r in supported), default=None),
+                weight=float(np.mean([r["weight"] for r in supported])) if supported else 0.,
+                p_value=max((r["p_value"] for r in supported), default=None),
+                abs_contribution=float(np.mean([r["abs_contribution"] for r in supported])) if supported else 0.,
+                local_lag_max=max_lag, local_lag_window_rows=window_rows,
+                local_routes=routes))
     return results
 
 

@@ -106,7 +106,7 @@ def test_incomplete_endpoints_never_reported(status):
 
 
 @pytest.mark.parametrize("empty", [False, True])
-def test_context_collection_and_both_csvs_even_empty(tmp_path, empty):
+def test_context_collection_and_canonical_csv_even_empty(tmp_path, empty):
     paths = empty_pathways() if empty else build_pathways(*tables())
     contexts = [{"cluster": "c", KEY: paths}, {"cluster": "d", KEY: paths.iloc[:0]}]
     result = run._collect_saturating_tables(contexts)
@@ -115,11 +115,10 @@ def test_context_collection_and_both_csvs_even_empty(tmp_path, empty):
     io.save_results(result, {"atac_to_rna": {"model_mode": "saturating_hybrid"},
         "output": {"dir": str(tmp_path), "save_intermediate": False}})
     output = tmp_path
-    named = pd.read_csv(output / "saturating_pathways.csv")
     standard = pd.read_csv(output / "perturbation_pathways.csv")
-    pd.testing.assert_frame_equal(named, standard)
-    assert len(named) == len(paths)
-    assert named.delta_r_raw_sum.isna().all()
+    assert not (output / "saturating_pathways.csv").exists()
+    assert len(standard) == len(paths)
+    assert standard.delta_r_raw_sum.isna().all()
 
 
 def test_legacy_empty_export_behavior_unchanged(tmp_path):
@@ -157,7 +156,7 @@ def test_actual_io_stable_gene_ids_and_display_names(tmp_path):
     before = paths.copy(deep=True)
     cfg["atac_to_rna"]["model_mode"] = "saturating_hybrid"
     io.save_results(dict(metadata, **{KEY: paths, "pathway_edges": paths}), cfg, gene_identity=identity)
-    saved = pd.read_csv(tmp_path / "results" / "saturating_pathways.csv")
+    saved = pd.read_csv(tmp_path / "results" / "perturbation_pathways.csv")
     assert set(saved.tf_name_id) == {"E1", "E2"}
     assert set(saved.tf_name) == {"A_01", "A_02"}
     assert set(saved.affected_gene_id) == {"E4"} and set(saved.target_gene_id) == {"E3"}

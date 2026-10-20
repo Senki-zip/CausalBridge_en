@@ -1,0 +1,119 @@
+# ==================== Usage examples ====================
+# Enter the project directory and activate the CausalBridge environment:
+# cd /path/to/CausalBridge
+# conda activate CausalBridge
+#
+# 1. Preview configuration and task order without computing:
+# python run_batch.py batch.example.yaml --dry-run
+#
+# 2. Run every task in the listed order:
+# python run_batch.py batch.example.yaml
+#
+# 3. Run named tasks in custom order; names must match task name fields:
+# python run_batch.py batch.example.yaml --order D6_Zic2 D3_Zic2 RUNX1
+#
+# 4. Continue subsequent tasks after a failure:
+# python run_batch.py batch.example.yaml --continue-on-error
+#
+# 5. Continue in the background after closing the terminal; write batch status to batch.log:
+# nohup python -u run_batch.py batch.example.yaml > batch.log 2>&1 < /dev/null &
+# Detailed task logs: batch_runs/<timestamp>/<task>/pipeline.log under its output directory.
+# Follow batch status: tail -f batch.log
+# ==================================================
+# Manifest-relative paths resolve against this YAML directory.
+# Base-config-relative paths resolve against the base configuration directory.
+base_config: config.yaml  # Base model configuration; tasks inherit settings not overridden below
+
+# Shared defaults, independently overridable by each task.
+defaults:
+  knockout_genes: [Zic2]  # KO targets also accept stable IDs or {gene: Zic2, type: TF}
+  joint_knockout: true   # Multiple genes: true for joint KO, false for separate interventions
+  overrides:  # Override other settings using the same structure as config.yaml
+    atac_to_rna:
+      single_min_r2: 0.3  # Single peak→gene training R² threshold; renormalize alpha after filtering
+    execution:
+      granger_workers: 24  # Step4 Granger processes;1 is serial
+      local_lag_workers: 24  # Step6 local-lag Pearson processes
+      simulation_workers: 4  # Maximum concurrent Step8 clusters
+      defer_cluster_simulation: true  # Parallel simulation after all cluster training finishes
+    output:
+      save_intermediate: true  # Save intermediate tables lacking formal exports; checkpoints are managed separately
+
+# Tasks run in list order; each starts only after the preceding process exits.
+# Use distinct output directories; caches may be shared, subject to pipeline compatibility checks.
+# Run a custom subset/order: python run_batch.py batch.example.yaml --order D6_Zic2 D3_Zic2
+tasks:
+  - name: D3_Zic2  # Unique task name; inherits default Zic2 KO
+    input:  # Task-specific input files and reference resources
+      rna_h5ad: /data/mouse/D3/rna_adata.h5ad
+      atac_h5ad: /data/mouse/D3/atac_adata.h5ad
+      annotation_gtf: /reference/mm10/genes.gtf.gz  # Mouse mm10 gene annotation
+      genome_fasta: /reference/mm10/genome.fa  # Mouse mm10 reference genome
+    output:
+      dir: results/batch/D3_Zic2/  # Results directory, also holding configuration snapshots and logs
+      cache_dir: cache_test2_D3  # Cache directory; compatible motif caches may be reused
+
+  - name: D6_Zic2  # Second task: use D6 inputs
+    input:  # Task-specific input files and reference resources
+      rna_h5ad: /data/mouse/D6/rna_adata.h5ad
+      atac_h5ad: /data/mouse/D6/atac_adata.h5ad
+      annotation_gtf: /reference/mm10/genes.gtf.gz  # Mouse mm10 gene annotation
+      genome_fasta: /reference/mm10/genome.fa  # Mouse mm10 reference genome
+    output:
+      dir: results/batch/D6_Zic2/
+      cache_dir: cache_test2_D6
+
+  - name: RUNX1  # Human-input task; targets are set explicitly below
+    knockout_genes: [RUNX1]  # Override default targets; default type is TF
+    input:  # Task-specific input files and reference resources
+      rna_h5ad: /data/human/rna_adata.h5ad
+      atac_h5ad: /data/human/atac_adata.h5ad
+      annotation_gtf: /reference/GRCh38/genes.gtf.gz  # Gene annotation matching this task
+      genome_fasta: /reference/GRCh38/genome.fa  # Reference FASTA matching this task
+    output:
+      dir: results/batch/RUNX1/
+      cache_dir: cache_test  # Cache directory; compatible motif caches may be reused
+
+  - name: MYB  # Human-input task; targets are set explicitly below
+    knockout_genes: [MYB]  # Override default targets; default type is TF
+    input:  # Task-specific input files and reference resources
+      rna_h5ad: /data/human/rna_adata.h5ad
+      atac_h5ad: /data/human/atac_adata.h5ad
+      annotation_gtf: /reference/GRCh38/genes.gtf.gz  # Gene annotation matching this task
+      genome_fasta: /reference/GRCh38/genome.fa  # Reference FASTA matching this task
+    output:
+      dir: results/batch/MYB/
+      cache_dir: cache_test  # Cache directory; compatible motif caches may be reused
+
+  - name: LMO2  # Human-input task; targets are set explicitly below
+    knockout_genes: [LMO2]  # Override default targets; default type is TF
+    input:  # Task-specific input files and reference resources
+      rna_h5ad: /data/human/rna_adata.h5ad
+      atac_h5ad: /data/human/atac_adata.h5ad
+      annotation_gtf: /reference/GRCh38/genes.gtf.gz  # Gene annotation matching this task
+      genome_fasta: /reference/GRCh38/genome.fa  # Reference FASTA matching this task
+    output:
+      dir: results/batch/LMO2/
+      cache_dir: cache_test  # Cache directory; compatible motif caches may be reused
+
+  - name: ATF4  # Human-input task; targets are set explicitly below
+    knockout_genes: [ATF4]  # Override default targets; default type is TF
+    input:  # Task-specific input files and reference resources
+      rna_h5ad: /data/human/rna_adata.h5ad
+      atac_h5ad: /data/human/atac_adata.h5ad
+      annotation_gtf: /reference/GRCh38/genes.gtf.gz  # Gene annotation matching this task
+      genome_fasta: /reference/GRCh38/genome.fa  # Reference FASTA matching this task
+    output:
+      dir: results/batch/ATF4/
+      cache_dir: cache_test  # Cache directory; compatible motif caches may be reused
+
+  - name: KLF1  # Human-input task; targets are set explicitly below
+    knockout_genes: [KLF1]  # Override default targets; default type is TF
+    input:  # Task-specific input files and reference resources
+      rna_h5ad: /data/human/rna_adata.h5ad
+      atac_h5ad: /data/human/atac_adata.h5ad
+      annotation_gtf: /reference/GRCh38/genes.gtf.gz  # Gene annotation matching this task
+      genome_fasta: /reference/GRCh38/genome.fa  # Reference FASTA matching this task
+    output:
+      dir: results/batch/KLF/
+      cache_dir: cache_test  # Cache directory; compatible motif caches may be reused

@@ -54,6 +54,11 @@ def install_stubs(monkeypatch):
     def registry(kind, r, a, pt, cfg, plan):
         snapshot = t._snapshot(r, a, pt, cfg, plan)
         snapshot["context"] = t.response_context(snapshot["context"], cfg, kind)
+        if kind == t.TF_TYPE:
+            snapshot["context"]["tf_lag_mode"] = "local"
+            from CausalBridge import saturating_hybrid as core
+            snapshot["context"]["fingerprint"] = core._digest({
+                k:v for k,v in snapshot["context"].items() if k != "fingerprint"})
         return t._registry(kind, snapshot, t.validate_saturating_config(cfg), {}, {}, {})
     def step5(r, a, pt, edges, cfg, *, granger_results, bin_plan):
         seen.append((5, bin_plan, cfg))

@@ -35,12 +35,6 @@ def propagate_perturbation(
     from ._wt_aggregation import validate_model_mode
     validate_model_mode(config)
     from .saturating_perturbation import propagate_saturating
-    from .saturating_transfer import validate_registry
-    from .atac_normalization import expected_registry_schema
-    validate_registry(transfer_models, expected_type="saturating_hybrid_peak_gene",
-                      expected_schema=expected_registry_schema("saturating_hybrid_peak_gene",config))
-    validate_registry(tf_model_registry, expected_type="saturating_hybrid_tf_peak",
-                      expected_schema=expected_registry_schema("saturating_hybrid_tf_peak",config))
     return propagate_saturating(target_genes, rna_adata, atac_adata, pseudotime_df,
         granger_edges, transfer_functions, tf_peak_weights, config,
         transfer_models=transfer_models, tf_model_registry=tf_model_registry,
@@ -214,12 +208,6 @@ def perturb_peak(
     from ._wt_aggregation import validate_model_mode
     validate_model_mode(config)
     from .saturating_perturbation import perturb_peak_saturating
-    from .saturating_transfer import validate_registry
-    from .atac_normalization import expected_registry_schema
-    validate_registry(transfer_models, expected_type="saturating_hybrid_peak_gene",
-                      expected_schema=expected_registry_schema("saturating_hybrid_peak_gene",config))
-    validate_registry(tf_model_registry, expected_type="saturating_hybrid_tf_peak",
-                      expected_schema=expected_registry_schema("saturating_hybrid_tf_peak",config))
     return perturb_peak_saturating(peak_id, rna_adata, atac_adata, pseudotime_df,
         granger_edges, transfer_functions, tf_peak_weights, config,
         transfer_models=transfer_models, tf_model_registry=tf_model_registry,

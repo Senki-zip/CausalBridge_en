@@ -353,6 +353,10 @@ def atac_output_bounds(y, representation):
 
 
 def expected_registry_schema(kind, config):
+    if kind == "saturating_hybrid_tf_peak":
+        validate_atac_depth_config(config)
+        family = config.get("rna_to_atac", {}).get("response_model", "saturation")
+        return f"hybrid_{family}_tf_peak_local_registry_v3"
     layer = "atac_to_rna" if kind == "saturating_hybrid_peak_gene" else "rna_to_atac"
     if config.get("atac_to_rna", {}).get("model_mode") == "saturating_hybrid" and config.get(layer, {}).get("response_model", "saturation") == "nn":
         validate_atac_depth_config(config)

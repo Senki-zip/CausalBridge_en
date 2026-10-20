@@ -23,6 +23,8 @@ import ast
 import inspect
 import textwrap
 import copy
+from contextvars import ContextVar
+from functools import wraps
 from types import SimpleNamespace
 from importlib.metadata import version, PackageNotFoundError
 from scipy import sparse
@@ -106,14 +108,112 @@ def _provenance_fingerprint(value):
     return digest.hexdigest()
 
 
+# Exact reviewed source aliases for the low-count target rescue change only.
+# Actual matrices/axes/configuration remain covered by checkpoint fingerprints.
+# Any further numerical source edit produces a different hash and is NOT aliased.
+_TARGET_RESCUE_SOURCE_COMPATIBILITY = {
+    "CausalBridge.preprocess.preprocess_rna": (
+        "6203d4322cee79e7dca0003d88d65a76f85b801ecfcd82779928d10756cab59b",
+        "49e113765769bae262963adc064870e0178e16d4dd7010e127dbf63def137de2",
+    ),
+    "CausalBridge.run._prepare_identity_model_rna": (
+        "61ae6a5ad3d3d84002dbb61eacd6f550f03a69ac13d34ed61d34a90020572906",
+        "eab14e09f08982515ac6b75e449930b249040748119dd6e9a30f7b4ec154aacc",
+    ),
+}
+
+
+# Reviewed execution-only partitioning of candidate pairs. An alias applies
+# only while BOTH the dispatched function and complete worker implementation
+# match the verified version. Later arithmetic/kernel edits invalidate it.
+_SCREENING_SOURCE_COMPATIBILITY = {
+    "CausalBridge.granger.granger_test": (
+        "1cc978025c3930ac6770fa155ec8e871719e9f46d8425a2eafe2ab95aa419229",
+        "1eead3e505217f61a0e1cfe39fb421a4439d1c6b0b5850c482123ece8e27bf1d",
+    ),
+    "CausalBridge.kinetics.fit_rna_to_atac": (
+        "d37569c14093ca94fce6586571b7fb115dd4f0f80ed698eff476dd7810295f47",
+        "f3e61ac19679962463eea27d7230b248510f30f880468d29d655f9ba4d57e6bb",
+    ),
+}
+_SCREENING_EXECUTOR_SHA256 = '8cd9adf720d5e5dce13c6dc094b5d229a34e0f9be91aae0fe9fcf9f0911d257f'
+
+# Only repairs reference means that previously failed strict model validation.
+# Already valid model bundles and all fitted responses retain their contract.
+_WT_REFERENCE_SOURCE_COMPATIBILITY = {
+    "CausalBridge.saturating_hybrid.fit_target": (
+        "39a242bacfcc0db144005ba25589d68985faf4945ee9530a620cc0585e29fcd6",
+        "fc0ba8371457ec2fa04fcb064fbed600ba5f31d20cf9937c1cc486d96f5f36ba",
+    ),
+    "CausalBridge.saturating_transfer._source_signature": (
+        "cacd564ca7dcf18c5d2ed3abd53ef63a1aa8bc5709366bc56c65d6d13751ab39",
+        "1b1f56d111c02857f765e45e1aabf0dbbc7357274ea80eab7c8d8463f40bc802",
+    ),
+}
+
+_PIPELINE_SOURCE_HASHES = ContextVar('pipeline_source_hashes', default=None)
+
+
+def _with_pipeline_source_snapshot(function):
+    """Scope source identities to one invocation, without leaking across runs."""
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        token = _PIPELINE_SOURCE_HASHES.set({})
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _PIPELINE_SOURCE_HASHES.reset(token)
+    return wrapped
+
+
 def _numerical_source_hash(function):
+    snapshot = _PIPELINE_SOURCE_HASHES.get()
+    if snapshot is not None and function in snapshot:
+        return snapshot[function]
+    digest = _read_numerical_source_hash(function)
+    if snapshot is not None:
+        snapshot[function] = digest
+    return digest
+
+
+def _read_numerical_source_hash(function):
     """Hash an explicit consumed function/class, excluding comments/docstrings."""
-    tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+    try:
+        source = inspect.getsource(function)
+    except (OSError, IndexError) as exc:
+        raise RuntimeError(
+            f"cannot read loaded numerical source: {function.__module__}.{function.__qualname__}; "
+            "source may have moved while process was running; "
+            "源码与已加载代码不一致，请重启进程后从现有 checkpoint 继续，无需删除断点") from exc
+    tree = ast.parse(textwrap.dedent(source))
+    definitions = [node for node in tree.body
+                   if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+    lambda_source = function.__name__ == "<lambda>" and any(isinstance(node, ast.Lambda) for node in ast.walk(tree))
+    if not lambda_source and (len(definitions) != 1 or definitions[0].name != function.__name__):
+        raise RuntimeError(
+            f"source moved while process was running: {function.__module__}.{function.__qualname__}; "
+            "restart the process before creating checkpoints")
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             if node.body and isinstance(node.body[0], ast.Expr) and isinstance(node.body[0].value, ast.Constant) and isinstance(node.body[0].value.value, str):
                 node.body.pop(0)
-    return hashlib.sha256(ast.dump(tree, include_attributes=False).encode()).hexdigest()
+    digest = hashlib.sha256(ast.dump(tree, include_attributes=False).encode()).hexdigest()
+    key = function.__module__ + "." + function.__qualname__
+    compatible = _TARGET_RESCUE_SOURCE_COMPATIBILITY.get(key)
+    if compatible and digest == compatible[0]:
+        return compatible[1]
+    compatible = _WT_REFERENCE_SOURCE_COMPATIBILITY.get(key)
+    if compatible and digest == compatible[0]:
+        return compatible[1]
+    parallel = _SCREENING_SOURCE_COMPATIBILITY.get(key)
+    if parallel and digest == parallel[0]:
+        from . import screening_parallel
+        worker_digest = hashlib.sha256(Path(screening_parallel.__file__).read_bytes()).hexdigest()
+        if worker_digest == _SCREENING_EXECUTOR_SHA256:
+            return parallel[1]
+        # Include helper changes even if the dispatch wrapper did not change.
+        return hashlib.sha256((digest + worker_digest).encode()).hexdigest()
+    return digest
 
 
 def _stage_numerical_signatures(stage, model_mode="saturating_hybrid", *, gene_identity_mode="legacy"):
@@ -144,7 +244,7 @@ def _stage_numerical_signatures(stage, model_mode="saturating_hybrid", *, gene_i
         dependencies[kinetics] = ("fit_rna_to_atac", "_scan_one_sequence",
             "_materialize_raw_motif_hits", "_scan_peaks_with_jaspar", "_build_family_groups",
             "_supplement_family_proxies", "_extract_peak_sequences", "_extract_peak_sequences_from_causal",
-            "_assign_tfs_fallback", "_filter_tfs_by_expression", "_fit_tf_peak_regression",
+            "_assign_tfs_fallback", "_filter_tfs_by_expression", "_fit_tf_peak_regression", "_local_tf_peak_routes", "_local_tf_peak_routes_scalar",
             "_branch_aware_lag_pairs", "_parse_gimmemotifs_pfm", "_parse_cisbp_pfm",
             "_dedup_motifs_by_tf", "_compute_ic", "_pfm_to_pwm")
         packages = ("numpy", "pandas", "scipy", "biopython", "gimmemotifs")
@@ -337,6 +437,58 @@ CHECKPOINT_RECOVERY_GUIDANCE = (
 )
 
 
+# Reproduced inspect.getsource line-offset artifacts from the running pre-rescue
+# process after the target-rescue source edit. Never apply these as global hash
+# aliases: only the complete historical stage contract below can be accepted.
+_SHIFTED_RESCUE_SOURCE_HASHES = {
+    "CausalBridge.preprocess.preprocess_rna": (
+        "49e113765769bae262963adc064870e0178e16d4dd7010e127dbf63def137de2",
+        "6079921b46c0ae4eff19930f3e3b8d33643b5ae283231e40a5874a82a759df1e"),
+    "CausalBridge.preprocess.preprocess_atac": (
+        "864b262d8cf533967c54bc6575badf5d46ac688e835d3d5ca8aecee470f8d1fb",
+        "6203d4322cee79e7dca0003d88d65a76f85b801ecfcd82779928d10756cab59b"),
+    "CausalBridge.preprocess.match_cells": (
+        "2da8babdbcc522458677918ae8c3679d751e5f92f0c8d2a32d61fe4a7c54b22c",
+        "d65775c7e795c10737653fc5a33fd84e034d32abe773ad04cc51a98d82a542ae"),
+    "CausalBridge.preprocess.cluster_cells": (
+        "402faec1a4d69a54e202ed5008c0fb08a0eb85bd1f8f3cf7470f71acd79ad7b4",
+        "864b262d8cf533967c54bc6575badf5d46ac688e835d3d5ca8aecee470f8d1fb"),
+    "CausalBridge.run._validate_identity_required_genes": (
+        "914c69a16f61a7c5067365e1a2c0e35ceded9680b7cb27ca570fba4499837230",
+        "61ae6a5ad3d3d84002dbb61eacd6f550f03a69ac13d34ed61d34a90020572906"),
+    "CausalBridge.run._prepare_identity_model_rna": (
+        "eab14e09f08982515ac6b75e449930b249040748119dd6e9a30f7b4ec154aacc",
+        "61ae6a5ad3d3d84002dbb61eacd6f550f03a69ac13d34ed61d34a90020572906"),
+}
+
+
+def _shifted_rescue_checkpoint_contract(expected, stage, upstream):
+    """Reconstruct one exact historical signature error, keeping all data checks.
+
+    Contracts are never edited on disk. Rebuild chained digests from the full
+    expected contracts, rather than copying unverified saved digest values.
+    Any future edit of an affected source disables this compatibility path.
+    """
+    historical = copy.deepcopy(expected)
+    try:
+        stages = historical["stages"]
+        functions = stages["step4_granger"]["numerical"]["functions"]
+        if any(functions.get(key) != good for key, (good, _) in _SHIFTED_RESCUE_SOURCE_HASHES.items()):
+            return None
+        for name in ("step4_granger", "step5_atac_to_rna", "step6_rna_to_atac"):
+            functions = stages[name]["numerical"]["functions"]
+            for key, (good, shifted) in _SHIFTED_RESCUE_SOURCE_HASHES.items():
+                if key in functions:
+                    if functions[key] != good:
+                        return None
+                    functions[key] = shifted
+        stages["step5_atac_to_rna"]["step4_contract"] = _provenance_fingerprint(stages["step4_granger"])
+        stages["step6_rna_to_atac"]["step5_contract"] = _provenance_fingerprint(stages["step5_atac_to_rna"])
+        return _stage_checkpoint_metadata(historical, stage, upstream)
+    except KeyError:
+        return None
+
+
 def _validate_adaptive_checkpoint(checkpoint, expected, stage, upstream):
     metadata = checkpoint.get("adaptive_checkpoint") if isinstance(checkpoint, dict) else None
     guidance = CHECKPOINT_RECOVERY_GUIDANCE
@@ -350,6 +502,11 @@ def _validate_adaptive_checkpoint(checkpoint, expected, stage, upstream):
     # Optional audit fields cannot affect scientific compatibility.
     consumed = {key: metadata[key] for key in required if key in metadata}
     differences = _checkpoint_field_differences(consumed, required)
+    if differences:
+        historical = _shifted_rescue_checkpoint_contract(expected, stage, upstream)
+        if historical is not None and not _checkpoint_field_differences(consumed, historical):
+            logger.warning("%s: 兼容已复现的靶点捞回期间源码行号错位签名；数据、参数、上游结果及模型校验保持严格", stage)
+            differences = []
     if differences:
         raise RuntimeError(f"{stage}: incompatible adaptive checkpoint fields (up to 10): "
                            + "; ".join(differences) + ". " + guidance)
@@ -525,7 +682,8 @@ def _prepare_identity_model_rna(original, reference, canonical_full, targets, co
     # Do not apply GTF twice or use duplicate display symbols for retention.
     _validate_identity_axis(canonical_full, identity)
     model = preprocess_rna(canonical_full, **config["preprocess"]["rna"],
-        keep_genes=list(dict.fromkeys(required)), filter_cells=False)
+        keep_genes=list(dict.fromkeys(required)), filter_cells=False,
+        retain_low_count_targets=True)
     # Reference PCA loadings are not a fit on the GTF-restricted feature axis.
     model.varm.pop("PCs", None)
     model.uns.pop("pca", None)
@@ -726,8 +884,9 @@ def _collect_saturating_table(contexts, key):
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
-def _collect_saturating_tables(contexts):
-    result = {"model_mode": "saturating_hybrid", "effect_schema_version": "bin_saturating_effect_v1"}
+def _collect_saturating_tables(contexts, *, destination=None):
+    result = {} if destination is None else destination
+    result.update(model_mode="saturating_hybrid", effect_schema_version="bin_saturating_effect_v1")
     for key in ("saturating_gene_metrics", "saturating_tf_metrics", "saturating_response_weights",
                 "saturating_support_diagnostics", "saturating_gates", "saturating_response_curves",
                 "saturating_endpoints", "saturating_peak_attributions", "saturating_tf_peak_contributions",
@@ -750,11 +909,13 @@ def _saturating_registry_reports(registry, layer):
             input_unit=registry["input_unit"], output_unit=registry["output_unit"], **values))
     for target, values in registry.get("failures", {}).items():
         identity = {"gene": target} if layer == "peak_gene" else {"peak_id": target}
+        values = {k:v for k,v in values.items() if k != "local_route_diagnostics"}
         metrics.append(dict(identity, layer=layer, target_id=target,
             input_unit=registry["input_unit"], output_unit=registry["output_unit"], **values))
     for target, bundle in registry.get("targets", {}).items():
         for index, (source, lag) in enumerate(bundle["input_keys"]):
             row = dict(layer=layer, target_id=target, input_id=source, lag=lag,
+                lag_mode="local" if lag == "local" else "fixed",
                 alpha=bundle["weights"][index], wt_response_score=bundle["scores"][index],
                 included=True, fit_status=bundle["singles"][index]["metrics"]["status"],
                 input_unit=registry["input_unit"], output_unit=registry["output_unit"])
@@ -1021,6 +1182,7 @@ def _run_modeling_for_subset(
     suffix: str = None,
     rna_raw = None,
     gene_identity=None,
+    defer_simulation: bool = False,
 ) -> dict:
     """
     对细胞子集执行建模步骤 (Step 3-8)。
@@ -1354,6 +1516,35 @@ def _run_modeling_for_subset(
     )
 
     # ====================================================================
+    # Freeze the exact post-training context; workers never revisit Steps 3-7.
+    simulation_inputs = dict(
+        rna_adata=rna_adata, atac_adata=atac_adata, target_genes=target_genes,
+        gene_types=gene_types, config=config, _cfg=_cfg, suffix=suffix,
+        pseudotime_df=pseudotime_df, plan_kwargs=plan_kwargs,
+        enabled=enabled, identity_mode=identity_mode,
+        binning_output_metadata=binning_output_metadata if enabled else None)
+    if defer_simulation:
+        from .simulation_queue import save_simulation_job
+        stages = ("step4_granger", "step5_atac_to_rna", "step6_rna_to_atac")
+        manifest = save_simulation_job(
+            simulation_inputs,
+            {stage: _checkpoint_dir(config, checkpoint_suffix) / f"{stage}.pkl" for stage in stages},
+            checkpoint_metadata, upstream)
+        return {"simulation_manifest": manifest}
+    return _finish_modeling_for_subset(
+        **simulation_inputs, granger_results=granger_results,
+        causal_edges=causal_edges, transfer_functions=transfer_functions,
+        transfer_models=transfer_models, tf_weights=tf_weights,
+        tf_model_registry=tf_model_registry)
+
+
+def _finish_modeling_for_subset(*, rna_adata, atac_adata, target_genes,
+        gene_types, config, _cfg, suffix, pseudotime_df, plan_kwargs, enabled,
+        identity_mode, binning_output_metadata, granger_results, causal_edges,
+        transfer_functions, transfer_models, tf_weights, tf_model_registry):
+    """Shared simulation, cell projection and reporting for a fitted cohort."""
+    _log = logger.getChild(suffix or "global")
+    checkpoint_suffix = suffix
     # Step 8: 扰动模拟 (knockout_type 开关: "gene"=TF/基因 KO, "peak"=peak KO)
     # ====================================================================
     ko_type = _cfg.get("perturbation", {}).get("knockout_type", "gene")
@@ -1518,6 +1709,7 @@ def _run_modeling_for_subset(
 # 主 Pipeline
 # ============================================================================
 
+@_with_pipeline_source_snapshot
 def run_pipeline(config_path: str) -> dict:
     """
     CausalBridge 完整分析流程。
@@ -1540,6 +1732,15 @@ def run_pipeline(config_path: str) -> dict:
     logger.info("=" * 60)
 
     config = _joint_runtime_config(load_config(config_path))
+    # Resolve every consumed numerical function before loading data or fitting
+    # any cluster. Later checkpoint operations use these loaded-code identities,
+    # not inspect line offsets into files edited during a long run.
+    mode = validate_model_mode(config)
+    identity_mode = config.get("input", {}).get("gene_identity_mode", "legacy")
+    for stage in ("step4_granger", "step5_atac_to_rna", "step6_rna_to_atac"):
+        _stage_numerical_signatures(stage, mode, gene_identity_mode=identity_mode)
+    from .simulation_queue import execution_options, run_simulation_jobs
+    defer_simulation, simulation_workers = execution_options(config)
 
     # 打印所有路径，避免缓存/断点/数据混淆
     _log_paths(config)
@@ -1777,6 +1978,7 @@ def run_pipeline(config_path: str) -> dict:
             )
 
     # --- 逐分组循环 ---
+    prepared_cohorts = []
     all_cluster_results = []
     cluster_cell_counts = {}
     n_skipped = 0
@@ -1842,6 +2044,7 @@ def run_pipeline(config_path: str) -> dict:
             config,
             suffix=suffix,
             rna_raw=rna_raw,
+            **({"defer_simulation": True} if defer_simulation else {}),
             **({"gene_identity": gene_identity} if gene_identity is not None else {}),
         )
 
@@ -1849,6 +2052,17 @@ def run_pipeline(config_path: str) -> dict:
             logger.warning(f"  {label}: {result['error']}")
             continue
 
+        prepared_cohorts.append((grp, cells, n_cells, result))
+        del cohort_rna, result
+
+    if defer_simulation:
+        simulation_results = run_simulation_jobs(
+            [item[3]["simulation_manifest"] for item in prepared_cohorts],
+            workers=simulation_workers)
+    else:
+        simulation_results = (item[3] for item in prepared_cohorts)
+
+    for (grp, cells, n_cells, _), result in zip(prepared_cohorts, simulation_results):
         cluster_cell_counts[str(grp)] = n_cells
 
         # 标注分组来源
@@ -1879,6 +2093,8 @@ def run_pipeline(config_path: str) -> dict:
 
         result["cluster"] = str(grp)
         all_cluster_results.append(result)
+        if defer_simulation:
+            del result, pert, pw, up
 
     if n_skipped > 0:
         logger.info(f"跳过了 {n_skipped} 个样本量不足的簇")
@@ -1894,20 +2110,25 @@ def run_pipeline(config_path: str) -> dict:
     logger.info("结果汇总与保存")
     logger.info("=" * 60)
 
+    from .result_store import DiskResults
+    all_results = DiskResults.create(Path(config["output"]["dir"]) / "simulation_results" / "merged") if defer_simulation else {}
+
     # 合并各簇的扰动结果
     perturbation_dfs = [
         r["perturbation_results"] for r in all_cluster_results
         if not r["perturbation_results"].empty
     ]
     if perturbation_dfs:
-        all_perturbation = pd.concat(perturbation_dfs, ignore_index=True)
+        all_results['perturbation_results'] = pd.concat(perturbation_dfs, ignore_index=True)
     else:
-        all_perturbation = pd.DataFrame()
+        all_results['perturbation_results'] = pd.DataFrame()
+
+    del perturbation_dfs
 
     # 计算全组织加权平均 delta_rna (按簇细胞数加权)
     total_cells = sum(cluster_cell_counts.values())
-    if not all_perturbation.empty and total_cells > 0 and len(cluster_cell_counts) > 1:
-        pert_w = all_perturbation.copy()
+    if not all_results['perturbation_results'].empty and total_cells > 0 and len(cluster_cell_counts) > 1:
+        pert_w = all_results['perturbation_results'].copy()
         pert_w["_weight"] = pert_w["cluster"].map(cluster_cell_counts)
         grouped = pert_w.groupby(["target_gene", "affected_gene"])
         merged_rows = []
@@ -1928,9 +2149,12 @@ def run_pipeline(config_path: str) -> dict:
                 "perturbation_mode": grp["perturbation_mode"].iloc[0],
                 "n_clusters_observed": len(grp),
             })
-        merged_perturbation = pd.DataFrame(merged_rows)
+        all_results['perturbation_merged'] = pd.DataFrame(merged_rows)
     else:
-        merged_perturbation = all_perturbation.copy() if not all_perturbation.empty else pd.DataFrame()
+        all_results['perturbation_merged'] = all_results['perturbation_results'].copy() if not all_results['perturbation_results'].empty else pd.DataFrame()
+
+    if "pert_w" in locals():
+        del pert_w, grouped, grp
 
     # 合并各簇的路径级边记录
     pathway_dfs = [
@@ -1938,11 +2162,13 @@ def run_pipeline(config_path: str) -> dict:
         if r.get("pathway_edges") is not None and not r["pathway_edges"].empty
     ]
     if pathway_dfs:
-        all_pathway_edges = pd.concat(pathway_dfs, ignore_index=True)
+        all_results['pathway_edges'] = pd.concat(pathway_dfs, ignore_index=True)
     else:
-        all_pathway_edges = pd.DataFrame(columns=[
+        all_results['pathway_edges'] = pd.DataFrame(columns=[
             "target_gene", "tf_name", "peak_id", "affected_gene",
             "delta_r_raw", "delta_r_total", "mechanism", "r2_score", "tf_lag", "bin_min", "bin_max", "cluster"])
+
+    del pathway_dfs
 
     # 合并各簇的聚合 TF→peak 边 (含窗口验证翻转信息)
     agg_edge_dfs = [
@@ -1951,31 +2177,25 @@ def run_pipeline(config_path: str) -> dict:
         and not r["aggregated_tf_peak_edges"].empty
     ]
     if agg_edge_dfs:
-        all_agg_edges = pd.concat(agg_edge_dfs, ignore_index=True)
+        all_results['aggregated_tf_peak_edges'] = pd.concat(agg_edge_dfs, ignore_index=True)
     else:
-        all_agg_edges = pd.DataFrame(columns=[
+        all_results['aggregated_tf_peak_edges'] = pd.DataFrame(columns=[
             "tf_gene", "peak_id", "weight", "lag", "flipped", "original_lag"])
 
-    # 合并各簇的图结构，标注簇来源
-    causal_edges_list = []
-    transfer_functions_list = []
-    tf_weights_list = []
-    for i, r in enumerate(all_cluster_results):
-        cl_label = str(r.get("cluster", i))
-        ce = r["causal_edges"].copy()
-        ce["cluster"] = cl_label
-        causal_edges_list.append(ce)
-        tfw = r["tf_peak_weights"].copy()
-        tfw["cluster"] = cl_label
-        tf_weights_list.append(tfw)
-        tf = r["transfer_functions"].copy()
-        tf.attrs = {}  # gene metrics are collected separately, not compared by concat
-        tf["cluster"] = cl_label
-        transfer_functions_list.append(tf)
+    del agg_edge_dfs
 
-    merged_causal_edges = pd.concat(causal_edges_list, ignore_index=True)
-    merged_tf_weights = pd.concat(tf_weights_list, ignore_index=True)
-    merged_transfer_functions = pd.concat(transfer_functions_list, ignore_index=True)
+    # Merge one report family at a time; fitted weights, curves and edges
+    # must not all be duplicated in RAM during final aggregation.
+    for key in ("causal_edges", "tf_peak_weights", "transfer_functions"):
+        frames = []
+        for i, context in enumerate(all_cluster_results):
+            frame = context[key].copy()
+            frame["cluster"] = str(context.get("cluster", i))
+            if key == "transfer_functions":
+                frame.attrs = {}
+            frames.append(frame)
+        all_results[key] = pd.concat(frames, ignore_index=True)
+        del frames, frame
 
     # 合并各簇的伪时间（每簇独立推断，标注簇来源）
     pseudotime_dfs = []
@@ -1986,14 +2206,16 @@ def run_pipeline(config_path: str) -> dict:
             pt_df = pt_df.copy()
             pt_df["cluster"] = cl_label
             pseudotime_dfs.append(pt_df)
-    combined_pseudotime = pd.concat(pseudotime_dfs) if pseudotime_dfs else pd.DataFrame()
+    all_results['pseudotime'] = pd.concat(pseudotime_dfs) if pseudotime_dfs else pd.DataFrame()
+
+    del pseudotime_dfs, r
 
     # 合并各簇的 ATAC 变化 (用于 IGV 可视化)
     atac_changes_dfs = [
         r["atac_changes"] for r in all_cluster_results
         if r.get("atac_changes") is not None and not r["atac_changes"].empty
     ]
-    combined_atac_changes = pd.concat(atac_changes_dfs, ignore_index=True) if atac_changes_dfs else pd.DataFrame()
+    all_results['atac_changes'] = pd.concat(atac_changes_dfs, ignore_index=True) if atac_changes_dfs else pd.DataFrame()
 
     # 跨簇加权平均 ATAC 变化 (对齐 perturbation_merged 逻辑: 按簇细胞数加权)
     # 每个 peak 输出 signed + abs 双列 delta, 避免跨簇方向抵消
@@ -2042,21 +2264,27 @@ def run_pipeline(config_path: str) -> dict:
                 row.update(status="unavailable",delta_accessibility=np.nan,
                     delta_accessibility_signed=np.nan,z_score=np.nan,is_significant=False)
             merged_atac_rows.append(row)
-        merged_atac_changes = pd.DataFrame(merged_atac_rows)
+        all_results['atac_changes_merged'] = pd.DataFrame(merged_atac_rows)
     else:
-        merged_atac_changes = combined_atac_changes.copy() if not combined_atac_changes.empty else pd.DataFrame()
+        all_results['atac_changes_merged'] = all_results['atac_changes'].copy() if not all_results['atac_changes'].empty else pd.DataFrame()
+
+    del atac_changes_dfs
+    if "ac_full" in locals():
+        del ac_full, ac_tagged, ac, grp
 
     # 合并各簇的上游 TF 归因 (peak KO 模式; gene 模式下为空)
     upstream_dfs = [
         r["upstream_tfs"] for r in all_cluster_results
         if r.get("upstream_tfs") is not None and not r["upstream_tfs"].empty
     ]
-    all_upstream_tfs = pd.concat(upstream_dfs, ignore_index=True) if upstream_dfs else pd.DataFrame()
+    all_results['upstream_tfs'] = pd.concat(upstream_dfs, ignore_index=True) if upstream_dfs else pd.DataFrame()
+
+    del upstream_dfs
 
     # 上游 TF 跨簇加权合并视图 (按簇细胞数加权, 对齐 perturbation_merged 思路)
-    merged_upstream_tfs = pd.DataFrame()
-    if not all_upstream_tfs.empty and modeled_total_cells > 0 and len(cluster_cell_counts) > 1:
-        _up = all_upstream_tfs.copy()
+    all_results['upstream_tfs_merged'] = pd.DataFrame()
+    if not all_results['upstream_tfs'].empty and modeled_total_cells > 0 and len(cluster_cell_counts) > 1:
+        _up = all_results['upstream_tfs'].copy()
         _up["_weight"] = _up["cluster"].map(cluster_cell_counts).fillna(0)
         _up_rows = []
         for (pk, tf), grp in _up.groupby(["peak_id", "tf_gene"]):
@@ -2071,12 +2299,15 @@ def run_pipeline(config_path: str) -> dict:
                 "n_clusters_observed": len(grp),
             })
         if _up_rows:
-            merged_upstream_tfs = pd.DataFrame(_up_rows).sort_values(
+            all_results['upstream_tfs_merged'] = pd.DataFrame(_up_rows).sort_values(
                 "weight_abs_merged", ascending=False
             )
 
+    if "_up" in locals():
+        del _up, grp
+
     # peak 模式: 汇总各簇扰动 peak 的基线/扰后/Δ (供四段式 report 生成)
-    peak_summary = pd.DataFrame()
+    all_results['peak_summary'] = pd.DataFrame()
     if any(r.get("prediction_mode", "").startswith("peak_") for r in all_cluster_results):
         _ps_rows = []
         for r in all_cluster_results:
@@ -2092,82 +2323,73 @@ def run_pipeline(config_path: str) -> dict:
                 "n_upstream_tfs": len(r.get("upstream_tfs", pd.DataFrame())),
                 "n_affected_edges": r.get("n_affected_edges", 0),
             })
-        peak_summary = pd.DataFrame(_ps_rows)
+        all_results['peak_summary'] = pd.DataFrame(_ps_rows)
 
     projection_tables = [r.get("cell_projection") for r in all_cluster_results
                          if r.get("cell_projection") is not None and not r.get("cell_projection").empty]
-    projection_table = pd.concat(projection_tables, ignore_index=True) if projection_tables else pd.DataFrame()
+    all_results['cell_projection'] = pd.concat(projection_tables, ignore_index=True) if projection_tables else pd.DataFrame()
+    projection_tables.clear()
     projection_histories = [r.get("projection_history") for r in all_cluster_results
                             if r.get("projection_history") is not None and not r.get("projection_history").empty]
-    projection_history = pd.concat(projection_histories, ignore_index=True) if projection_histories else pd.DataFrame()
+    all_results['projection_history'] = pd.concat(projection_histories, ignore_index=True) if projection_histories else pd.DataFrame()
+    projection_histories.clear()
     projection_metadata_frames = [r.get("projection_bin_metadata") for r in all_cluster_results
                                   if r.get("projection_bin_metadata") is not None and not r.get("projection_bin_metadata").empty]
-    projection_metadata = pd.concat(projection_metadata_frames, ignore_index=True) if projection_metadata_frames else pd.DataFrame()
+    all_results['projection_bin_metadata'] = pd.concat(projection_metadata_frames, ignore_index=True) if projection_metadata_frames else pd.DataFrame()
+    projection_metadata_frames.clear()
     projection_event_frames = [r.get("projection_events") for r in all_cluster_results
                                if r.get("projection_events") is not None and not r.get("projection_events").empty]
-    projection_events = pd.concat(projection_event_frames, ignore_index=True) if projection_event_frames else pd.DataFrame()
-    projection_summary = pd.DataFrame()
-    projection_branch_probabilities = pd.DataFrame()
-    if not projection_table.empty:
-        projection_summary = (
-            projection_table.groupby(["source_context", "target_gene", "projection_status"], dropna=False)
+    all_results['projection_events'] = pd.concat(projection_event_frames, ignore_index=True) if projection_event_frames else pd.DataFrame()
+    all_results['projection_summary'] = pd.DataFrame()
+    all_results['projection_branch_probabilities'] = pd.DataFrame()
+    if not all_results['cell_projection'].empty:
+        all_results['projection_summary'] = (
+            all_results['cell_projection'].groupby(["source_context", "target_gene", "projection_status"], dropna=False)
             .size().reset_index(name="n_cells")
         )
-        probability_cols = [c for c in projection_table.columns if c.startswith("branch_probability_")]
+        probability_cols = [c for c in all_results['cell_projection'].columns if c.startswith("branch_probability_")]
         if probability_cols:
-            projection_branch_probabilities = projection_table[
+            all_results['projection_branch_probabilities'] = all_results['cell_projection'][
                 ["cell_id", "source_context", "target_gene"] + probability_cols
             ].melt(id_vars=["cell_id", "source_context", "target_gene"],
                    var_name="branch", value_name="branch_probability")
-            projection_branch_probabilities["branch"] = projection_branch_probabilities["branch"].str.replace(
-                "branch_probability_", "", regex=False
-            )
+            probabilities = all_results['projection_branch_probabilities']
+            probabilities["branch"] = probabilities["branch"].str.replace("branch_probability_", "", regex=False)
+            all_results['projection_branch_probabilities'] = probabilities
+            del probabilities
 
-    all_results = {
-        "causal_edges": merged_causal_edges,
-        "transfer_functions": merged_transfer_functions,
-        "tf_peak_weights": merged_tf_weights,
-        "perturbation_results": all_perturbation,
-        "perturbation_merged": merged_perturbation,
-        "pathway_edges": all_pathway_edges,
-        "aggregated_tf_peak_edges": all_agg_edges,
-        "atac_changes": combined_atac_changes,
-        "atac_changes_merged": merged_atac_changes,
-        "upstream_tfs": all_upstream_tfs,
-        "upstream_tfs_merged": merged_upstream_tfs,
-        "peak_summary": peak_summary,
-        "granger_results": all_cluster_results[0]["granger_results"],
-        "pseudotime": combined_pseudotime,
-        "cluster_results": all_cluster_results,
-    }
-    all_results.update(_collect_saturating_tables(all_cluster_results))
+    del projection_tables, projection_histories, projection_metadata_frames, projection_event_frames
+
+    all_results.update(granger_results=all_cluster_results[0]["granger_results"],
+                       cluster_results=all_cluster_results)
+    _collect_saturating_tables(all_cluster_results, destination=all_results)
     merged, diagnostics = _saturating_merge_contexts(all_cluster_results, joint_context_registry,
         list(rna_adata.var_names), config.get("perturbation", {}).get("min_delta_threshold", 0),
         policy=config.get("perturbation", {}).get("aggregation_policy", "strict_complete"),
         endpoints=all_results["saturating_endpoints"])
     all_results["perturbation_merged"] = merged
     all_results["saturating_aggregation_diagnostics"] = diagnostics
-    if config.get("perturbation", {}).get("cell_projection", {}).get("enabled", False):
-        all_results["cell_projection"] = projection_table
-        all_results["projection_history"] = projection_history
-        all_results["projection_bin_metadata"] = projection_metadata
-        all_results["projection_events"] = projection_events
-        all_results["projection_summary"] = projection_summary
-        all_results["projection_branch_probabilities"] = projection_branch_probabilities
+    if not config.get("perturbation", {}).get("cell_projection", {}).get("enabled", False):
+        for key in ("cell_projection", "projection_history", "projection_bin_metadata",
+                    "projection_events", "projection_summary", "projection_branch_probabilities"):
+            del all_results[key]
+    del merged, diagnostics
     if gene_identity is not None:
         all_results.update(identity_tables)
-        all_results["gene_identity_metadata"].update(effective_output_dir=config["output"]["dir"],
+        metadata = all_results["gene_identity_metadata"]
+        metadata.update(effective_output_dir=config["output"]["dir"],
             effective_checkpoint_dir=str(_checkpoint_dir(config)), cache_dir=config["output"].get("cache_dir"))
+        all_results["gene_identity_metadata"] = metadata
     save_results(all_results, config, **({"gene_identity": gene_identity} if gene_identity is not None else {}))
 
     # 汇总统计
-    if not all_perturbation.empty and "target_gene" in all_perturbation.columns:
-        n_clusters = all_perturbation["cluster"].nunique() if "cluster" in all_perturbation.columns else 1
-        n_unique_targets = all_perturbation["target_gene"].nunique()
-        n_unique_affected = all_perturbation["affected_gene"].nunique()
+    if not all_results['perturbation_results'].empty and "target_gene" in all_results['perturbation_results'].columns:
+        n_clusters = all_results['perturbation_results']["cluster"].nunique() if "cluster" in all_results['perturbation_results'].columns else 1
+        n_unique_targets = all_results['perturbation_results']["target_gene"].nunique()
+        n_unique_affected = all_results['perturbation_results']["affected_gene"].nunique()
         atac_mediated_pct = (
-            all_perturbation["mediated_by_atac"].mean() * 100
-            if "mediated_by_atac" in all_perturbation.columns
+            all_results['perturbation_results']["mediated_by_atac"].mean() * 100
+            if "mediated_by_atac" in all_results['perturbation_results'].columns
             else 0
         )
         logger.info("=" * 60)
@@ -2175,7 +2397,7 @@ def run_pipeline(config_path: str) -> dict:
         logger.info(f"  细胞簇数: {n_clusters}")
         logger.info(f"  目标基因数: {n_unique_targets}")
         logger.info(f"  受影响基因数: {n_unique_affected}")
-        logger.info(f"  预测的 target→affected 关系: {len(all_perturbation)}")
+        logger.info(f"  预测的 target→affected 关系: {len(all_results['perturbation_results'])}")
         logger.info(f"  通过 ATAC 介导的比例: {atac_mediated_pct:.1f}%")
         logger.info(f"  结果目录: {config['output']['dir']}")
         logger.info("=" * 60)

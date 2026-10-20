@@ -5,15 +5,18 @@ one fixed-route final pass; any lost group support triggers a whole-intervention
 weighted replay (at most three passes, never a splice of group/single histories).
 """
 from dataclasses import replace
+from copy import deepcopy
 import json
 import logging
+from time import monotonic
+from types import MappingProxyType, SimpleNamespace
 
 import numpy as np
 import pandas as pd
 
 from . import saturating_hybrid as core
 from .saturating_transfer import (GENE_TYPE,TF_TYPE,validate_saturating_config,
-    validate_registry,load_models,_snapshot,_dense,_net_metrics,_lag)
+    registry_schema,load_models,_snapshot,_dense,_net_metrics,_lag)
 from .saturating_projection import SCHEMA,cell_l0_from_saturating_payload
 
 
@@ -72,7 +75,7 @@ def _validate_screening_topology(edges, tf_weights, gene_registry, tf_registry):
             for row in frame.to_dict("records"):
                 target = str(row.get(target_column + "_id", row[target_column]))
                 source = str(row.get(input_column + "_id", row[input_column]))
-                lag = _lag(row.get(lag_column, 1 if registry["type"]==GENE_TYPE else 0))
+                lag = "local" if registry["type"]==TF_TYPE and row.get("lag_mode") == "local" else _lag(row.get(lag_column, 1 if registry["type"]==GENE_TYPE else 0))
                 relations.setdefault(target, set()).add((source, lag))
         if set(relations) != set(registry["targets"]) | set(registry["failures"]):
             raise ValueError("saturating screening topology differs from fitted registry; refit Step 5/6")
@@ -94,7 +97,150 @@ def _rows(model,context):
 
 
 def _inputs(model,rows,states,index):
-    return np.column_stack([states[rows-lag,index[key]] for key,lag in model.input_keys])
+    if not any(lag == "local" for _,lag in model.input_keys):
+        return np.column_stack([states[rows-lag,index[key]] for key,lag in model.input_keys])
+    positions = _row_positions(model, rows)
+    source = rows[:,None]-model.target_rows[positions,None]+model.source_bins[positions]
+    mask = model.route_supported[positions]
+    X = np.zeros(source.shape,dtype=float)
+    for i,(key,_) in enumerate(model.input_keys):
+        X[mask[:,i],i] = states[source[mask[:,i],i],index[key]]
+    return X
+
+
+def _row_positions(model, rows):
+    # A model's supplied global rows follow its immutable shared support order.
+    # Translate a partial query using branch offsets resolved by the caller.
+    global_rows = getattr(model, "_query_global_rows", None)
+    if global_rows is None:
+        raise ValueError("local model requires bound global query rows")
+    lookup = model._query_row_lookup
+    return np.array([lookup[int(b)] for b in rows],dtype=int)
+
+
+def _bind_rows(model, context):
+    rows = _rows(model,context)
+    rows.setflags(write=False)
+    object.__setattr__(model, "_query_global_rows", rows)
+    object.__setattr__(model, "_query_row_lookup", MappingProxyType({int(b):i for i,b in enumerate(rows)}))
+    return model
+
+
+def _input_support(model, rows, min_lag=False):
+    if not any(lag == "local" for _,lag in model.input_keys):
+        return np.ones((len(rows),len(model.input_keys)),dtype=bool)
+    positions = _row_positions(model, rows)
+    mask = model.route_supported[positions].copy()
+    if min_lag:
+        lag = model.target_rows[positions,None]-model.source_bins[positions]
+        minimum = np.min(np.where(mask, lag, np.iinfo(np.int64).max),axis=1)
+        mask &= lag == minimum[:,None]
+    return mask
+
+
+class _WTResponseCache:
+    """Lazy row-wise WT responses owned by one checked invocation cohort."""
+
+    def __init__(self, model, old):
+        self.model, self.old = model, old
+        self.predictions = None
+        self.ready = None
+        self.values = {}
+
+    def weighted_values(self, supported):
+        # Query masks can differ (e.g. local minimum-lag filtering). Keep their
+        # frozen-alpha baselines separate while sharing native WT responses.
+        key = np.packbits(supported).tobytes()
+        if key not in self.values:
+            self.values[key] = np.full(len(self.old), np.nan)
+        return self.values[key]
+
+    def row(self, position):
+        if self.predictions is None:
+            self.predictions = np.empty(self.old.shape, dtype=float)
+            self.ready = np.zeros(len(self.old), dtype=bool)
+        if not self.ready[position]:
+            m = self.model
+            references = m.diagnostics.get("single_WT_reference_means", [m.wt_mean]*len(m.singles))
+            self.predictions[position:position+1] = core._single_predictions(m.singles,
+                self.old[position:position+1], m.route_supported[position:position+1], references)
+            self.ready[position] = True
+        return self.predictions[position:position+1]
+
+
+class _SinglesPlan:
+    """Invocation-owned weighted preview over already checked, frozen WT rows.
+
+    Group selection/replay still uses the public predictor. With no cell support
+    the preview can only select singles, no_change, or no_information. Reuse
+    structural query checks, retaining row-wise evaluation so BLAS batch
+    reduction order cannot change the propagated floating-point values.
+    Nothing here is accepted from callers or persisted in a fitted registry.
+    """
+
+    def __init__(self, model, old, supported, declared, *, wt_cache=None):
+        self.model = model
+        self.old = old
+        self.supported = supported
+        self.declared = set(core._keys(declared)) if declared else set()
+        self.changed_columns = np.array([key in self.declared for key in model.input_keys])
+        if not self.declared.issubset(set(model.input_keys)):
+            raise ValueError("declared changed_inputs must cover all actual changes with known keys")
+        core._unit_domain(old, model.input_unit)
+        self.weights = np.asarray(model.weights)
+        self.references = model.diagnostics.get("single_WT_reference_means", [model.wt_mean]*len(model.singles))
+        if wt_cache is not None and (wt_cache.model is not model or wt_cache.old is not old):
+            raise ValueError("WT response cache must belong to this checked model/input cohort")
+        self.wt_cache = _WTResponseCache(model, old) if wt_cache is None else wt_cache
+        self.old_values = self.wt_cache.weighted_values(supported)
+        self.lower = np.array([single.x_range[0] for single in model.singles])
+        self.upper = np.array([single.x_range[1] for single in model.singles])
+        self.old_outside = ((old < self.lower) | (old > self.upper)) & supported
+        self.ordered_groups = sorted(model.groups, key=lambda g: (-g.diagnostics["penalized_gain"], g.indices))
+
+    def predict(self, position, new):
+        model = self.model
+        new = core._array(new, "new query", 2)
+        old = self.old[position:position+1]
+        supported = self.supported[position:position+1]
+        if new.shape != old.shape:
+            raise ValueError("query matrices must be aligned to input_keys")
+        core._unit_domain(new, model.input_unit)
+        actual = ((old != new) & supported)[0]
+        if (actual & ~self.changed_columns).any():
+            raise ValueError("declared changed_inputs must cover all actual changes with known keys")
+        outside = (self.old_outside[position] | (((new[0] < self.lower) | (new[0] > self.upper)) & supported[0]))
+        diagnostic = dict(changed_inputs=sorted(self.declared),
+            single_WT_range_exceeded=[key for key, flag in zip(model.input_keys, outside) if flag],
+            saturation_out_of_WT_support=bool(outside.any()), alpha_frozen=True,
+            active_input_renormalization=False, group_fallbacks=[],
+            route_scope="whole_query_batch", group_corrections_added=False)
+        predictions = None
+        if model.status == "no_information":
+            route, values = "no_information", np.zeros(1)
+        elif not actual.any():
+            route, values = "no_change", np.zeros(1)
+        else:
+            changed_indices = set(np.flatnonzero(self.changed_columns))
+            for group in self.ordered_groups:
+                reason = ("query_local_route_unsupported" if not supported[:, group.indices].all()
+                    else "changed_inputs_not_covered" if not changed_indices.issubset(set(group.indices))
+                    else "query_cell_support_missing")
+                diagnostic["group_fallbacks"].append(dict(indices=group.indices, reason=reason))
+            old_predictions = self.wt_cache.row(position).copy()
+            old_predictions[0, ~supported[0]] = np.asarray(self.references)[~supported[0]]
+            new_predictions = old_predictions.copy()
+            for i in np.flatnonzero(actual):
+                new_predictions[:,i] = model.singles[i].predict(new[:,i])
+            if np.isnan(self.old_values[position]):
+                self.old_values[position] = np.clip(old_predictions @ self.weights, *model.bounds)[0]
+            values = np.clip(new_predictions @ self.weights, *model.bounds) - self.old_values[position]
+            predictions = old_predictions, new_predictions
+            route = "singles"
+        # This result stays inside the private simulation; exported metadata is
+        # copied by the same audit construction as the general predictor path.
+        return SimpleNamespace(values=values, route=route, group_indices=(),
+            diagnostics=diagnostic, output_unit=model.output_unit, single_predictions=predictions)
 
 
 def _verify_wt_metrics(registry,models,snapshot):
@@ -102,7 +248,10 @@ def _verify_wt_metrics(registry,models,snapshot):
     context=snapshot["context"]
     gene_index={g:i for i,g in enumerate(context["gene_ids"])}
     peak_index={p:i for i,p in enumerate(context["peak_ids"])}
+    inputs = {}
+    started = last_log = monotonic()
     for target,model in models.items():
+        _bind_rows(model,context)
         rows=_rows(model,context)
         if registry["type"]==GENE_TYPE:
             X=_inputs(model,rows,snapshot["A"],peak_index)
@@ -115,10 +264,12 @@ def _verify_wt_metrics(registry,models,snapshot):
             from .atac_normalization import atac_output_bounds
             if model.bounds!=atac_output_bounds(y,context.get("atac_representation",{"unit":"raw_atac"})):
                 raise ValueError("TF output cap differs from frozen WT representation/range")
-        predictions=np.column_stack([single.predict(X[:,i]) for i,single in enumerate(model.singles)])
-        adjacent=(np.diff(model.target_rows)==1)&(np.array(model.branch_ids[1:])==np.array(model.branch_ids[:-1]))
-        adjacent &= np.all(np.diff(model.source_bins,axis=0)==1,axis=1)
-        scores=np.mean(abs(np.diff(predictions,axis=0)[adjacent]),axis=0) if adjacent.any() else np.zeros(len(model.input_keys))
+        X=core._array(X,"checked WT inputs",2)
+        inputs[target] = X
+        local = any(lag == "local" for _,lag in model.input_keys)
+        predictions=(core._single_predictions(model.singles,X,model.route_supported,model.diagnostics["single_WT_reference_means"]) if local else
+            np.column_stack([single.predict(X[:,i]) for i,single in enumerate(model.singles)]))
+        scores,_=core._wt_scores(predictions,model.target_rows,model.branch_ids,model.source_bins,model.route_supported,local)
         if not np.array_equal(scores,np.asarray(model.scores)):
             raise ValueError("frozen WT response scores differ from fitted registry")
         metrics=_net_metrics(model,X,y)
@@ -132,6 +283,12 @@ def _verify_wt_metrics(registry,models,snapshot):
                 if value is not reference:raise ValueError("stored target quality differs from frozen WT")
             elif not np.isclose(value,reference,rtol=1e-10,atol=1e-12):
                 raise ValueError("stored target quality differs from frozen WT")
+        now = monotonic()
+        if now-last_log >= 5:
+            logger.info("Step 8 WT 质量核验 [%s]: %d/%d 模型，耗时 %.1fs",
+                registry["type"], len(inputs), len(models), now-started)
+            last_log = now
+    return inputs
 
 
 def _closure(targets,seed_peak,genes,tfmodels,depth,*,tf_keys=None,work_budget=None):
@@ -170,7 +327,7 @@ def _closure(targets,seed_peak,genes,tfmodels,depth,*,tf_keys=None,work_budget=N
     return selected_genes,selected_peaks
 
 
-def _contributions(model,old,new,route,group_indices):
+def _contributions(model,old,new,route,group_indices,input_support=None):
     if route=="group":
         group=next(g for g in model.groups if g.indices==group_indices)
         value=old[:,group.indices].copy();previous=group.predict(value)
@@ -181,25 +338,86 @@ def _contributions(model,old,new,route,group_indices):
             previous=current
         return output,"ordered_telescoping_not_causal"
     return [(i,float(weight*(single.predict(new[:,i])[0]-single.predict(old[:,i])[0])))
-            for i,(weight,single) in enumerate(zip(model.weights,model.singles))],"frozen_alpha_single_response"
+            for i,(weight,single) in enumerate(zip(model.weights,model.singles))
+            if input_support is None or input_support[0,i]],"frozen_alpha_single_response"
+
+
+def _prepare_simulation(rna,atac,pt,config,gene_registry,tf_registry,*,bin_plan=None,cluster_label="",screening=None):
+    """Own one invocation's registry snapshot, models and checked WT matrices.
+
+    The returned private closure never escapes a public invocation. No caller
+    registry, identity cache or caller-supplied trusted flag can skip validation.
+    Each new invocation copies and fully validates both libraries again.
+    Keep the shared transfer/core validators unchanged for fit-cache signatures.
+    """
+    started = monotonic()
+    logger.info("Step 8 创建本次调用的模型库快照")
+    gene_registry,tf_registry = deepcopy((gene_registry,tf_registry))
+    config = deepcopy(config)
+    cfg=validate_saturating_config(config)
+    logger.info("Step 8 校验 peak→gene 模型库并加载")
+    gmodels,gsupport=load_models(gene_registry,GENE_TYPE)
+    logger.info("Step 8 校验 TF→peak 模型库并加载；peak→gene=%d，耗时 %.1fs", len(gmodels),monotonic()-started)
+    tmodels,tsupport=load_models(tf_registry,TF_TYPE)
+    for registry in (gene_registry,tf_registry):
+        lag_mode = registry["context"].get("tf_lag_mode", "fixed")
+        if lag_mode not in ("fixed", "local") or registry["schema"] != registry_schema(registry["type"],config,lag_mode=lag_mode):
+            raise ValueError("unexpected saturating registry type/schema")
+    if screening is not None:
+        _validate_screening_topology(*screening,gene_registry,tf_registry)
+    prepared=None
+    def simulate(*,targets=(),seed_peak=None):
+        nonlocal prepared
+        if prepared is None:
+            # Publish only a completely checked WT cohort. In particular, a
+            # missing peak keeps its existing registry-only early return.
+            prepared=_prepare_wt_context(rna,atac,pt,config,cfg,gene_registry,tf_registry,
+                gmodels,tmodels,bin_plan,started)
+        snapshot,ginputs,tinputs=prepared
+        return _simulate_prepared(rna,atac,pt,config,gene_registry,tf_registry,
+            snapshot,gmodels,gsupport,tmodels,tsupport,ginputs,tinputs,
+            targets=targets,seed_peak=seed_peak,cluster_label=cluster_label)
+    return simulate
+
+
+def _prepare_wt_context(rna,atac,pt,config,cfg,gene_registry,tf_registry,gmodels,tmodels,bin_plan,started):
+    logger.info("Step 8 构建 WT 快照；peak→gene=%d，TF→peak=%d，耗时 %.1fs", len(gmodels),len(tmodels),monotonic()-started)
+    snapshot=_snapshot(rna,atac,pt,config,bin_plan)
+    # Shared WT values have immutable byte buffers, just like fitted model
+    # arrays. Direct intervention states are separate writable copies.
+    for key in ("R","A"):
+        snapshot[key]=core._array(snapshot[key],"frozen WT "+key,2)
+    snapshot["rna_cells"]=core._array(_dense(rna.X),"frozen WT RNA cells",2)
+    context=snapshot["context"]
+    for registry in (gene_registry,tf_registry):
+        from .saturating_transfer import response_context
+        expected_context = response_context(context, config, registry["type"])
+        if registry["context"].get("tf_lag_mode") == "local":
+            expected_context["tf_lag_mode"] = "local"
+            expected_context["fingerprint"] = core._digest({k:v for k,v in expected_context.items() if k != "fingerprint"})
+        if registry["context"]["fingerprint"]!=expected_context["fingerprint"] or core.HybridConfig.from_dict(registry["config"])!=cfg:
+            raise ValueError("saturating simulation differs from fitted WT context/config")
+    logger.info("Step 8 WT 质量核验开始；模型=%d",len(gmodels)+len(tmodels))
+    ginputs=_verify_wt_metrics(gene_registry,gmodels,snapshot)
+    tinputs=_verify_wt_metrics(tf_registry,tmodels,snapshot)
+    snapshot["_wt_response_caches"] = {(kind,target):_WTResponseCache(model,values[target])
+        for kind,table,values in ((GENE_TYPE,gmodels,ginputs),(TF_TYPE,tmodels,tinputs))
+        for target,model in table.items()}
+    logger.info("Step 8 WT 质量核验完成；耗时 %.1fs",monotonic()-started)
+    return snapshot,ginputs,tinputs
 
 
 def _simulate(rna,atac,pt,config,gene_registry,tf_registry,*,targets=(),seed_peak=None,bin_plan=None,cluster_label=""):
-    cfg=validate_saturating_config(config)
-    gmodels,gsupport=load_models(gene_registry,GENE_TYPE)
-    tmodels,tsupport=load_models(tf_registry,TF_TYPE)
-    snapshot=_snapshot(rna,atac,pt,config,bin_plan)
+    return _prepare_simulation(rna,atac,pt,config,gene_registry,tf_registry,
+        bin_plan=bin_plan,cluster_label=cluster_label)(targets=targets,seed_peak=seed_peak)
+
+
+def _simulate_prepared(rna,atac,pt,config,gene_registry,tf_registry,
+        snapshot,gmodels,gsupport,tmodels,tsupport,ginputs,tinputs,*,targets=(),seed_peak=None,cluster_label=""):
     context=snapshot["context"]
     representation=context.get("atac_representation",{"unit":"raw_atac"})
     continuous=representation["unit"]=="normalized_atac_log1p"
     ceiling=float(np.log1p(representation["target_sum"])) if continuous else 1.
-    for registry in (gene_registry,tf_registry):
-        from .saturating_transfer import response_context
-        expected_context = response_context(context, config, registry["type"])
-        if registry["context"]["fingerprint"]!=expected_context["fingerprint"] or core.HybridConfig.from_dict(registry["config"])!=cfg:
-            raise ValueError("saturating simulation differs from fitted WT context/config")
-    _verify_wt_metrics(gene_registry,gmodels,snapshot)
-    _verify_wt_metrics(tf_registry,tmodels,snapshot)
     genes,peaks=context["gene_ids"],context["peak_ids"]
     gi,ai={v:i for i,v in enumerate(genes)},{v:i for i,v in enumerate(peaks)}
     if not targets and seed_peak is None:
@@ -213,8 +431,14 @@ def _simulate(rna,atac,pt,config,gene_registry,tf_registry,*,targets=(),seed_pea
     excluded.update(gene_registry["failures"])
     eligible={g:m for g,m in gmodels.items() if g not in excluded}
     eligible_tf={a:m for a,m in tmodels.items() if tf_registry["target_metrics"][a]["status"]!="budget_exhausted"}
-    tf_keys={a:tuple(key for key in m.input_keys if not p.get("min_lag_per_peak_filter",False)
-                    or key[1]==min(lag for _,lag in m.input_keys)) for a,m in eligible_tf.items()}
+    tf_keys={}
+    for a,m in eligible_tf.items():
+        if any(lag == "local" for _,lag in m.input_keys):
+            mask = _input_support(m,_rows(m,context),p.get("min_lag_per_peak_filter",False))
+            tf_keys[a] = tuple(key for i,key in enumerate(m.input_keys) if mask[:,i].any())
+        else:
+            tf_keys[a] = tuple(key for key in m.input_keys if not p.get("min_lag_per_peak_filter",False)
+                or key[1]==min(lag for _,lag in m.input_keys))
     depth = p.get("peak_ko", {}).get("depth", 1) if seed_peak is not None else p.get("subnetwork_depth","unlimited")
     work_budget=p.get("subnetwork_unlimited_max_work_edges")
     if work_budget is not None:work_budget=core._integer(work_budget,"subnetwork_unlimited_max_work_edges",1)
@@ -226,9 +450,11 @@ def _simulate(rna,atac,pt,config,gene_registry,tf_registry,*,targets=(),seed_pea
     active_g={g:m for g,m in eligible.items() if g in selected_genes and g not in targets}
     active_t={a:m for a,m in eligible_tf.items() if a in selected_peaks and a!=seed_peak}
     models={(GENE_TYPE,g):m for g,m in active_g.items()}|{(TF_TYPE,a):m for a,m in active_t.items()}
+    wt_inputs={(kind,target):values[target] for kind,values,table in
+        ((GENE_TYPE,ginputs,active_g),(TF_TYPE,tinputs,active_t)) for target in table}
     declared={key:tuple(k for k in m.input_keys if k[0] in (selected_peaks if key[0]==GENE_TYPE else selected_genes)
                        and (key[0]==GENE_TYPE or k in tf_keys[key[1]])) for key,m in models.items()}
-    cells=_dense(rna.X).astype(float)
+    cells=snapshot["rna_cells"]
     factors=np.ones_like(cells)
     strength=core._number(p.get("ko_strength",1.),"ko_strength")
     if not 0<=strength<=1:
@@ -267,8 +493,21 @@ def _simulate(rna,atac,pt,config,gene_registry,tf_registry,*,targets=(),seed_pea
             if not 0<=amount<=ceiling:raise ValueError("absolute peak strength outside declared ATAC state ceiling")
             seed_values=np.asarray(snapshot["operator"]@np.full(atac.n_obs,amount)).ravel() if continuous else np.full(len(WT_A),amount)
         else:raise ValueError("unsupported saturating peak intervention mode")
-    row_lookup={key:set(_rows(m,context).tolist()) for key,m in models.items()}
+    supports={key:_input_support(m,m._query_global_rows,key[0]==TF_TYPE and p.get("min_lag_per_peak_filter",False))
+        for key,m in models.items()}
+    singles_plans={key:_SinglesPlan(m,wt_inputs[key],supports[key],declared[key],
+        wt_cache=snapshot["_wt_response_caches"][key]) for key,m in models.items()}
+    # Resolve branch offsets and feature columns once, rather than rebuilding
+    # local row maps and fetching each input through a separate NumPy query.
+    query_sources={key:m._query_global_rows[:,None]-m.target_rows[:,None]+m.source_bins
+        for key,m in models.items()}
+    query_columns={key:np.array([(ai if key[0]==GENE_TYPE else gi)[name] for name,_ in m.input_keys])
+        for key,m in models.items()}
+    query_enabled={key:supports[key] & np.array([key[0]==GENE_TYPE or k in tf_keys[key[1]] for k in m.input_keys])
+        for key,m in models.items()}
     def run(locked=None):
+        started = last_log = monotonic()
+        logger.info("Step 8 传播 [%s]: bin=%d，活跃模型=%d，锁定组=%d", ",".join(targets) if targets else seed_peak,len(WT_R),len(models),len(locked or {}))
         R=direct_R.copy();A=WT_A.copy()
         if seed_peak is not None:A[:,ai[seed_peak]]=seed_values
         rbad=np.zeros(R.shape,bool);abad=np.zeros(A.shape,bool)
@@ -286,7 +525,7 @@ def _simulate(rna,atac,pt,config,gene_registry,tf_registry,*,targets=(),seed_pea
             support_rows.append(audit)
             events.append(dict(audit,diagnostic=reason))
         locked={} if locked is None else locked
-        locked_models={key:replace(models[key],groups=(next(g for g in models[key].groups if g.indices==indices),)) for key,indices in locked.items()}
+        locked_models={key:_bind_rows(replace(models[key],groups=(next(g for g in models[key].groups if g.indices==indices),)),context) for key,indices in locked.items()}
         for start,end in snapshot["boundaries"]:
             for b in range(start,end):
                 # RNA lag1 is finalized before all same-bin TF lag0 queries.
@@ -295,9 +534,14 @@ def _simulate(rna,atac,pt,config,gene_registry,tf_registry,*,targets=(),seed_pea
                     (TF_TYPE,active_t,WT_R,R,gi,abad,rbad,gi,tsupport,aorigins,rorigins)):
                     for target,m in table.items():
                         key=(kind,target)
-                        if b not in row_lookup[key]:continue
-                        enabled=m.input_keys if kind==GENE_TYPE else tf_keys[target]
-                        sources=[(b-lag,name) for name,lag in enabled]
+                        pos=m._query_row_lookup.get(b)
+                        if pos is None:continue
+                        positions = slice(pos,pos+1)
+                        input_support = supports[key][positions]
+                        mask=query_enabled[key][pos]
+                        enabled = tuple(k for k,flag in zip(m.input_keys,mask) if flag)
+                        source_bins=query_sources[key][pos]
+                        sources=[(int(s),name) for s,(name,_),flag in zip(source_bins,m.input_keys,mask) if flag]
                         target_index=gi[target] if kind==GENE_TYPE else ai[target]
                         if any(inputbad[s,inputidx[name]] for s,name in sources):
                             bad[b,target_index]=True
@@ -308,16 +552,18 @@ def _simulate(rna,atac,pt,config,gene_registry,tf_registry,*,targets=(),seed_pea
                             record_failure(kind,target,m,b,enabled,"unavailable_upstream",
                                 "enabled input state is unavailable",inherited)
                             continue
-                        old=_inputs(m,np.array([b]),WT,index)
-                        new=_inputs(m,np.array([b]),current,index)
-                        if kind==TF_TYPE:
-                            for i,input_key in enumerate(m.input_keys):
-                                if input_key not in enabled:new[:,i]=old[:,i]
+                        old=wt_inputs[key][positions]
+                        new=old.copy()
+                        new[0,mask]=current[source_bins[mask],query_columns[key][mask]]
                         selected=locked_models.get(key,m)
                         try:
-                            answer=core.predict_delta(selected,old,new,changed_inputs=declared[key],
-                                branch_ids=(context["bin_branch_ids"][b],),
-                                cell_support=shared if key in locked else None)
+                            if key not in locked:
+                                answer=singles_plans[key].predict(pos,new)
+                            else:
+                                answer=core.predict_delta(selected,old,new,changed_inputs=declared[key],
+                                    branch_ids=(context["bin_branch_ids"][b],),
+                                    cell_support=shared, input_support=input_support,
+                                    target_rows=m.target_rows[positions] if any(lag=="local" for _,lag in m.input_keys) else None)
                             if key in locked and answer.route not in ("group","no_change","no_information"):
                                 raise _Replay(f"{kind}/{target}: locked group lost support")
                             delta=float(answer.values[0])
@@ -331,14 +577,23 @@ def _simulate(rna,atac,pt,config,gene_registry,tf_registry,*,targets=(),seed_pea
                             gene=target if kind==GENE_TYPE else None, peak_id=target if kind==TF_TYPE else None,
                             branch=context["bin_branch_ids"][b],status="ok",
                             group_indices=answer.group_indices,changed_inputs=declared[key],
-                            saturation_out_of_WT_support=answer.diagnostics["saturation_out_of_WT_support"]))
+                            saturation_out_of_WT_support=answer.diagnostics["saturation_out_of_WT_support"],
+                            local_route_status="supported" if input_support.any() else "no_supported_lag",
+                            input_routes_json=json.dumps([dict(input_id=name,source_bin=s,lag=b-s) for s,name in sources])))
                         event = dict(bin=b, gene=target if kind==GENE_TYPE else None,
                             peak_id=target if kind==TF_TYPE else None, target_id=target,
                             relation_type=kind, status="ok", delta_native=delta,
                             route=answer.route, group_indices=answer.group_indices)
                         events.append(event)
                         if delta==0:continue
-                        contributions,method=_contributions(selected,old,new,answer.route,answer.group_indices)
+                        predictions=getattr(answer,"single_predictions",None)
+                        if predictions is None:
+                            contributions,method=_contributions(selected,old,new,answer.route,answer.group_indices,input_support)
+                        else:
+                            old_predictions,new_predictions=predictions
+                            contributions=[(i,float(weight*(new_predictions[0,i]-old_predictions[0,i])))
+                                for i,weight in enumerate(m.weights) if input_support[0,i]]
+                            method="frozen_alpha_single_response"
                         if kind==GENE_TYPE:
                             before=np.log1p(direct_R[b,target_index])+delta
                             after=float(np.clip(before,0,m.bounds[1]))
@@ -354,8 +609,14 @@ def _simulate(rna,atac,pt,config,gene_registry,tf_registry,*,targets=(),seed_pea
                             if before!=A[b,target_index]:event["status"]="ATAC_physical_clip"
                             for i,value in contributions:
                                 if m.input_keys[i] not in enabled:continue
-                                tf_contributions.append(dict(bin=b,source_bin=b-m.input_keys[i][1],tf_gene=m.input_keys[i][0],
+                                source_bin = (next(s for s,name in sources if name == m.input_keys[i][0])
+                                    if m.input_keys[i][1] == "local" else b-m.input_keys[i][1])
+                                tf_contributions.append(dict(bin=b,source_bin=source_bin,tf_lag=b-source_bin,tf_gene=m.input_keys[i][0],
                                     peak_id=target,delta_atac_raw=value,method=method,causal_claim=False))
+                now = monotonic()
+                if now-last_log >= 5:
+                    logger.info("Step 8 传播 bin %d/%d，活跃模型=%d，耗时 %.1fs",b+1,len(WT_R),len(models),now-started)
+                    last_log = now
         return dict(R=R,A=A,rbad=rbad,abad=abad,events=events,clips=clips,support=support_rows,
                     attributions=attributions,tf_contributions=tf_contributions,rorigins=rorigins,aorigins=aorigins)
     preview=run()
@@ -364,11 +625,14 @@ def _simulate(rna,atac,pt,config,gene_registry,tf_registry,*,targets=(),seed_pea
         if not m.groups or not declared[key]:continue
         rows=_rows(m,context)
         old_states,new_states,index,shared=(WT_A,preview["A"],ai,gsupport) if key[0]==GENE_TYPE else (WT_R,preview["R"],gi,tsupport)
-        old=_inputs(m,rows,old_states,index);new=_inputs(m,rows,new_states,index)
+        old=wt_inputs[key];new=_inputs(m,rows,new_states,index)
         if key[0]==TF_TYPE:
             for i,input_key in enumerate(m.input_keys):
                 if input_key not in tf_keys[key[1]]:new[:,i]=old[:,i]
-        answer=core.predict_delta(m,old,new,changed_inputs=declared[key],branch_ids=m.branch_ids,cell_support=shared)
+        query_support = supports[key]
+        if key[0]==TF_TYPE:
+            new = np.where(query_support,new,old)
+        answer=core.predict_delta(m,old,new,changed_inputs=declared[key],branch_ids=m.branch_ids,cell_support=shared,input_support=query_support)
         if answer.route=="group":routes[key]=answer.group_indices
     replay_count=0;replay_reason=None
     if routes:
@@ -397,6 +661,7 @@ def _simulate(rna,atac,pt,config,gene_registry,tf_registry,*,targets=(),seed_pea
         payload["atac_representation"]=representation
     # Unavailable columns abstain; do not contaminate unrelated valid endpoints.
     # The public payload remains invalid and cannot be silently projected.
+    logger.info("Step 8 重建细胞端点 [%s]",label)
     _,_,pert_cp=cell_l0_from_saturating_payload(dict(payload,invalid_state=False))
     pert_cp[:,final["rbad"].any(axis=0)]=np.nan
     control_cp=np.expm1(cells)
@@ -483,6 +748,8 @@ def _simulate(rna,atac,pt,config,gene_registry,tf_registry,*,targets=(),seed_pea
     path_events = result["local_events"].copy()
     path_events["target_gene"] = label
     path_events["source_context"] = str(cluster_label or "global")
+    logger.info("Step 8 构建通路 [%s]: TF→peak 贡献=%d，peak→gene 贡献=%d",label,
+        len(result["saturating_tf_peak_contributions"]),len(result["saturating_peak_attributions"]))
     result[KEY] = build_pathways(result["saturating_tf_peak_contributions"],
         result["saturating_peak_attributions"], result["saturating_endpoints"],
         branch_boundaries=snapshot["boundaries"], control_atac_states=WT_A,
@@ -498,12 +765,11 @@ def propagate_saturating(target_genes,rna,atac,pt,edges,transfers,tf_weights,con
     validate_saturating_config(config)
     if any(str((gene_types or {}).get(g,"TF")).upper()!="TF" for g in target_genes):
         raise ValueError("saturating_hybrid does not support TARGET proxy interventions")
-    validate_registry(transfer_models,expected_type=GENE_TYPE);validate_registry(tf_model_registry,expected_type=TF_TYPE)
-    _validate_screening_topology(edges,tf_weights,transfer_models,tf_model_registry)
     groups=[list(target_genes)] if config.get("perturbation",{}).get("joint_knockout",False) else [[g] for g in target_genes]
     if not groups or any(not g for g in groups):raise ValueError("empty saturating gene intervention")
-    results=[_simulate(rna,atac,pt,config,transfer_models,tf_model_registry,targets=group,
-        bin_plan=bin_plan,cluster_label=cluster_label) for group in groups]
+    simulate=_prepare_simulation(rna,atac,pt,config,transfer_models,tf_model_registry,
+        bin_plan=bin_plan,cluster_label=cluster_label,screening=(edges,tf_weights))
+    results=[simulate(targets=group) for group in groups]
     output=dict(results[0])
     for name in ("perturbation_results","atac_changes","saturating_endpoints","saturating_peak_attributions",
                  "saturating_tf_peak_contributions","saturating_support_diagnostics","l1_floor_diagnostics","saturating_gene_metrics",
@@ -519,13 +785,12 @@ def propagate_saturating(target_genes,rna,atac,pt,edges,transfers,tf_weights,con
 def perturb_peak_saturating(peak_id,rna,atac,pt,edges,transfers,tf_weights,config,*,
         transfer_models=None,tf_model_registry=None,bin_plan=None,cluster_label=""):
     validate_saturating_config(config)
-    validate_registry(transfer_models,expected_type=GENE_TYPE);validate_registry(tf_model_registry,expected_type=TF_TYPE)
-    _validate_screening_topology(edges,tf_weights,transfer_models,tf_model_registry)
+    simulate=_prepare_simulation(rna,atac,pt,config,transfer_models,tf_model_registry,
+        bin_plan=bin_plan,cluster_label=cluster_label,screening=(edges,tf_weights))
     from .perturbation import _match_peak
     matched, info = _match_peak(peak_id, atac, config.get("perturbation", {}).get("peak_ko", {}).get("match", "exact"))
     if matched is None:
         return dict(error="peak_not_found", requested_peak=peak_id, match_info=info)
-    output = _simulate(rna,atac,pt,config,transfer_models,tf_model_registry,seed_peak=matched,
-        bin_plan=bin_plan,cluster_label=cluster_label)
+    output = simulate(seed_peak=matched)
     output.update(requested_peak=peak_id, match_info=info)
     return output

@@ -90,7 +90,7 @@ def test_save_results_writes_only_configured_root(tmp_path, monkeypatch, mode, c
     assert cfg == before
     output = tmp_path / cfg["output"]["dir"]
     assert set(tmp_path.rglob("perturbation_results.csv")) == {
-        output / "perturbation_results.csv", output / "intermediate/perturbation_results.csv"}
+        output / "perturbation_results.csv"}
 
 
 @pytest.mark.parametrize("mode", ["legacy_pair_nn"])
