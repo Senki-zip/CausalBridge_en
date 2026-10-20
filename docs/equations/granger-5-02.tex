@@ -1,0 +1,8 @@
+\begin{aligned}
+c&=\left[\frac{\mathtt{reference\_bins}-3}{\max(\mathtt{n\_valid\_pairs}-3,1)}\right]^2,\\
+\alpha_{\mathrm{corrected}}&=\frac{\mathtt{significance\_threshold}}{c},\qquad
+E_{\mathrm{corrected}}=\mathtt{min\_effect\_size}\,c,\\
+p_{\mathrm{score}}&=\operatorname{clip}\!\left(1-\frac{p_{\mathrm{adj}}}{\alpha_{\mathrm{corrected}}},0,1\right),\\
+E_{\mathrm{score}}&=\frac12\operatorname{clip}\!\left(\frac{\mathtt{delta\_r2}}{E_{\mathrm{corrected}}},0,2\right),\\
+\mathtt{composite\_score}&=0.4p_{\mathrm{score}}+0.6E_{\mathrm{score}}.
+\end{aligned}

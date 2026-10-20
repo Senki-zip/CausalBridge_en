@@ -1,0 +1,10 @@
+\begin{aligned}
+\mathcal A_{\mathrm{local}}&=\{i:r_{i+1}-r_i=1,\ b_{i+1}=b_i\},\\
+m_{ij}&=\mathbf 1\{\mathtt{route\_supported}_{ij}\},\\
+S_j&=\begin{cases}
+\displaystyle\frac{1}{|\mathcal A_{\mathrm{local}}|}\sum_{i\in\mathcal A_{\mathrm{local}}}
+ m_{ij}m_{i+1,j}\,|f_j(x_{i+1,j})-f_j(x_{ij})|,&|\mathcal A_{\mathrm{local}}|>0,\\
+0,&|\mathcal A_{\mathrm{local}}|=0,
+\end{cases}\\
+\alpha_j&=\begin{cases}S_j/\sum_kS_k,&\sum_kS_k>0,\\0,&\sum_kS_k=0.\end{cases}
+\end{aligned}

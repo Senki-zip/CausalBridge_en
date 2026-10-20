@@ -187,13 +187,19 @@ The model uses a single gene-level TSS approximation; it does not explicitly mod
 
 The current hybrid configuration enables a continuous model view while keeping `preprocess.atac.binarize: true` for reference QC. Before QC, it saves original integer counts and full input depth:
 
-```text
-layers['_atac_input_counts'] = original peak counts
-obs['_atac_full_input_depth'] = D_i = sum of counts over every original input peak
-Model A_ip = log1p(S * C_ip / D_i), currently S=10000
-```
+Original peak counts are saved in `layers['_atac_input_counts']`; complete-input depths are saved in `obs['_atac_full_input_depth']`.
 
-D is not recomputed after peak filtering, cell subsetting, or clustering. It is a peak-count depth proxy, not independently verified total fragments. The model unit is `normalized_atac_log1p`. The TF output upper bound is `min(log1p(S), WTmax + λ*WTspan)`, currently λ=0.25; continuous values are not clipped to [0,1].
+![Continuous ATAC normalization](docs/equations/atac-3-01.svg)
+
+[LaTeX](docs/equations/atac-3-01.tex)
+
+D is not recomputed after peak filtering, cell subsetting, or clustering. It is a peak-count depth proxy, not independently verified total fragments. The model unit is `normalized_atac_log1p`. The TF output upper bound is determined from the WT range below; continuous values are not clipped to [0,1]:
+
+![Continuous ATAC upper bound](docs/equations/atac-3-02.svg)
+
+[LaTeX](docs/equations/atac-3-02.tex)
+
+Here $A_{\min},A_{\max}$ describe the current target peak's WT range; the resulting bound is frozen from WT.
 
 Validation incorporates the complete original axes, depths, retained-count summaries, and per-cell summaries. Conflicting raw layers are not overwritten; retained zero-depth cells raise an error. For custom peak subsets, call `finalize_atac_qc(subset, prepared_source)` while the complete original source is available, then construct `depth_log1p_model_view`. Arbitrary slicing cannot be used to fabricate provenance.
 
@@ -218,11 +224,9 @@ Parameters are fixed at `batch=NULL, enableFast=FALSE, ncores=1, subsamplesize=1
 
 Gaussian soft binning weights neighboring cells to balance temporal resolution and mean noise. Hard binning averages within each bin: few bins in small cohorts lose resolution, while forcing more bins increases mean noise. Soft binning computes:
 
-```text
-w_ji = exp[-0.5*((time_i-center_j)/sigma_j)^2]
-X_bin[j] = Σ_i w_ji X_i / Σ_i w_ji
-ESS_j = (Σ_i w_ji)^2 / Σ_i w_ji^2
-```
+![Gaussian binning weights, means and effective sample size](docs/equations/binning-4-01.svg)
+
+[LaTeX](docs/equations/binning-4-01.tex)
 
 `n_bins: 50` is an upper limit; actual bin counts adapt to cohort size and `min_cells_per_bin: 10`. The Gaussian route borrows information within the overlap limit; `smooth_overlap_factor: 2` limits sigma expansion relative to bin width. Hard mode uses no soft windows. Consult diagnostics for the actual bin count.
 
@@ -265,13 +269,9 @@ Candidates use the distance from the midpoint of a peak to a same-chromosome gen
 
 The standard one-step model compares the same valid rows:
 
-```text
-Reduced: Y(t) = b0 + b1*Y(t-1) + e
-Full:    Y(t) = b0 + b1*Y(t-1) + b2*A(t-1) + e
-F = [(SSE_reduced-SSE_full)/1] / [SSE_full/(n-3)]
-delta_r2 = 1 - SSE_full/SSE_reduced
-p = scipy.stats.f.sf(F, 1, n-3)
-```
+![Reduced and full Granger models, F statistic and partial R squared](docs/equations/granger-5-01.svg)
+
+[LaTeX](docs/equations/granger-5-01.tex)
 
 `delta_r2` measures improvement relative to the reduced model's remaining error, a partial R² form rather than a difference in ordinary R² with total variation as denominator. SSE is the least-squares residual sum of squares. Both standard and lag-0 routes use this definition.
 
@@ -281,14 +281,9 @@ Low-variance / low-SSE, valid-row, and rank-deficiency skip rules remain. The la
 
 Valid candidate p-values undergo the configured correction, such as fdr_bh. Small cohorts use the following threshold scaling to limit overfitting:
 
-```text
-c = [(reference_bins-3)/max(n_valid_pairs-3,1)]^2
-alpha_corrected = significance_threshold/c
-effect_corrected = min_effect_size*c
-p_score = clip(1-p_adj/alpha_corrected,0,1)
-effect_score = clip(delta_r2/effect_corrected,0,2)/2
-composite_score = 0.4*p_score + 0.6*effect_score
-```
+![Degrees-of-freedom scaling and composite screening score](docs/equations/granger-5-02.svg)
+
+[LaTeX](docs/equations/granger-5-02.tex)
 
 soft_threshold screens by composite score and does not require every edge to meet separate p / effect thresholds. The hard route requires both. The pipeline may further adjust reference_bins / composite thresholds for small cohorts; consult the logs.
 
@@ -357,14 +352,9 @@ For one target, let aligned WT data be $(X,y)$ and $x_{ij}$ input j in row i. In
 
 Let $D=U-L$, $\sigma(t)=(1+e^{-t})^{-1}$, and $h(t)=t/(1+|t|)$. All three families share the same output bounds for a target. The current [bound implementation](CausalBridge/atac_normalization.py) uses:
 
-```math
-L=0,\qquad
-U=\begin{cases}
-\max_i y_i+\lambda_{\rm RNA}(\max_i y_i-\min_i y_i), & \text{RNA L2},\\
-\min\{\log(1+S),\ \max_i y_i+\lambda_{\rm ATAC}(\max_i y_i-\min_i y_i)\}, & \text{continuous ATAC},\\
-1, & \text{binary ATAC proportion view}.
-\end{cases}
-```
+![Shared response output bounds](docs/equations/response-6-1-01.svg)
+
+[LaTeX](docs/equations/response-6-1-01.tex)
 
 Currently $S=10000$, and both upper-bound expansion coefficients are $0.25$. These WT-derived bounds are frozen and not reestimated at perturbation queries. The nondegenerate formulas below assume $D>0$ and variable input / output. For constant inputs / outputs or $D=0$, single relations use the implementation's constant-mean branch and record that status; parameter identifiability is not claimed.
 
@@ -388,17 +378,15 @@ There is no single-relation ridge. SciPy's reported cost is $1/2$ of this sum of
 
 For $d$ inputs, define the following network; singles use $d=1$, groups use $d=2$ or $3$:
 
-```math
-u_j=\frac{x_j-\mu_j}{s_j},\qquad
-f_\theta(x)=L+D\,\sigma\!\left[v^\top\tanh(Wu+b)+c\right].
-```
+![Bounded neural network response](docs/equations/response-6-3-01.svg)
+
+[LaTeX](docs/equations/response-6-3-01.tex)
 
 $\mu_j$ and $s_j$ are the fitted WT input mean and population standard deviation (`ddof=0`); zero standard deviations are safely replaced by $1$. They are stored as model constants and not recomputed for queries. $W\in\mathbb R^{H\times d}$, $b,v\in\mathbb R^H$, and $c\in\mathbb R$. Let $\theta$ concatenate **all** elements of $W,b,v,c$, giving $p=H(d+2)+1$ parameters. Training and best-snapshot selection use the same objective:
 
-```math
-J_{\rm NN}(\theta)=\frac1n\sum_{i=1}^n\left(\frac{f_\theta(x_i)-y_i}{D}\right)^2
-+\lambda_{\rm NN}\frac{\|\theta\|_2^2}{p}.
-```
+![Neural network training objective](docs/equations/response-6-3-02.svg)
+
+[LaTeX](docs/equations/response-6-3-02.tex)
 
 Biases are penalized; WT normalization means / scales are not. Current `nn_response` settings are `hidden_width: 4, epochs: 300, lr: 0.01, l2: 0.01, seed: 42, restarts: 1`. Adam trains on all WT rows, retaining the best objective snapshot across epochs / restarts, without an independent validation set. Training uses Torch CPU float64 and limits Torch threads during worker initialization. Inference and immutable-model validation use NumPy, without CUDA. Completing fixed epochs is not solver convergence; NN restarts are independent of the saturation budget.
 
@@ -406,23 +394,17 @@ Biases are penalized; WT normalization means / scales are not. Current `nn_respo
 
 Let $z=(x-x_{\min})/(x_{\max}-x_{\min})$. Within the WT range, the latent curve is $g(z)=\sum_k\theta_k B_{k,3}(z)$. $B_{k,3}$ are cubic B-splines with four repeated knots at each end. Internal knots are equal quantiles of normalized WT inputs, deduplicated and excluding endpoints. For any such curve, define the tail-extension operator:
 
-```math
-(T_\tau g)(z)=\begin{cases}
-g(0)+\tau g'(0)(e^{z/\tau}-1), & z<0,\\
-g(z), & 0\le z\le1,\\
-g(1)+\tau g'(1)(1-e^{-(z-1)/\tau}), & z>1.
-\end{cases}
-\qquad f(x)=L+D\,\sigma((T_\tau g)(z)).
-```
+![Spline response with continuous exponential tails](docs/equations/response-6-4-01.svg)
+
+[LaTeX](docs/equations/response-6-4-01.tex)
 
 Values and first derivatives are continuous at the boundaries ($C^1$). The latent plateaus are $g(0)-\tau g'(0)$ and $g(1)+\tau g'(1)$. Sigmoid maps them to learned finite response plateaus, without forcing $L,U$; curves may be nonmonotonic. $x=0$ is a finite location in the nonnegative input domain and is not automatically the left-infinite plateau.
 
 All derivatives and integrals are with respect to dimensionless $z$. The objective is:
 
-```math
-J_{\rm spline}(\theta)=\frac1n\sum_{i=1}^n\left(\frac{f(x_i)-y_i}{D}\right)^2
-+\lambda_s\left[\int_0^1(g''(z))^2\,dz+\frac{g'(0)^2+g'(1)^2}{2\tau}\right].
-```
+![Spline training objective](docs/equations/response-6-4-02.svg)
+
+[LaTeX](docs/equations/response-6-4-02.tex)
 
 The curvature integral uses 12-point Gauss–Legendre quadrature on each nonzero knot interval. The endpoint-slope term also equals the integrated squared curvature of the exponential tails above. There is no additional single-relation ridge. Initialization fits a design-matrix least-squares solution to logits of normalized WT output clipped to $[10^{-4},1-10^{-4}]$; further starts add Gaussian perturbations with a fixed seed.
 
@@ -499,12 +481,9 @@ Only adjacent rows in their original order and branch are compared. Rows are not
 
 **Local-lag TF→peak** uses the separate rule below, without requiring consecutive source bins. Target rows must differ by1 and share a branch. A response difference contributes only when both endpoints support that input. The denominator counts all such target-adjacent pairs, rather than that input's supported pairs:
 
-```text
-A = all adjacent supplied row pairs with consecutive target_bin in the same branch
-S[j] = sum(abs(f[j](X[next,j])-f[j](X[prev,j]))
-           for (prev,next) in A if both endpoints have route_supported[:,j]) / len(A)
-alpha[j] = S[j] / sum(S)   # all alpha are0 when the total score is0
-```
+![Local-lag WT response scores and frozen alpha weights](docs/equations/response-6-6-06.svg)
+
+[LaTeX](docs/equations/response-6-6-06.tex)
 
 With no adjacent pairs the score is0. Source bins may jump as selected lags change. For example, if there are3 target-adjacent pairs and an input supports2 of them with differences2 and1, then `S=3/3=1`, rather than1.5. Missing support reduces the accumulated score without amplifying remaining supported rows.
 
@@ -586,9 +565,9 @@ With local routes, minimum lag is compared among supported TFs **per peak and ta
 
 Changes from multiple regulatory paths accumulate in L2 before a single transformation to L1, preserving signed addition. The endpoint transform is:
 
-```text
-L1' = expm1(log1p(L1_WT) + Σ ΔL2)
-```
+![RNA endpoint reconstruction from accumulated L2 changes](docs/equations/propagation-7-01.svg)
+
+[LaTeX](docs/equations/propagation-7-01.tex)
 
 Symmetry in L2 does not imply symmetry in final CP10k effects. Check negative-L1 truncation and unavailable cell-endpoint states. Reconstruction is a forward mapping, not an exact inverse of binning, and does not recover raw UMI.
 
@@ -618,6 +597,12 @@ Bin-wise `bin_forward` preserves branches, TF lags, peak→gene temporal advance
 After transforming L2 changes to L1, cell reconstruction floors negative values at zero, then recovers CP10k. Bin means need not equal reconstructed cell endpoints. `l1_floor_diagnostics.csv`, endpoint `status`, and upper / lower bound evidence identify flooring and unavailability. Zero means, nonfinite values, and missing endpoints are not ordinary zero effects.
 
 Current `valid_cell_means` uses WT and perturbed means from **the same valid context / cell subset** for each gene, weights them by cell count, then computes `log2(perturbed mean/WT mean)` rather than averaging cluster log2FC. Quality-filtered, missing-endpoint, failed, and nonpositive-mean contexts are excluded from both sides with reasons recorded. Explicitly valid, unselected genes with equal WT / perturbed values in the quality-pruned network can supply unchanged baselines; assumptions and context counts are reported separately. Missing effects are not zero-filled.
+
+Let $\mathcal V_g$ be the same valid context set for gene $g$, $N_c$ the valid cell count and $\mu_{gc}$ its corresponding cell CP10k mean:
+
+![Valid-cell-weighted WT and KO means and merged log2 fold change](docs/equations/aggregation-8-01.svg)
+
+[LaTeX](docs/equations/aggregation-8-01.tex)
 
 Read `aggregation_scope` (`full/partial/unavailable`), `aggregation_used_cells`, `aggregation_total_cells`, `aggregation_excluded_cells`, `aggregation_cell_fraction`, context counts, and `aggregation_context_exclusions`. partial represents only the listed valid subset and cannot be generalized to every input cell. Optional `strict_complete` requires full coverage; section 12 describes diagnostic limitations.
 
@@ -1556,17 +1541,15 @@ R loading failures retain package names and underlying messages; Python exceptio
 
 **Fix**: the propagation simulation itself is unchanged. For each first-triggered `peak→gene` edge whose target gene is an executable TF, the model L2 delta is first back-converted on top of the original L1 expression at the triggering bin:
 
-```text
-ΔL1_event = expm1(log1p(L1_orig[t]) + ΔL2_event) - L1_orig[t]
-```
+![Historical v1.38.2 event response in RNA L1](docs/equations/history-1-38-2-01.svg)
+
+[LaTeX](docs/equations/history-1-38-2-01.tex)
 
 Only the output contribution is recorded; nothing is written back into later bins and the TF→peak input is unchanged. The final mean contribution of the event is weighted by the fraction of remaining bins:
 
-```text
-weighted_ΔL1 = ΔL1_event × (n_bins - t) / n_bins
-TF_mean_KO = TF_mean_WT + initialization_offset + Σ weighted_ΔL1
-log2FC = log2(TF_mean_KO / TF_mean_WT)
-```
+![Historical v1.38.2 time-weighted TF endpoint](docs/equations/history-1-38-2-02.svg)
+
+[LaTeX](docs/equations/history-1-38-2-02.tex)
 
 Here `initialization_offset` preserves the direct repression effect on proxy TFs from non-TF KOs. Non-TFs still use the existing `delta_cum` endpoint reconstruction path; `log_accumulation: false` keeps the legacy behavior. If the simulated L1 endpoint is invalid (`<=0`), the current result is kept as `NaN`; downstream result filtering may omit that row. This is a numerical validity state, not a biological zero effect.
 

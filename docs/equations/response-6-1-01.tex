@@ -1,0 +1,6 @@
+L=0,\qquad
+U=\begin{cases}
+\max_i y_i+\lambda_{\rm RNA}(\max_i y_i-\min_i y_i), & \text{RNA L2},\\
+\min\{\log(1+S),\ \max_i y_i+\lambda_{\rm ATAC}(\max_i y_i-\min_i y_i)\}, & \text{continuous ATAC},\\
+1, & \text{binary ATAC proportion}.
+\end{cases}
