@@ -199,7 +199,7 @@ D is not recomputed after peak filtering, cell subsetting, or clustering. It is 
 
 [LaTeX](docs/equations/atac-3-02.tex)
 
-Here $A_{\min},A_{\max}$ describe the current target peak's WT range; the resulting bound is frozen from WT.
+Here $`A_{\min},A_{\max}`$ describe the current target peak's WT range; the resulting bound is frozen from WT.
 
 Validation incorporates the complete original axes, depths, retained-count summaries, and per-cell summaries. Conflicting raw layers are not overwritten; retained zero-depth cells raise an error. For custom peak subsets, call `finalize_atac_qc(subset, prepared_source)` while the complete original source is available, then construct `depth_log1p_model_view`. Arbitrary slicing cannot be used to fabricate provenance.
 
@@ -348,15 +348,15 @@ This shared fitting-core signature change affects both Step5 and Step6. Reusing 
 
 ### 6.1 Notation, units, and output bounds
 
-For one target, let aligned WT data be $(X,y)$ and $x_{ij}$ input j in row i. In the losses below, $n$ is the actual number of fitting rows: supported rows for a local TF→peak single, jointly supported rows for a group, and commonly aligned rows for fixed peak→gene. WT bin rows receive equal loss weights; cell ESS is used for group support checks, not loss weighting. TF→peak uses RNA L1 inputs and model ATAC targets; peak→gene uses model ATAC inputs and RNA L2 targets. See section8 for normalization and endpoint units. Below, $f,F,\Delta y$ use the corresponding layer's **target-model units**.
+For one target, let aligned WT data be $`(X,y)`$ and $`x_{ij}`$ input j in row i. In the losses below, $`n`$ is the actual number of fitting rows: supported rows for a local TF→peak single, jointly supported rows for a group, and commonly aligned rows for fixed peak→gene. WT bin rows receive equal loss weights; cell ESS is used for group support checks, not loss weighting. TF→peak uses RNA L1 inputs and model ATAC targets; peak→gene uses model ATAC inputs and RNA L2 targets. See section8 for normalization and endpoint units. Below, $`f,F,\Delta y`$ use the corresponding layer's **target-model units**.
 
-Let $D=U-L$, $\sigma(t)=(1+e^{-t})^{-1}$, and $h(t)=t/(1+|t|)$. All three families share the same output bounds for a target. The current [bound implementation](CausalBridge/atac_normalization.py) uses:
+Let $`D=U-L`$, $`\sigma(t)=(1+e^{-t})^{-1}`$, and $`h(t)=t/(1+|t|)`$. All three families share the same output bounds for a target. The current [bound implementation](CausalBridge/atac_normalization.py) uses:
 
 ![Shared response output bounds](docs/equations/response-6-1-01.svg)
 
 [LaTeX](docs/equations/response-6-1-01.tex)
 
-Currently $S=10000$, and both upper-bound expansion coefficients are $0.25$. These WT-derived bounds are frozen and not reestimated at perturbation queries. The nondegenerate formulas below assume $D>0$ and variable input / output. For constant inputs / outputs or $D=0$, single relations use the implementation's constant-mean branch and record that status; parameter identifiability is not claimed.
+Currently $`S=10000`$, and both upper-bound expansion coefficients are $`0.25`$. These WT-derived bounds are frozen and not reestimated at perturbation queries. The nondegenerate formulas below assume $`D\gt 0`$ and variable input / output. For constant inputs / outputs or $`D=0`$, single relations use the implementation's constant-mean branch and record that status; parameter identifiability is not claimed.
 
 ### 6.2 saturation singles: softsign curves
 
@@ -366,23 +366,23 @@ A softsign curve has two plateaus, a center, and a scale:
 
 [LaTeX](docs/equations/response-6-2-01.tex)
 
-Both plateaus $p_{0j},p_{1j}\in[L,U]$ are learned from WT and are the limits as $x\to-\infty,+\infty$, respectively. Activation and repression are allowed; the plateaus are not forced to $L,U$. Let $r=\max(x_{\max}-x_{\min},10^{-8})$. Constraints are $c_j\in[x_{\min}-r,x_{\max}+r]$ and $s_j\in[10^{-6}r,100r]$, with actual optimization variables $(p_{0j},p_{1j},c_j,\log s_j)$. SciPy least squares uses residuals $(f_j(x_{ij})-y_i)/D$, equivalent to minimizing:
+Both plateaus $`p_{0j},p_{1j}\in[L,U]`$ are learned from WT and are the limits as $`x\to-\infty,+\infty`$, respectively. Activation and repression are allowed; the plateaus are not forced to $`L,U`$. Let $`r=\max(x_{\max}-x_{\min},10^{-8})`$. Constraints are $`c_j\in[x_{\min}-r,x_{\max}+r]`$ and $`s_j\in[10^{-6}r,100r]`$, with actual optimization variables $`(p_{0j},p_{1j},c_j,\log s_j)`$. SciPy least squares uses residuals $`(f_j(x_{ij})-y_i)/D`$, equivalent to minimizing:
 
 ![Equation 6.2.2](docs/equations/response-6-2-02.svg)
 
 [LaTeX](docs/equations/response-6-2-02.tex)
 
-There is no single-relation ridge. SciPy's reported cost is $1/2$ of this sum of squares. Within deterministic `det_starts` and `max_nfev` budgets, valid candidates are selected by WT MSE. The current `best_finite` policy can retain finite, bounded candidates after budget exhaustion while recording `solver_converged=False`, raw solver status, and evaluation count. Numerical failures are excluded.
+There is no single-relation ridge. SciPy's reported cost is $`1/2`$ of this sum of squares. Within deterministic `det_starts` and `max_nfev` budgets, valid candidates are selected by WT MSE. The current `best_finite` policy can retain finite, bounded candidates after budget exhaustion while recording `solver_converged=False`, raw solver status, and evaluation count. Numerical failures are excluded.
 
 ### 6.3 NN singles: independent bounded networks
 
-For $d$ inputs, define the following network; singles use $d=1$, groups use $d=2$ or $3$:
+For $`d`$ inputs, define the following network; singles use $`d=1`$, groups use $`d=2`$ or $`3`$:
 
 ![Bounded neural network response](docs/equations/response-6-3-01.svg)
 
 [LaTeX](docs/equations/response-6-3-01.tex)
 
-$\mu_j$ and $s_j$ are the fitted WT input mean and population standard deviation (`ddof=0`); zero standard deviations are safely replaced by $1$. They are stored as model constants and not recomputed for queries. $W\in\mathbb R^{H\times d}$, $b,v\in\mathbb R^H$, and $c\in\mathbb R$. Let $\theta$ concatenate **all** elements of $W,b,v,c$, giving $p=H(d+2)+1$ parameters. Training and best-snapshot selection use the same objective:
+$`\mu_j`$ and $`s_j`$ are the fitted WT input mean and population standard deviation (`ddof=0`); zero standard deviations are safely replaced by $`1`$. They are stored as model constants and not recomputed for queries. $`W\in\mathbb R^{H\times d}`$, $`b,v\in\mathbb R^H`$, and $`c\in\mathbb R`$. Let $`\theta`$ concatenate **all** elements of $`W,b,v,c`$, giving $`p=H(d+2)+1`$ parameters. Training and best-snapshot selection use the same objective:
 
 ![Neural network training objective](docs/equations/response-6-3-02.svg)
 
@@ -392,59 +392,59 @@ Biases are penalized; WT normalization means / scales are not. Current `nn_respo
 
 ### 6.4 spline singles: cubic latent splines and exponential tails
 
-Let $z=(x-x_{\min})/(x_{\max}-x_{\min})$. Within the WT range, the latent curve is $g(z)=\sum_k\theta_k B_{k,3}(z)$. $B_{k,3}$ are cubic B-splines with four repeated knots at each end. Internal knots are equal quantiles of normalized WT inputs, deduplicated and excluding endpoints. For any such curve, define the tail-extension operator:
+Let $`z=(x-x_{\min})/(x_{\max}-x_{\min})`$. Within the WT range, the latent curve is $`g(z)=\sum_k\theta_k B_{k,3}(z)`$. $`B_{k,3}`$ are cubic B-splines with four repeated knots at each end. Internal knots are equal quantiles of normalized WT inputs, deduplicated and excluding endpoints. For any such curve, define the tail-extension operator:
 
 ![Spline response with continuous exponential tails](docs/equations/response-6-4-01.svg)
 
 [LaTeX](docs/equations/response-6-4-01.tex)
 
-Values and first derivatives are continuous at the boundaries ($C^1$). The latent plateaus are $g(0)-\tau g'(0)$ and $g(1)+\tau g'(1)$. Sigmoid maps them to learned finite response plateaus, without forcing $L,U$; curves may be nonmonotonic. $x=0$ is a finite location in the nonnegative input domain and is not automatically the left-infinite plateau.
+Values and first derivatives are continuous at the boundaries ($`C^1`$). The latent plateaus are $`g(0)-\tau g'(0)`$ and $`g(1)+\tau g'(1)`$. Sigmoid maps them to learned finite response plateaus, without forcing $`L,U`$; curves may be nonmonotonic. $`x=0`$ is a finite location in the nonnegative input domain and is not automatically the left-infinite plateau.
 
-All derivatives and integrals are with respect to dimensionless $z$. The objective is:
+All derivatives and integrals are with respect to dimensionless $`z`$. The objective is:
 
 ![Spline training objective](docs/equations/response-6-4-02.svg)
 
 [LaTeX](docs/equations/response-6-4-02.tex)
 
-The curvature integral uses 12-point Gauss–Legendre quadrature on each nonzero knot interval. The endpoint-slope term also equals the integrated squared curvature of the exponential tails above. There is no additional single-relation ridge. Initialization fits a design-matrix least-squares solution to logits of normalized WT output clipped to $[10^{-4},1-10^{-4}]$; further starts add Gaussian perturbations with a fixed seed.
+The curvature integral uses 12-point Gauss–Legendre quadrature on each nonzero knot interval. The endpoint-slope term also equals the integrated squared curvature of the exponential tails above. There is no additional single-relation ridge. Initialization fits a design-matrix least-squares solution to logits of normalized WT output clipped to $`[10^{-4},1-10^{-4}]`$; further starts add Gaussian perturbations with a fixed seed.
 
 Current settings are `smoothness: 1e-6, tail_scale: 0.5, internal_knots: 2, max_nfev: 1000, restarts: 3, seed: 42`. These are experimental settings, not independently validated optimal defaults; production does not cross-validate each relation. Only successful finite solutions are accepted and ranked by the objective. With none, fitting fails; saturation's best-finite policy does not apply.
 
 ### 6.5 Two- / three-input groups: functions and penalties
 
-Candidate group $G$ uses the two / three inputs with the highest WT singles scores. Ranking and input standardization are frozen on WT. Groups fit the entire $y$, not singles residuals. Let $M_G=n^{-1}\sum_i(F_G(X_{iG})-y_i)^2$.
+Candidate group $`G`$ uses the two / three inputs with the highest WT singles scores. Ranking and input standardization are frozen on WT. Groups fit the entire $`y`$, not singles residuals. Let $`M_G=n^{-1}\sum_i(F_G(X_{iG})-y_i)^2`$.
 
-**saturation groups** use WT population means / standard deviations to form $u_j=(x_j-\mu_j)/s_j$, then map a quadratic polynomial through softsign:
+**saturation groups** use WT population means / standard deviations to form $`u_j=(x_j-\mu_j)/s_j`$, then map a quadratic polynomial through softsign:
 
 ![Equation 6.5.1](docs/equations/response-6-5-01.svg)
 
 [LaTeX](docs/equations/response-6-5-01.tex)
 
-There are $p=(d+1)(d+2)/2$ parameters, or $6/10$ for two / three inputs; all coefficients are bounded to $[-100,100]$. Least-squares residuals concatenate $(F_G-y)/(D/2)$ and $\sqrt{\lambda_r n/p}\,\beta$, equivalent to minimizing $M_G+P_G$, where:
+There are $`p=(d+1)(d+2)/2`$ parameters, or $`6/10`$ for two / three inputs; all coefficients are bounded to $`[-100,100]`$. Least-squares residuals concatenate $`(F_G-y)/(D/2)`$ and $`\sqrt{\lambda_r n/p}\,\beta`$, equivalent to minimizing $`M_G+P_G`$, where:
 
 ![Equation 6.5.2](docs/equations/response-6-5-02.svg)
 
 [LaTeX](docs/equations/response-6-5-02.tex)
 
-This ridge **includes the intercept**, rather than penalizing only interactions or non-intercept terms. **NN groups** directly use the $d$-input network and objective in 6.3, with $p=H(d+2)+1$. In original output units, the penalty is:
+This ridge **includes the intercept**, rather than penalizing only interactions or non-intercept terms. **NN groups** directly use the $`d`$-input network and objective in 6.3, with $`p=H(d+2)+1`$. In original output units, the penalty is:
 
 ![Equation 6.5.3](docs/equations/response-6-5-03.svg)
 
 [LaTeX](docs/equations/response-6-5-03.tex)
 
-**spline groups** first apply each input's WT min–max transformation to obtain $z_j$. Let $m_j=\operatorname{median}_i z_{ij}$. $N_{j1},N_{j2}$ are natural cubic interpolation bases at knots $(0,m_j,1)$, with respective values $(0,1,0)$ and $(0,0,1)$ and zero second derivatives at endpoints. Extend every basis with $T_\tau$ from 6.4 and define:
+**spline groups** first apply each input's WT min–max transformation to obtain $`z_j`$. Let $`m_j=\operatorname{median}_i z_{ij}`$. $`N_{j1},N_{j2}`$ are natural cubic interpolation bases at knots $`(0,m_j,1)`$, with respective values $`(0,1,0)`$ and $`(0,0,1)`$ and zero second derivatives at endpoints. Extend every basis with $`T_\tau`$ from 6.4 and define:
 
 ![Equation 6.5.4](docs/equations/response-6-5-04.svg)
 
 [LaTeX](docs/equations/response-6-5-04.tex)
 
-Within $[0,1]$, $q_j$ is $z_j-\bar z_j$, with no additional standard-deviation scaling. Before centering, its left and right tails are $\tau(e^{z_j/\tau}-1)$ and $1+\tau(1-e^{-(z_j-1)/\tau})$. Group latent curves and outputs are:
+Within $`[0,1]`$, $`q_j`$ is $`z_j-\bar z_j`$, with no additional standard-deviation scaling. Before centering, its left and right tails are $`\tau(e^{z_j/\tau}-1)`$ and $`1+\tau(1-e^{-(z_j-1)/\tau})`$. Group latent curves and outputs are:
 
 ![Equation 6.5.5](docs/equations/response-6-5-05.svg)
 
 [LaTeX](docs/equations/response-6-5-05.tex)
 
-Two- / three-input groups have $6/11$ parameters. Let $\gamma$ contain all pairwise and third-order interaction coefficients. Define the complete Hessian and boundary normal-slope penalty:
+Two- / three-input groups have $`6/11`$ parameters. Let $`\gamma`$ contain all pairwise and third-order interaction coefficients. Define the complete Hessian and boundary normal-slope penalty:
 
 ![Equation 6.5.6](docs/equations/response-6-5-06.svg)
 
@@ -454,7 +454,7 @@ Two- / three-input groups have $6/11$ parameters. Let $\gamma$ contain all pairw
 
 [LaTeX](docs/equations/response-6-5-07.tex)
 
-The interaction penalty is a **sum** of squared coefficients, currently `group_interaction_penalty: 0.01`. $R_G$ uses 4-point Gauss–Legendre tensor-product quadrature over $[0,m_j]$ and $[m_j,1]$ in each coordinate, with face-normal coordinates fixed at $0/1$. The mixed-second-derivative coefficient is indeed $2$. Geometric group support separately uses WT mean / standard-deviation coordinates $u$; do not confuse these with the function bases' min–max coordinates $z$.
+The interaction penalty is a **sum** of squared coefficients, currently `group_interaction_penalty: 0.01`. $`R_G`$ uses 4-point Gauss–Legendre tensor-product quadrature over $`[0,m_j]`$ and $`[m_j,1]`$ in each coordinate, with face-normal coordinates fixed at $`0/1`$. The mixed-second-derivative coefficient is indeed $`2`$. Geometric group support separately uses WT mean / standard-deviation coordinates $`u`$; do not confuse these with the function bases' min–max coordinates $`z`$.
 
 ### 6.6 Frozen WT weights, group gain, and query routing
 
@@ -467,7 +467,7 @@ peak→gene has two distinct quality thresholds:
 
 The first filter retains relationships with R²≥threshold and excludes undefined R², recording `low_single_r2`. If all relationships are excluded, the target is `no_information`. The second filter does not replace the first: a good overall model may contain poor single responses. Missing or `null` `single_min_r2` disables the first filter only. Both are training-fit measures, not cross-validation or causal confidence. The single-response threshold applies to peak→gene only.
 
-Let $r_i$ denote target rows, $t_{ij}$ input source bins and $b_i$ branches. For **fixed-lag peak→gene**, failed relationships and those below `single_min_r2` are removed before computing weights from the following adjacent pairs and scores. Consecutive source bins remain required:
+Let $`r_i`$ denote target rows, $`t_{ij}`$ input source bins and $`b_i`$ branches. For **fixed-lag peak→gene**, failed relationships and those below `single_min_r2` are removed before computing weights from the following adjacent pairs and scores. Consecutive source bins remain required:
 
 ![Equation 6.6.1](docs/equations/response-6-6-01.svg)
 
@@ -487,29 +487,29 @@ Only adjacent rows in their original order and branch are compared. Rows are not
 
 With no adjacent pairs the score is0. Source bins may jump as selected lags change. For example, if there are3 target-adjacent pairs and an input supports2 of them with differences2 and1, then `S=3/3=1`, rather than1.5. Missing support reduces the accumulated score without amplifying remaining supported rows.
 
-If $\mathcal A$ is empty, all $S_j=0$. Failed relations have no weight (equivalently $\alpha_j=0$); WT scores / normalization are recomputed over retained relations. If the total score is zero, all weights are zero, the WT mean is returned with `no_information`, and groups are not fitted. **$\alpha$ is frozen during perturbation**, without renormalization for actual changes, enabled lags, or “active” inputs. Under singles routing:
+If $`\mathcal A`$ is empty, all $`S_j=0`$. Failed relations have no weight (equivalently $`\alpha_j=0`$); WT scores / normalization are recomputed over retained relations. If the total score is zero, all weights are zero, the WT mean is returned with `no_information`, and groups are not fitted. **$`\alpha`$ is frozen during perturbation**, without renormalization for actual changes, enabled lags, or “active” inputs. Under singles routing:
 
 ![Equation 6.6.3](docs/equations/response-6-6-03.svg)
 
 [LaTeX](docs/equations/response-6-6-03.tex)
 
-Use frozen singles WT predictions as the comparison baseline, with $B=n^{-1}\sum_i(F_{\rm single}(X_i)-y_i)^2$. All three families use penalized group loss and gain in original $y$ units:
+Use frozen singles WT predictions as the comparison baseline, with $`B=n^{-1}\sum_i(F_{\rm single}(X_i)-y_i)^2`$. All three families use penalized group loss and gain in original $`y`$ units:
 
 ![Equation 6.6.4](docs/equations/response-6-6-04.svg)
 
 [LaTeX](docs/equations/response-6-6-04.tex)
 
-The complexity term $pB/n$ is used for group selection / acceptance and does not change the optimum within a fixed group. For $B=0$, saturation / NN record gain $0$ and spline records $-1$; neither passes the current `min_penalized_gain: 0.05`. Multiple starts also check WT prediction spread $\max_i(\max_a\hat y_i^{(a)}-\min_a\hat y_i^{(a)})/D$. saturation / spline groups require every start to succeed finitely; NN uses finite best snapshots and does not treat fixed epochs as convergence evidence.
+The complexity term $`pB/n`$ is used for group selection / acceptance and does not change the optimum within a fixed group. For $`B=0`$, saturation / NN record gain $`0`$ and spline records $`-1`$; neither passes the current `min_penalized_gain: 0.05`. Multiple starts also check WT prediction spread $`\max_i(\max_a\hat y_i^{(a)}-\min_a\hat y_i^{(a)})/D`$. saturation / spline groups require every start to succeed finitely; NN uses finite best snapshots and does not treat fixed epochs as convergence evidence.
 
-Candidate groups also check row counts, cell ESS, effective kernel rows, and global / branch geometry. If $W$ is the normalized weight matrix from common WT rows to cells and $\bar w=n^{-1}\sum_iW_{i:}$, the implementation uses:
+Candidate groups also check row counts, cell ESS, effective kernel rows, and global / branch geometry. If $`W`$ is the normalized weight matrix from common WT rows to cells and $`\bar w=n^{-1}\sum_iW_{i:}`$, the implementation uses:
 
 ![Equation 6.6.5](docs/equations/response-6-6-05.svg)
 
 [LaTeX](docs/equations/response-6-6-05.tex)
 
-These are support indicators, not independent observation counts. Current settings are `min_group_rows: 24, min_group_cell_ess: 30, min_query_cell_ess: 10, min_group_effective_rows: 12, max_geometry_condition: 10000`. Every family requires $n_{\rm eff}\ge\max(12,2p)$. NN / spline also require $n\ge\max(24,2p)$; saturation requires $24$ raw rows. Rejection of all groups means current data and thresholds do not support a group; it does not automatically indicate a bug or justify relaxing production thresholds.
+These are support indicators, not independent observation counts. Current settings are `min_group_rows: 24, min_group_cell_ess: 30, min_query_cell_ess: 10, min_group_effective_rows: 12, max_geometry_condition: 10000`. Every family requires $`n_{\rm eff}\ge\max(12,2p)`$. NN / spline also require $`n\ge\max(24,2p)`$; saturation requires $`24`$ raw rows. Rejection of all groups means current data and thresholds do not support a group; it does not automatically indicate a bug or justify relaxing production thresholds.
 
-Queries try accepted groups in descending penalized gain. A group must cover all declared changed inputs, and every WT / perturbed row in the query batch must pass same-branch nearest-neighbor radius and local cell-ESS checks. If any row fails, try the next group or fall back to singles. A selected group **replaces the entire batch** with $\Delta y=F_G(x'_G)-F_G(x_G)$; singles and group corrections are not added. Groups have two / three inputs, but routing has no additional requirement that at least two actually change. One changed input can use a covering, supported group. Unchanged queries return identical WT / query responses.
+Queries try accepted groups in descending penalized gain. A group must cover all declared changed inputs, and every WT / perturbed row in the query batch must pass same-branch nearest-neighbor radius and local cell-ESS checks. If any row fails, try the next group or fall back to singles. A selected group **replaces the entire batch** with $`\Delta y=F_G(x'_G)-F_G(x_G)`$; singles and group corrections are not added. Groups have two / three inputs, but routing has no additional requirement that at least two actually change. One changed input can use a covering, supported group. Unchanged queries return identical WT / query responses.
 
 Curves, weights, metrics, and checkpoints distinguish families. NN exports network parameters; spline exports knots / coefficients and configuration. Other-family parameters cannot be interpreted as saturation parameters. Bounded output or smooth extrapolation does not guarantee biologically reliable predictions outside WT. Failure of quality screening is not biological zero effect; training R² / RMSE and group gain are not independently measured predictive accuracy.
 
@@ -598,7 +598,7 @@ After transforming L2 changes to L1, cell reconstruction floors negative values 
 
 Current `valid_cell_means` uses WT and perturbed means from **the same valid context / cell subset** for each gene, weights them by cell count, then computes `log2(perturbed mean/WT mean)` rather than averaging cluster log2FC. Quality-filtered, missing-endpoint, failed, and nonpositive-mean contexts are excluded from both sides with reasons recorded. Explicitly valid, unselected genes with equal WT / perturbed values in the quality-pruned network can supply unchanged baselines; assumptions and context counts are reported separately. Missing effects are not zero-filled.
 
-Let $\mathcal V_g$ be the same valid context set for gene $g$, $N_c$ the valid cell count and $\mu_{gc}$ its corresponding cell CP10k mean:
+Let $`\mathcal V_g`$ be the same valid context set for gene $`g`$, $`N_c`$ the valid cell count and $`\mu_{gc}`$ its corresponding cell CP10k mean:
 
 ![Valid-cell-weighted WT and KO means and merged log2 fold change](docs/equations/aggregation-8-01.svg)
 
