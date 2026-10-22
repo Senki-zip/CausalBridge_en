@@ -621,6 +621,10 @@ When omitted, `output.export_details` defaults to `false` in the library, export
 
 `save_intermediate: true` saves only intermediate tables without a formal export. It neither duplicates root results nor separately exports duplicate per-cluster perturbations, and cannot override `export_details: false`. The canonical pathway table is `perturbation_pathways.csv`; an identical `saturating_pathways.csv` is no longer duplicated. Disabling exports does not remove files from previous runs.
 
+With explicit `perturbation.joint_knockout: false`, all listed TFs share the fitted WT model and are simulated separately. Intervention-specific exports receive a TF prefix, for example `RUNX1_perturbation_results.csv` and `KLF1_perturbation_results.csv`; merged effects, ATAC CSV/BED, pathways, attributions and projections are partitioned in the same way. The table below lists base filenames; this mode uses `<TF>_<base filename>`. ATAC aggregation keeps interventions separate across clusters.
+
+Shared WT networks, fit metrics, response curves and identity tables remain unprefixed. `intervention_outputs.json` maps stable target IDs to filename prefixes. Identity-resolved display names distinguish duplicate symbols, and path characters are sanitized. Joint KO keeps its existing filenames. Old exports are not automatically deleted; use separate output directories to preserve distinct runs.
+
 | File | Contents |
 |---|---|
 | `hvg_genes.csv` | Actual model HVGs, independent of `save_intermediate` |
@@ -800,7 +804,18 @@ R configuration precedence is CLI > `CAUSALBRIDGE_RESULT_DIR` / `CAUSALBRIDGE_OU
 
 Additional figures are controlled by the script-top `TRAJECTORY_GENES`, `TRAJECTORY_PEAKS`, `TRAJECTORY_TOP_PATHS`, `TF_RESPONSE_TOP_N`, `TF_RESPONSE_MIN_R2`, `VIS_WORKERS` and `MODEL_DIAGNOSTIC_PLOTS`. These editable local examples may change genes, species or directories; the rules below describe enablement rather than personal settings. `--new-visualizations-only` runs only additional figures; missing or unverifiable data are explicitly skipped. See [additional-figure units and parameters](FIGUERS_README.md#12-wtko-pseudotime-trajectories-for-selected-downstream-genes).
 
-Setting `TRAJECTORY_GENES` or `--trajectory-genes` retains the response galleries and adds two single-relationship figures for each trajectory actually generated, suffixed `_tf_response` and `_peak_gene_response`. They use the exact same cluster, TF, peak, gene and saved lag. These saved single-model curves are unweighted by alpha and are not filtered again by gallery R² or top-N thresholds. Titles show training R² and alpha; no refitting occurs. Existing trajectory ranking and counts remain, default3, with joint KO counts grouped by context/TF.
+For prefixed separate-KO exports, R and Python diagnostics read `intervention_outputs.json`. By default, interventions are drawn sequentially into `figures_R/<TF>/` (or `<output-dir>/<TF>/` for the Python entry point). Select one intervention with R `INTERVENTION_TF <- "RUNX1"`, `--intervention RUNX1`, or `CAUSALBRIDGE_VIS_INTERVENTION=RUNX1`; stable IDs from the manifest are also accepted. CLI overrides environment variables, which override script-top settings. An unset selection means all interventions.
+
+```bash
+Rscript visualize_perturbation.R results/test/RUNX1_KLF1_each
+Rscript visualize_perturbation.R results/test/RUNX1_KLF1_each --intervention RUNX1
+```
+
+The selected TF's prefixed effects, pathways, ATAC, projection history and events are read alongside shared WT networks, identities and checkpoints. Stale unprefixed intervention tables are never substituted. An explicit output directory is used directly for a selected single KO; automatic all-intervention mode adds TF subdirectories. Legacy unprefixed single/joint KO directories retain their existing behavior.
+
+Setting `TRAJECTORY_GENES` or `--trajectory-genes` retains the response galleries and adds two single-relationship figures for each trajectory actually generated, suffixed `_tf_response` and `_peak_gene_response`. They use the exact same cluster, TF, peak, gene and saved lag. These saved single-model curves are unweighted by alpha and are not filtered again by gallery R² or top-N thresholds. Titles show training R² and alpha; no refitting occurs. Single KO retains its per-gene cross-cluster path cap. Joint KO selects up to top-paths distinct peaks per gene/context and merges the KO-TF paths sharing each peak.
+
+Joint KO is one intervention subject. For selected genes/peaks, TF response galleries combine TF panels in one figure per cluster. A trajectory is emitted per gene/peak/cluster, showing every jointly knocked-out TF in the top panel and the joint peak/gene states below. Its TF-response companion combines the actual saved per-TF curves into one panel figure, preserving individual alpha, training R² and lag; these curves are not summed into a joint prediction. New filenames contain `joint_` and all target IDs. Superseded per-TF images for the same paths are moved to `legacy_split_joint_plots/`. Trace CSVs add `feature_id` for the plotted feature and `trajectory_id` for the shared figure, retaining route-specific `tf`/`tf_lag`; plotted state rows can therefore repeat across actual TF routes.
 
 When neither genes nor peaks are selected (set both R variables to `NULL`, or pass `--trajectory-genes NULL --trajectory-peaks NULL`), each cluster displays its5 highest-training-R² single relationships separately in each layer. Candidates require alpha>0 and finite R²; the extra gallery0.5 threshold is not applied, and fewer available candidates yield fewer plots. TF candidates include all saved TFs in that cluster, beyond KO TFs. Filenames start with `top5_tf_response_` or `top5_peak_gene_`; selections are saved to `top5_tf_response_selected.csv` and `top5_peak_gene_selected.csv`. Old figures are not automatically removed.
 
@@ -821,10 +836,10 @@ R `VIS_WORKERS` or CLI `--workers 2` controls visualization process count, indep
 
 | Figure | Selection | Counts and limits |
 |---|---|---|
-| TF response gallery for selected genes | TF→peak edges on saved KO paths, alpha>0, status ok and single training R²≥`TF_RESPONSE_MIN_R2` | Up to `TF_RESPONSE_TOP_N` distinct peaks per KO TF/cluster |
+| TF response gallery for selected genes | TF→peak edges on saved KO paths, alpha>0, status ok and single training R²≥`TF_RESPONSE_MIN_R2` | Up to `TF_RESPONSE_TOP_N` distinct peaks per KO TF/cluster; joint KO combines TF panels per cluster |
 | peak→gene gallery for selected genes | Selected gene's peak→gene edges on saved KO paths, using the same alpha/status/plot-R² conditions | Up to top-N per downstream gene/cluster |
-| Trajectory | Descending `abs(peak_input_contribution_mean)`, falling back to `abs(delta_r_raw_sum)` only when the preferred field is absent; not R²/p ranking | Deduplicate context/TF/peak; single KO takes top-paths across clusters per gene, joint KO within each gene/context/TF group |
-| Trajectory response companions | Exact cluster/TF/peak/gene/lag of each trajectory actually drawn | Two figures per path without another gallery-R² cutoff |
+| Trajectory | Descending `abs(peak_input_contribution_mean)`, falling back to `abs(delta_r_raw_sum)` only when the preferred field is absent; not R²/p ranking | Deduplicate context/TF/peak; single KO takes top-paths across clusters per gene, joint KO selects distinct peaks per gene/context and combines their TF paths |
+| Trajectory response companions | Exact cluster/TF/peak/gene/lag of each trajectory actually drawn | Two companions per trajectory; joint TF panels share one figure, without another gallery-R² cutoff |
 | top5 without selected genes/peaks | Per-cluster, per-layer saved singles ranked by finite training R², alpha>0 | At most5 per layer/cluster, individually plotted; not limited to KO TFs |
 
 Gallery ties use smaller saved FDR, then p, then peak/lag. Both galleries currently share `TF_RESPONSE_TOP_N` (default10) and `TF_RESPONSE_MIN_R2` (default0.5), distinct from the0.3 single-peak fitting and0.3 overall-model thresholds. A missing cluster figure does not imply missing simulation. Trajectory ranking takes the absolute value after averaging signed contributions, so opposite-sign bins can cancel; it does not rank mean absolute effects. Top paths are selected before checking plot eligibility, without backfilling invalid paths. If ranking fields are absent or unusable, table order has no effect-size or confidence interpretation.

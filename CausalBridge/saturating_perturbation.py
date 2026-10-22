@@ -770,6 +770,11 @@ def propagate_saturating(target_genes,rna,atac,pt,edges,transfers,tf_weights,con
     simulate=_prepare_simulation(rna,atac,pt,config,transfer_models,tf_model_registry,
         bin_plan=bin_plan,cluster_label=cluster_label,screening=(edges,tf_weights))
     results=[simulate(targets=group) for group in groups]
+    if config.get("perturbation", {}).get("joint_knockout") is False:
+        for result in results:
+            result["atac_changes"] = result["atac_changes"].copy()
+            result["atac_changes"]["target_gene"] = result["target_gene"]
+            result["atac_changes"]["cluster"] = str(cluster_label)
     output=dict(results[0])
     for name in ("perturbation_results","atac_changes","saturating_endpoints","saturating_peak_attributions",
                  "saturating_tf_peak_contributions","saturating_support_diagnostics","l1_floor_diagnostics","saturating_gene_metrics",

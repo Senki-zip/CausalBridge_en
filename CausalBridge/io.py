@@ -7,6 +7,8 @@ CausalBridge I/O 模块：配置文件解析、数据加载、结果保存
 import yaml
 import json
 import logging
+import hashlib
+import re
 import pandas as pd
 import numpy as np
 import anndata as ad
@@ -491,6 +493,80 @@ DETAIL_EXPORT_KEYS = frozenset({
 })
 
 
+
+class _InterventionFiles:
+    """Split intervention tables lazily; fitted WT tables stay shared."""
+    def __init__(self, results, config, gene_identity=None):
+        self.prefixes = {}
+        separate = (config.get("perturbation", {}).get("joint_knockout") is False
+                    and config.get("perturbation", {}).get("knockout_type", "gene") == "gene")
+        if not separate:
+            return
+        labels = {}
+        for key in ("saturating_endpoints", "perturbation_results", "projection_bin_metadata"):
+            frame = results.get(key)
+            if not isinstance(frame, pd.DataFrame) or "target_gene" not in frame or frame.empty:
+                continue
+            target_column = "target_gene_id" if "target_gene_id" in frame else "target_gene"
+            for target, group in frame.groupby(target_column, sort=False):
+                target = str(target)
+                if "target_gene_ids_json" in group:
+                    ids = json.loads(group["target_gene_ids_json"].iloc[0])
+                    if len(ids) != 1:
+                        raise ValueError("separate KO exports require singleton intervention IDs")
+                if gene_identity is not None and target in gene_identity.by_id:
+                    label = gene_identity.display_labels[target]
+                elif "target_gene_name" in group:
+                    label = str(group["target_gene_name"].iloc[0])
+                else:
+                    label = target
+                labels[target] = label
+            break
+        # Metadata preserves interventions even when every public result is empty.
+        if not labels:
+            evidence = results.get("saturating_context_metadata", [])
+            if isinstance(evidence, dict):
+                evidence = [evidence]
+            for context in evidence:
+                diagnostics = context.get("diagnostics", context)
+                for entry in diagnostics.get("interventions", ()):
+                    target = str(entry["target_gene"])
+                    labels[target] = (gene_identity.display_labels.get(target, target)
+                                      if gene_identity is not None else target)
+        used = {}
+        for target, label in labels.items():
+            prefix = re.sub(r"[^\w.-]+", "_", label, flags=re.UNICODE).strip("._") or "TF"
+            used.setdefault(prefix, []).append(target)
+            self.prefixes[target] = prefix
+        for prefix, targets in used.items():
+            if len(targets) > 1:
+                for target in targets:
+                    self.prefixes[target] = prefix + "_" + hashlib.sha256(target.encode()).hexdigest()[:10]
+
+    def frames(self, frame, directory, filename):
+        directory = Path(directory)
+        if not self.prefixes or "target_gene" not in frame:
+            yield directory / filename, frame
+            return
+        if frame.empty:
+            for prefix in self.prefixes.values():
+                yield directory / (prefix + "_" + filename), frame
+            return
+        target_column = "target_gene_id" if "target_gene_id" in frame else "target_gene"
+        for target, part in frame.groupby(target_column, sort=False, dropna=False):
+            if str(target) not in self.prefixes:
+                raise ValueError(f"unknown intervention in export: {target}")
+            yield directory / (self.prefixes[str(target)] + "_" + filename), part
+
+    def csv(self, frame, directory, filename):
+        for path, part in self.frames(frame, directory, filename):
+            part.to_csv(path, index=False)
+
+    def bed(self, frame, directory, filename):
+        for path, part in self.frames(frame, directory, filename):
+            _save_atac_bed(part, path)
+
+
 def save_results(results: dict, config: dict, *, gene_identity=None):
     """
     保存汇总结果；output.export_details=true 时另存明细，每张表仅存一份。
@@ -513,6 +589,7 @@ def save_results(results: dict, config: dict, *, gene_identity=None):
     export_details = config["output"].get("export_details", False)
     if not isinstance(export_details, bool):
         raise ValueError("output.export_details must be a boolean")
+    files = _InterventionFiles(results, config, gene_identity)
     skipped_details = sorted(DETAIL_EXPORT_KEYS.intersection(results)) if not export_details else []
     # Filter before identity presentation to avoid copying large unused tables.
     # This new dictionary leaves the caller's in-memory results untouched.
@@ -558,7 +635,7 @@ def save_results(results: dict, config: dict, *, gene_identity=None):
                     "saturating_peak_attributions", "saturating_tf_peak_contributions", "l1_floor_diagnostics"):
             frame = results.get(key)
             if isinstance(frame, pd.DataFrame):
-                frame.to_csv(out_dir / f"{key}.csv", index=False)
+                files.csv(frame, out_dir, f"{key}.csv")
         evidence = results.get("saturating_context_metadata", [])
         if isinstance(evidence, dict):
             evidence = [evidence]
@@ -566,7 +643,7 @@ def save_results(results: dict, config: dict, *, gene_identity=None):
             json.dumps(evidence, indent=2, allow_nan=False), encoding="utf-8")
     for key in ("gene_identity", "gene_filter_report", "gene_target_resolution"):
         if isinstance(results.get(key), pd.DataFrame):
-            results[key].to_csv(out_dir / f"{key}.csv", index=False)
+            files.csv(results[key], out_dir, f"{key}.csv")
     if "gene_identity_metadata" in results:
         (out_dir / "gene_identity_metadata.json").write_text(
             json.dumps(results["gene_identity_metadata"], indent=2, allow_nan=False), encoding="utf-8")
@@ -590,18 +667,16 @@ def save_results(results: dict, config: dict, *, gene_identity=None):
         ):
             frame = results.get(key)
             if isinstance(frame, pd.DataFrame) and not frame.empty:
-                frame.to_csv(out_dir / filename, index=False)
+                files.csv(frame, out_dir, filename)
 
     # --- 因果调控边 ---
     if "causal_edges" in results:
-        results["causal_edges"].to_csv(
-            out_dir / "causal_peak_gene_edges.csv", index=False
-        )
+        files.csv(results["causal_edges"], out_dir, "causal_peak_gene_edges.csv")
         logger.info(f"因果边已保存: {len(results['causal_edges'])} 条")
 
     # --- TF→peak 权重 ---
     if export_details and isinstance(results.get("tf_peak_lag_routes"), pd.DataFrame):
-        results["tf_peak_lag_routes"].to_csv(out_dir / "tf_peak_lag_routes.csv", index=False)
+        files.csv(results["tf_peak_lag_routes"], out_dir, "tf_peak_lag_routes.csv")
     if "tf_peak_weights" in results:
         weights = results["tf_peak_weights"]
         if export_details and "local_routes" in weights:
@@ -610,7 +685,7 @@ def save_results(results: dict, config: dict, *, gene_identity=None):
                 identity = {k:edge[k] for k in ("cluster", "tf_gene", "tf_gene_id", "tf_gene_name", "peak_id") if k in edge}
                 for route in edge.get("local_routes", ()):
                     route_rows.append(dict(identity, **route))
-            pd.DataFrame(route_rows).to_csv(out_dir / "tf_peak_lag_routes.csv", index=False)
+            files.csv(pd.DataFrame(route_rows), out_dir, "tf_peak_lag_routes.csv")
         weights.drop(columns=["local_routes"], errors="ignore").to_csv(
             out_dir / "tf_peak_weights.csv", index=False
         )
@@ -621,28 +696,28 @@ def save_results(results: dict, config: dict, *, gene_identity=None):
         if not pert.empty and "delta_rna" in pert.columns:
             columns = (["cluster"] if "cluster" in pert else []) + ["delta_rna"]
             pert = pert.sort_values(columns, ascending=([True] if "cluster" in pert else []) + [False])
-        pert.to_csv(out_dir / "perturbation_results.csv", index=False)
+        files.csv(pert, out_dir, "perturbation_results.csv")
 
     # --- 加权平均扰动结果 (跨簇合并) ---
     if "perturbation_merged" in results:
         pm = results["perturbation_merged"]
         if not pm.empty and "delta_rna" in pm.columns:
             pm = pm.sort_values("delta_rna", ascending=False)
-        pm.to_csv(out_dir / "perturbation_merged.csv", index=False)
+        files.csv(pm, out_dir, "perturbation_merged.csv")
         logger.info(f"加权平均扰动结果已保存: {len(pm)} 条")
 
     # --- 路径级边记录 (TF→peak→gene, 用于抵消分析与调控链追踪) ---
     if "pathway_edges" in results or (saturation and "saturating_pathways" in results):
         pw = results["saturating_pathways"] if saturation and "saturating_pathways" in results else results["pathway_edges"]
         if not pw.empty or (saturation and "saturating_pathways" in results):
-            pw.to_csv(out_dir / "perturbation_pathways.csv", index=False)
+            files.csv(pw, out_dir, "perturbation_pathways.csv")
             logger.info(f"路径边已保存: {len(pw)} 条")
 
     # --- 聚合后的 TF→peak 边 (含窗口验证翻转信息) ---
     if "aggregated_tf_peak_edges" in results:
         ae = results["aggregated_tf_peak_edges"]
         if not ae.empty:
-            ae.to_csv(out_dir / "aggregated_tf_peak_edges.csv", index=False)
+            files.csv(ae, out_dir, "aggregated_tf_peak_edges.csv")
             n_flipped = ae["flipped"].sum() if "flipped" in ae.columns else 0
             logger.info(f"聚合 TF→peak 边已保存: {len(ae)} 条 (其中翻转 {n_flipped} 条)")
 
@@ -650,14 +725,14 @@ def save_results(results: dict, config: dict, *, gene_identity=None):
     # --- ATAC 变化 (BED 格式，可用 IGV 可视化) ---
     if "atac_changes" in results:
         atac_df = results["atac_changes"]
-        atac_df.to_csv(out_dir / RESULT_CSV_EXPORTS["atac_changes"], index=False)
+        files.csv(atac_df, out_dir, RESULT_CSV_EXPORTS["atac_changes"])
         if not atac_df.empty:
-            _save_atac_bed(atac_df, out_dir / "atac_changes.bed")
+            files.bed(atac_df, out_dir, "atac_changes.bed")
             # 显著 ATAC 变化: |z_score| >= 阈值 (z-score 由 WT 零分布计算)
             if "is_significant" in atac_df.columns:
                 sig_df = atac_df[_significant_mask(atac_df["is_significant"])].copy()
                 if not sig_df.empty:
-                    _save_atac_bed(sig_df, out_dir / "atac_changes_significant.bed")
+                    files.bed(sig_df, out_dir, "atac_changes_significant.bed")
                     logger.info(
                         f"显著 ATAC 变化 (|z| 阈值): {len(sig_df)} peaks → "
                         f"atac_changes_significant.bed"
@@ -667,12 +742,12 @@ def save_results(results: dict, config: dict, *, gene_identity=None):
     if "atac_changes_merged" in results:
         acm = results["atac_changes_merged"]
         if acm is not None and not acm.empty:
-            acm.to_csv(out_dir / "atac_changes_merged.csv", index=False)
-            _save_atac_bed(acm, out_dir / "atac_changes_merged.bed")
+            files.csv(acm, out_dir, "atac_changes_merged.csv")
+            files.bed(acm, out_dir, "atac_changes_merged.bed")
             if "is_significant" in acm.columns:
                 sig_m = acm[_significant_mask(acm["is_significant"])].copy()
                 if not sig_m.empty:
-                    _save_atac_bed(sig_m, out_dir / "atac_changes_significant_merged.bed")
+                    files.bed(sig_m, out_dir, "atac_changes_significant_merged.bed")
                     logger.info(
                         f"跨簇加权平均 ATAC 显著变化: {len(sig_m)} peaks → "
                         f"atac_changes_significant_merged.bed"
@@ -687,21 +762,19 @@ def save_results(results: dict, config: dict, *, gene_identity=None):
                 pert_all["target_gene"].astype(str).str.startswith("PEAK:")
             ].copy()
             if not peak_res.empty:
-                peak_res.to_csv(out_dir / "peak_perturbation_results.csv", index=False)
+                files.csv(peak_res, out_dir, "peak_perturbation_results.csv")
                 logger.info(f"Peak 扰动结果已保存: {len(peak_res)} 条 → peak_perturbation_results.csv")
 
     if "upstream_tfs" in results and results["upstream_tfs"] is not None \
             and not results["upstream_tfs"].empty:
-        results["upstream_tfs"].to_csv(out_dir / "peak_upstream_tfs.csv", index=False)
+        files.csv(results["upstream_tfs"], out_dir, "peak_upstream_tfs.csv")
         logger.info(
             f"上游 TF 归因已保存: {len(results['upstream_tfs'])} 条 → peak_upstream_tfs.csv"
         )
 
     if "upstream_tfs_merged" in results and results["upstream_tfs_merged"] is not None \
             and not results["upstream_tfs_merged"].empty:
-        results["upstream_tfs_merged"].to_csv(
-            out_dir / "peak_upstream_tfs_merged.csv", index=False
-        )
+        files.csv(results["upstream_tfs_merged"], out_dir, "peak_upstream_tfs_merged.csv")
         logger.info(
             f"上游 TF 跨簇加权合并已保存: {len(results['upstream_tfs_merged'])} 条 "
             f"→ peak_upstream_tfs_merged.csv"
@@ -709,6 +782,13 @@ def save_results(results: dict, config: dict, *, gene_identity=None):
 
     if results.get("peak_summary") is not None and not results["peak_summary"].empty:
         _write_peak_report(results["peak_summary"], out_dir / "peak_perturbation_report.txt")
+
+    if files.prefixes:
+        (out_dir / "intervention_outputs.json").write_text(json.dumps({
+            "mode": "separate_single_KO_shared_WT_model",
+            "filename_prefixes": files.prefixes,
+            "shared_tables": "fitted WT networks, metrics, response curves and identity tables",
+        }, indent=2, ensure_ascii=False), encoding="utf-8")
 
     # --- 中间文件 ---
     if config["output"].get("save_intermediate", True):
@@ -719,7 +799,7 @@ def save_results(results: dict, config: dict, *, gene_identity=None):
                     and key not in {"peak_summary", "cell_states", "projection_cell_states"}
                     and not key.endswith("_saved")):
                 inter_dir.mkdir(exist_ok=True)
-                df.to_csv(inter_dir / f"{key}.csv", index=False)
+                files.csv(df, inter_dir, f"{key}.csv")
 
     if skipped_details:
         logger.info("汇总导出：跳过 %d 类明细 (%s)；需要时设置 output.export_details: true。"

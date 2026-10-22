@@ -58,8 +58,46 @@ def slug(value):
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value))
 
 
-def read_table(root, name):
-    for file in (root / name, root / "intermediate" / name):
+def saved_interventions(root):
+    """Read the export manifest; shared WT files are never intervention inputs."""
+    file = root / "intervention_outputs.json"
+    if not file.exists():
+        return {}
+    mapping = json.loads(file.read_text())["filename_prefixes"]
+    if not isinstance(mapping, dict) or not mapping:
+        raise ValueError("Empty or invalid intervention filename manifest")
+    for target, prefix in mapping.items():
+        if (not isinstance(prefix, str) or not prefix or prefix in (".", "..")
+                or "/" in prefix or "\\" in prefix):
+            raise ValueError(f"Invalid intervention filename prefix: {target!r}")
+    if len(set(mapping.values())) != len(mapping):
+        raise ValueError("Duplicate intervention filename prefixes")
+    return mapping
+
+
+def select_interventions(root, requested=None):
+    mapping = saved_interventions(root)
+    if not mapping:
+        if requested not in (None, "ALL", "__ALL__"):
+            raise ValueError("--intervention requires intervention_outputs.json")
+        return {}
+    if requested in (None, "ALL", "__ALL__"):
+        return mapping
+    matches = {target: prefix for target, prefix in mapping.items()
+               if requested in (target, prefix)}
+    if len(matches) != 1:
+        raise ValueError(f"Unknown or ambiguous intervention {requested!r}; choose "
+                         + ", ".join(mapping.values()))
+    return matches
+
+
+def table_paths(root, name, prefix=""):
+    filename = f"{prefix}_{name}" if prefix else name
+    return (root / filename, root / "intermediate" / filename)
+
+
+def read_table(root, name, *, prefix=""):
+    for file in table_paths(root, name, prefix):
         if file.exists():
             return pd.read_csv(file, low_memory=False)
     return pd.DataFrame()
@@ -72,12 +110,12 @@ def identity(frame, role):
     return frame[role].astype(str)
 
 
-def load_pathways(root, labels):
+def load_pathways(root, labels, *, prefix=""):
     """Read actual exported paths and resolve result-local gene aliases."""
     # Prefer the canonical export even when it is empty.
     name = next((name for name in ("perturbation_pathways.csv", "saturating_pathways.csv")
-                 if any(file.exists() for file in (root / name, root / "intermediate" / name))), None)
-    paths = read_table(root, name) if name else pd.DataFrame()
+                 if any(file.exists() for file in table_paths(root, name, prefix))), None)
+    paths = read_table(root, name, prefix=prefix) if name else pd.DataFrame()
     aliases = {}
 
     def add(gene, alias):
@@ -93,7 +131,7 @@ def load_pathways(root, labels):
             if field in genes:
                 for gene, alias in zip(genes.gene_id, genes[field]):
                     add(gene, alias)
-    for frame in (read_table(root, "perturbation_results.csv"), paths):
+    for frame in (read_table(root, "perturbation_results.csv", prefix=prefix), paths):
         for role in ("affected_gene", "target_gene", "tf_name", "tf_gene"):
             if role + "_id" in frame:
                 for field in (role, role + "_name"):
@@ -323,12 +361,12 @@ def load_archives(root, selected_tfs=None, *, workers=1, files=None):
     return archives
 
 
-def labels_and_targets(root):
+def labels_and_targets(root, *, prefix=""):
     labels = {}
     genes = read_table(root, "gene_identity.csv")
     if {"gene_id", "gene_name"}.issubset(genes):
         labels.update(zip(genes.gene_id.astype(str), genes.gene_name.astype(str)))
-    endpoints = read_table(root, "perturbation_results.csv")
+    endpoints = read_table(root, "perturbation_results.csv", prefix=prefix)
     members, target_labels = intervention_members(endpoints)
     targets = set(members)
     labels.update(target_labels)
@@ -510,10 +548,10 @@ def peak_gene_response_plots(root, paths, targets, labels, output, top_n, min_r2
     return selected_records
 
 
-def load_history(root, wanted, targets=None):
-    file = root / "perturbation_projection_bin_history.csv"
+def load_history(root, wanted, targets=None, *, prefix=""):
+    file = table_paths(root, "perturbation_projection_bin_history.csv", prefix)[0]
     if not file.exists():
-        file = root / "intermediate" / "projection_history.csv"
+        file = table_paths(root, "projection_history.csv", prefix)[1]
     if not file.exists():
         return pd.DataFrame()
     parts = []
@@ -623,6 +661,19 @@ def save_figure(fig, output, name):
     note(f"saved {name}.png")
 
 
+def archive_split_joint_plots(output, names):
+    """Keep superseded per-TF images out of the current joint figure gallery."""
+    for name in names:
+        file = output / (name + '.png')
+        if file.exists():
+            archive = output / 'legacy_split_joint_plots'
+            archive.mkdir(exist_ok=True)
+            destination = archive / file.name
+            if destination.exists():
+                destination = archive / (file.stem + '_' + str(time.time_ns()) + '.png')
+            file.replace(destination)
+
+
 def response_plots(archives, targets, labels, output, top_n, min_r2, related_edges=None):
     if top_n == 0:
         return
@@ -659,39 +710,47 @@ def response_plots(archives, targets, labels, output, top_n, min_r2, related_edg
         return
     table = pd.DataFrame([{k: v for k, v in row.items() if k not in ("model", "bundle")} for row in records])
     selected_records = []
-    for (tf, ctx), group in table.groupby(["tf", "context"], sort=True):
-        group = group.sort_values(["training_r2", "screening_fdr", "screening_p", "peak", "lag"],
-                                  ascending=[False, True, True, True, True]).drop_duplicates("peak").head(top_n)
-        chosen = [r for r in records if r["tf"] == tf and r["context"] == ctx and
-                  (r["peak"], r["lag"]) in set(zip(group.peak, group.lag))]
-        # Common physical TF axis. Each peak is evaluated from its saved model.
-        low = min(r["model"].x_range[0] for r in chosen)
-        high = max(r["model"].x_range[1] for r in chosen)
-        x = np.linspace(min(0., low), high if high > 0 else 1., 250)
-        fig, ax = plt.subplots(figsize=(10, 6))
-        for i, r in enumerate(chosen):
-            y = r["model"].predict(x)
-            if not np.isfinite(y).all():
-                raise ValueError("nonfinite saved response evaluation")
-            lo, hi = r["model"].x_range
-            supported = (x >= lo) & (x <= hi)
-            color = plt.get_cmap("tab10")(i % 10)
-            ax.plot(x, np.where(supported, y, np.nan), color=color, lw=1.5,
-                    label=f"{r['peak']}  lag={r['lag']}  train R²={r['training_r2']:.2f}")
-            ax.plot(x, np.where(~supported, y, np.nan), color=color, ls="--", lw=1., alpha=.65)
-            ax.scatter([lo, hi], r["model"].predict(np.array([lo, hi])), color=color, s=10)
-            ax.scatter([0.], r["model"].predict(np.array([0.])), color=color, marker="x", s=22)
-            selected_records.append({k: v for k, v in r.items() if k not in ("model", "bundle")})
-        ax.axvline(0, color="#b33333", lw=1, ls=":", label="Complete KO input")
-        ax.set(xlabel=f"{labels.get(tf, tf)} input ({chosen[0]['input_unit']})",
-               ylabel=f"Fitted peak response ({chosen[0]['output_unit']})",
-               title=f"{labels.get(tf, tf)} → peaks · Cluster {ctx}\nHigh training-fit rank; no validation confidence probability" + intervention_context(targets, labels))
+    for ctx, context_group in table.groupby("context", sort=True):
+        groups = list(context_group.groupby("tf", sort=True))
+        fig, axes = plt.subplots(len(groups), 1, figsize=(10, 6 * len(groups)), squeeze=False)
+        for ax, (tf, group) in zip(axes[:, 0], groups):
+            group = group.sort_values(["training_r2", "screening_fdr", "screening_p", "peak", "lag"],
+                                      ascending=[False, True, True, True, True]).drop_duplicates("peak").head(top_n)
+            chosen = [r for r in records if r["tf"] == tf and r["context"] == ctx and
+                      (r["peak"], r["lag"]) in set(zip(group.peak, group.lag))]
+            # Common physical TF axis. Each peak is evaluated from its saved model.
+            low = min(r["model"].x_range[0] for r in chosen)
+            high = max(r["model"].x_range[1] for r in chosen)
+            x = np.linspace(min(0., low), high if high > 0 else 1., 250)
+            for i, r in enumerate(chosen):
+                y = r["model"].predict(x)
+                if not np.isfinite(y).all():
+                    raise ValueError("nonfinite saved response evaluation")
+                lo, hi = r["model"].x_range
+                supported = (x >= lo) & (x <= hi)
+                color = plt.get_cmap("tab10")(i % 10)
+                ax.plot(x, np.where(supported, y, np.nan), color=color, lw=1.5,
+                        label=f"{r['peak']}  lag={r['lag']}  train R²={r['training_r2']:.2f}")
+                ax.plot(x, np.where(~supported, y, np.nan), color=color, ls="--", lw=1., alpha=.65)
+                ax.scatter([lo, hi], r["model"].predict(np.array([lo, hi])), color=color, s=10)
+                ax.scatter([0.], r["model"].predict(np.array([0.])), color=color, marker="x", s=22)
+                selected_records.append({k: v for k, v in r.items() if k not in ("model", "bundle")})
+            ax.axvline(0, color="#b33333", lw=1, ls=":", label="Complete KO input")
+            ax.set(xlabel=f"{labels.get(tf, tf)} input ({chosen[0]['input_unit']})",
+                   ylabel=f"Fitted peak response ({chosen[0]['output_unit']})",
+                   title=f"{labels.get(tf, tf)} → peaks · Cluster {ctx}\nHigh training-fit rank; no validation confidence probability" + intervention_context(targets, labels))
+            ax.legend(fontsize=7, loc="upper left", bbox_to_anchor=(1.02, 1))
+            ax.grid(alpha=.16)
+        if len(targets) > 1:
+            fig.suptitle("Joint KO: " + " + ".join(labels.get(t, t) for t in sorted(targets))
+                         + f" · Cluster {ctx}", fontsize=14)
         figure_footer(fig, "Solid: saved WT input range; dashed: extrapolation; dots: WT endpoints; ×: input zero.\n"
                 "Ranking: single training R², then saved screening FDR/p if available. No refitting or whole-model prediction.",
                 )
-        ax.legend(fontsize=7, loc="upper left", bbox_to_anchor=(1.02, 1))
-        ax.grid(alpha=.16)
-        save_figure(fig, output, f"tf_response_{slug(labels.get(tf, tf))}_{slug(tf)}_context_{slug(ctx)}")
+        subject = "joint_" + "_".join(slug(t) for t in sorted(targets)) if len(targets) > 1 else slug(labels.get(tf, tf)) + "_" + slug(tf)
+        save_figure(fig, output, f"tf_response_{subject}_context_{slug(ctx)}")
+        if len(targets) > 1:
+            archive_split_joint_plots(output, [f"tf_response_{slug(labels.get(t, t))}_{slug(t)}_context_{slug(ctx)}" for t in targets])
     pd.DataFrame(selected_records).to_csv(output / "tf_response_selected.csv", index=False)
 
 
@@ -787,12 +846,19 @@ def ranked_response_curves(curves, limit=5):
 
 
 def individual_response(curve, ctx, labels, output, name, layer):
+    fig, ax = plt.subplots(figsize=(9, 6))
+    draw_individual_response(ax, curve, ctx, labels, layer)
+    figure_footer(fig, 'Saved single response, before alpha weighting; no refitting.\n'
+                  'Solid: WT range; dashed: extrapolation; ×: zero input. Training R² is not validation.')
+    save_figure(fig, output, name)
+
+
+def draw_individual_response(ax, curve, ctx, labels, layer):
     model = curve['model']
     lo, hi = model.x_range
     x = np.linspace(0., max(hi, 1e-8), 250)
     y = model.predict(x)
     supported = (x >= lo) & (x <= hi)
-    fig, ax = plt.subplots(figsize=(9, 6))
     ax.plot(x, np.where(supported, y, np.nan), color='#346ca0', lw=2)
     ax.plot(x, np.where(~supported, y, np.nan), color='#346ca0', ls='--', lw=1)
     ax.scatter([lo, hi], model.predict(np.array([lo, hi])), color='#346ca0')
@@ -805,8 +871,14 @@ def individual_response(curve, ctx, labels, output, name, layer):
            ylabel=f"Fitted response ({curve['output_unit']})",
            title=f"{labels.get(source, source)} → {labels.get(target, target)} · Cluster {ctx}\n"
                  f"Single training R²={r2_label} · alpha={curve['alpha']:.4g} · lag={curve['lag']}")
-    figure_footer(fig, 'Saved single response, before alpha weighting; no refitting.\n'
-                  'Solid: WT range; dashed: extrapolation; ×: zero input. Training R² is not validation.')
+
+
+def joint_companion_response(curves, ctx, labels, output, name, targets):
+    fig, axes = plt.subplots(len(curves), 1, figsize=(9, 5 * len(curves)), squeeze=False)
+    for ax, curve in zip(axes[:, 0], curves):
+        draw_individual_response(ax, curve, ctx, labels, 'tf_peak')
+    fig.suptitle("Joint KO: " + " + ".join(labels.get(t, t) for t in sorted(targets)), fontsize=14)
+    figure_footer(fig, 'Saved per-TF single responses, before alpha weighting; not an additive joint prediction.')
     save_figure(fig, output, name)
 
 
@@ -850,7 +922,11 @@ def cluster_top_responses(root, archives, labels, output, workers=1):
 
 def trajectory_companion_responses(root, path, curve, ctx, labels, output, name):
     """One saved single per layer, exactly matching a successfully drawn trace."""
-    individual_response(curve, ctx, labels, output, name+'_tf_response', 'tf_peak')
+    if isinstance(curve, list):
+        joint_companion_response(curve, ctx, labels, output, name+'_tf_response',
+                                 json.loads(path['joint_target_ids_json']))
+    else:
+        individual_response(curve, ctx, labels, output, name+'_tf_response', 'tf_peak')
     file = root/'checkpoints'/f'cluster_{ctx}'/'step5_atac_to_rna.pkl'
     if not file.exists():
         note(f"skip companion peak→gene response: missing {file}")
@@ -896,17 +972,25 @@ def validated_peak_baseline(atac_file, registry, peaks):
     return operator @ normalized
 
 
+def curve_target_bins(registry, curve):
+    bundle = curve['bundle']
+    if 'bin_to_support' in registry['context'] and 'support_rows' in bundle:
+        inverse = {int(s): b for b, s in enumerate(registry['context']['bin_to_support']) if s >= 0}
+        return [inverse[int(s)] for s in bundle['support_rows']]
+    return list(bundle['target_rows'])
+
+
 def trajectory_plots(root, archives, history, requested, targets, labels, output, top_paths, atac_file,
-                     *, selected_pathways=None):
+                     *, selected_pathways=None, prefix=""):
     if not requested:
         note("skip triple traces: TRAJECTORY_GENES is NULL")
         return
     if selected_pathways is None:
-        pathways, aliases = load_pathways(root, labels)
+        pathways, aliases = load_pathways(root, labels, **({"prefix": prefix} if prefix else {}))
         pathways = requested_pathways(pathways, requested, aliases)
     else:
         pathways = selected_pathways
-    event_file = root / "perturbation_projection_events.csv"
+    event_file = table_paths(root, "perturbation_projection_events.csv", prefix)[0]
     event_parts = []
     if event_file.exists() and not pathways.empty:
         for part in pd.read_csv(event_file, chunksize=200000, low_memory=False):
@@ -933,19 +1017,25 @@ def trajectory_plots(root, archives, history, requested, targets, labels, output
             paths["rank"] = pd.to_numeric(paths[effect_field], errors="coerce").abs()
             paths = paths.sort_values("rank", ascending=False)
         paths = paths.drop_duplicates(["context", "tf_id", "peak_id"])
-        # The display cap applies independently to each jointly knocked-out TF
-        # and context, so a strong TF cannot remove every path of its partner.
-        paths = (paths.groupby(["context", "tf_id"], sort=False).head(top_paths)
-                 if len(targets) > 1 else paths.head(top_paths))
-        for _, path in paths.iterrows():
+        if len(targets) > 1:
+            selected = paths.drop_duplicates(["context", "peak_id"]).groupby("context", sort=False).head(top_paths)
+            selected_keys = set(zip(selected.context, selected.peak_id))
+            paths = paths.loc[[(c, p) in selected_keys for c, p in zip(paths.context, paths.peak_id)]]
+            display_paths = paths.drop_duplicates(["context", "peak_id"])
+        else:
+            paths = paths.head(top_paths)
+            display_paths = paths
+        for _, path in display_paths.iterrows():
             ctx, tf, peak = path.context, path.tf_id, path.peak_id
             if ctx not in archives:
                 note(f"skip {requested_gene}/{ctx}/{peak}: no authenticated TF archive")
                 continue
             registry, curves, _ = archives[ctx]
-            edges = pathway_edges(pd.DataFrame([path]))
-            matching = [c for c in curves if c["peak"] == peak and c["tf"] == tf and
-                        (c["lag"] == "local" or (ctx, tf, str(peak), c["lag"]) in edges or (ctx, tf, str(peak), None) in edges)]
+            members = paths[(paths.context == ctx) & (paths.peak_id == peak)]
+            edges = pathway_edges(members)
+            matching = [c for c in curves if c["peak"] == peak and c["tf"] in set(members.tf_id) and
+                        (c["lag"] == "local" or (ctx, c["tf"], str(peak), c["lag"]) in edges or
+                         (ctx, c["tf"], str(peak), None) in edges)]
             if not matching:
                 note(f"skip {requested_gene}/{ctx}/{peak}: saved TF path absent from fitted archive")
                 continue
@@ -962,18 +1052,15 @@ def trajectory_plots(root, archives, history, requested, targets, labels, output
                 continue
             saved_delta = peak_events.set_index("bin")
             upper = matching[0]["bundle"]["bounds"][1]
-            if "bin_to_support" in registry["context"] and "support_rows" in matching[0]["bundle"]:
-                inverse = {int(s):b for b,s in enumerate(registry["context"]["bin_to_support"]) if s>=0}
-                global_rows = [inverse[int(s)] for s in matching[0]["bundle"]["support_rows"]]
-            else:
-                global_rows = matching[0]["bundle"]["target_rows"]
-            expected_rows = set(global_rows)
+            expected_rows = {b for c in matching for b in curve_target_bins(registry, c)}
             fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
             data_parts = []
-            for role, feature in (("TF", tf), ("Gene", gene)):
+            tf_subject = sorted(targets) if len(targets) > 1 else [tf]
+            for role, feature in [("TF", t) for t in tf_subject] + [("Gene", gene)]:
                 rows = history[(history.context == ctx) & (history.gene_id == feature)].copy()
                 rows["role"] = role
-                data_parts.append(rows[["context", "branch", "bin", "pseudotime", "role", "control_state", "state_value", "state_unit"]])
+                rows["feature_id"] = feature
+                data_parts.append(rows[["feature_id", "context", "branch", "bin", "pseudotime", "role", "control_state", "state_value", "state_unit"]])
             peak_rows = []
             for b, wt in enumerate(baseline):
                 ko = np.nan if b in expected_rows else wt
@@ -981,55 +1068,74 @@ def trajectory_plots(root, archives, history, requested, targets, labels, output
                     event = saved_delta.loc[b]
                     ko = float(np.clip(wt + event.delta_native, 0, upper)) if event.status in ("ok", "ATAC_physical_clip") else np.nan
                 peak_rows.append(dict(context=ctx, branch=registry["context"]["bin_branch_ids"][b], bin=b,
-                    pseudotime=registry["context"]["bin_centers"][b], role="Peak", control_state=wt,
+                    pseudotime=registry["context"]["bin_centers"][b], role="Peak", feature_id=peak, control_state=wt,
                     state_value=ko, state_unit=registry["output_unit"]))
             data_parts.append(pd.DataFrame(peak_rows))
             data = pd.concat(data_parts, ignore_index=True)
             for ax, role, feature in zip(axes, ("TF", "Peak", "Gene"), (tf, peak, gene)):
                 panel = data[data.role == role]
-                for _, branch in panel.groupby("branch"):
+                for (line_feature, _), branch in panel.groupby(["feature_id", "branch"]):
                     branch = branch.sort_values("bin")
                     # Missing bins create gaps; separate branch lines never join.
                     first, last = int(branch.bin.min()), int(branch.bin.max())
                     branch = branch.set_index("bin").reindex(range(first, last + 1))
                     for field, color, style, label in (("control_state", "#346ca0", "-", "WT"), ("state_value", "#ce5145", "--", "KO")):
-                        ax.plot(branch.pseudotime, branch[field], color=color, ls=style, lw=1.8, label=label)
+                        ax.plot(branch.pseudotime, branch[field], color=color, ls=style, lw=1.8,
+                                label=(f"{labels.get(line_feature, line_feature)} {label}" if role == "TF" and len(targets) > 1 else label),
+                                marker=(['o', 's', '^', 'D'][tf_subject.index(line_feature) % 4] if role == 'TF' and len(targets) > 1 else None),
+                                markevery=max(1, len(branch) // 8), markersize=3)
                 unit = panel.state_unit.dropna().unique()
-                ax.set(ylabel=f"{role}: {labels.get(feature, feature)}\n{unit[0] if len(unit) else 'unavailable'}")
+                feature_label = " + ".join(labels.get(t, t) for t in tf_subject) if role == "TF" else labels.get(feature, feature)
+                ax.set(ylabel=f"{role}: {feature_label}\n{unit[0] if len(unit) else 'unavailable'}")
                 ax.grid(alpha=.16)
             handles, names = axes[0].get_legend_handles_labels()
             axes[0].legend(dict(zip(names, handles)).values(), dict(zip(names, handles)).keys(), loc="best")
-            lag = matching[0]["lag"]
-            lag_label = "TF lag varies by bin" if lag == "local" else f"TF lag {lag} bin(s)"
-            axes[0].set_title(f"{labels.get(tf, tf)} → {peak} → {labels.get(gene, gene)} · Cluster {ctx}\nSaved temporal path; {lag_label}; no allocated causal claim" + intervention_context(targets, labels))
+            lag_label = "; ".join(f"{labels.get(c['tf'], c['tf'])}: " +
+                ("lag varies by bin" if c['lag'] == 'local' else f"lag {c['lag']} bin(s)") for c in matching)
+            subject_label = " + ".join(labels.get(t, t) for t in tf_subject)
+            axes[0].set_title(f"{subject_label} → {peak} → {labels.get(gene, gene)} · Cluster {ctx}\nSaved temporal path; {lag_label}; no allocated causal claim" + intervention_context(targets, labels))
             axes[-1].set_xlabel("Native pseudotime (lag retained; branches shown separately)")
-            name = f"trajectory_{slug(labels.get(gene, gene))}_{slug(gene)}_{slug(tf)}_{slug(peak)}_context_{slug(ctx)}"
+            subject_id = "joint_" + "_".join(slug(t) for t in sorted(targets)) if len(targets) > 1 else slug(tf)
+            name = f"trajectory_{slug(labels.get(gene, gene))}_{slug(gene)}_{subject_id}_{slug(peak)}_context_{slug(ctx)}"
             save_figure(fig, output, name)
-            # Companion plots are tied to the trace actually emitted, and are
-            # never removed by the unrelated response-gallery R² threshold.
-            trajectory_companion_responses(root, path, matching[0], ctx, labels, output, name)
-            data["downstream_gene"] = gene
-            data["tf"] = tf
-            data["peak"] = peak
-            if lag == "local":
-                bundle = matching[0]["bundle"]
-                column = bundle["input_keys"].index([tf,"local"])
-                lags = {b:int(bundle["selected_lag"][i][column]) for i,b in enumerate(global_rows)}
-                data["tf_lag"] = data.bin.map(lags)
-                data["tf_source_bin"] = np.where(data.tf_lag>=0,data.bin-data.tf_lag,-1)
-                data["lag_mode"] = "local"
-            else:
-                data["tf_lag"] = lag
-            data["target_gene_ids_json"] = json.dumps(sorted(targets))
-            exported.append(data)
+            if len(targets) > 1:
+                path = path.copy()
+                path['joint_target_ids_json'] = json.dumps(sorted(targets))
+            trajectory_companion_responses(root, path, matching if len(targets) > 1 else matching[0], ctx, labels, output, name)
+            if len(targets) > 1:
+                archive_split_joint_plots(output, [
+                    f"trajectory_{slug(labels.get(gene, gene))}_{slug(gene)}_{slug(t)}_{slug(peak)}_context_{slug(ctx)}{suffix}"
+                    for t in targets for suffix in ('', '_tf_response', '_peak_gene_response')])
+            # Keep route-specific lag provenance, with one shared plotted trajectory ID.
+            for curve in matching:
+                route_data = data.copy()
+                route_data["trajectory_id"] = name
+                route_data["downstream_gene"] = gene
+                route_data["tf"] = curve['tf']
+                route_data["peak"] = peak
+                lag = curve['lag']
+                if lag == "local":
+                    bundle = curve["bundle"]
+                    column = bundle["input_keys"].index([curve['tf'], "local"])
+                    curve_rows = curve_target_bins(registry, curve)
+                    lags = {b: int(bundle["selected_lag"][i][column]) for i, b in enumerate(curve_rows)}
+                    route_data["tf_lag"] = route_data.bin.map(lags)
+                    route_data["tf_source_bin"] = np.where(route_data.tf_lag >= 0, route_data.bin - route_data.tf_lag, -1)
+                    route_data["lag_mode"] = "local"
+                else:
+                    route_data["tf_lag"] = lag
+                route_data["target_gene_ids_json"] = json.dumps(sorted(targets))
+                exported.append(route_data)
     if exported:
         pd.concat(exported, ignore_index=True).to_csv(output / "trajectory_trace_data.csv", index=False)
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--result-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--intervention", help="Single-KO TF prefix or stable ID; default: all manifest interventions")
     parser.add_argument("--trajectory-genes", default="")
     parser.add_argument("--trajectory-peaks", default="", help="Comma-separated exact saved peak IDs; intersect with requested genes")
     parser.add_argument("--trajectory-top-paths", type=int, default=3)
@@ -1043,17 +1149,38 @@ def main(argv=None):
         parser.error("workers must be a positive integer")
     if args.tf_response_top_n < 0 or args.trajectory_top_paths < 1 or not np.isfinite(args.tf_response_min_r2):
         parser.error("top-n must be nonnegative, top-paths positive, and min-r2 finite")
+    interventions = select_interventions(args.result_dir, args.intervention)
+    if len(interventions) > 1:
+        failures = []
+        for target, prefix in interventions.items():
+            note(f"single KO: {prefix}; output: {args.output_dir / prefix}")
+            try:
+                status = main(argv + ["--intervention", target, "--output-dir", str(args.output_dir / prefix)])
+            except Exception:
+                traceback.print_exc()
+                status = 1
+            if status:
+                failures.append(prefix)
+        if failures:
+            note("Failed interventions: " + ", ".join(failures))
+        return int(bool(failures))
+    prefix = next(iter(interventions.values()), "")
+    selection = {"prefix": prefix} if prefix else {}
+    if prefix and args.intervention in (None, "ALL", "__ALL__"):
+        args.output_dir = args.output_dir / prefix
     args.output_dir.mkdir(parents=True, exist_ok=True)
     plt.rcParams.update({"font.size": 10, "axes.spines.top": False, "axes.spines.right": False})
     with timed_step("labels and intervention"):
-        labels, targets = labels_and_targets(args.result_dir)
+        labels, targets = labels_and_targets(args.result_dir, **selection)
+        if interventions and targets != set(interventions):
+            raise ValueError("Selected result intervention differs from filename manifest")
     requested = [x.strip() for x in args.trajectory_genes.split(",") if x.strip()]
     peaks = [x.strip() for x in args.trajectory_peaks.split(',') if x.strip()]
     selected_tfs = set(targets)
     related_edges = None
     if requested or peaks:
         with timed_step("pathway loading and selection"):
-            paths, aliases = load_pathways(args.result_dir, labels)
+            paths, aliases = load_pathways(args.result_dir, labels, **selection)
             if requested:
                 paths = requested_pathways(paths, requested, aliases)
             paths = requested_peak_pathways(paths, peaks)
@@ -1092,7 +1219,7 @@ def main(argv=None):
             plt.close("all")
 
     def read_history():
-        history = load_history(args.result_dir, wanted, targets) if requested or args.model_diagnostic_plots == "true" else pd.DataFrame()
+        history = load_history(args.result_dir, wanted, targets, **selection) if requested or args.model_diagnostic_plots == "true" else pd.DataFrame()
         return validate_history_axes(history, archives)
 
     history = attempt("saved RNA history validation", read_history)
@@ -1133,7 +1260,7 @@ def main(argv=None):
         attempt("WT/KO trajectory plots", lambda: trajectory_plots(
             args.result_dir, archives, history, requested, targets, labels, args.output_dir,
             args.trajectory_top_paths, atac_file,
-            **({"selected_pathways": paths} if requested else {})))
+            **dict(selection, **({"selected_pathways": paths} if requested else {}))))
     if failures:
         note("Failed plot steps: " + "; ".join(failures))
     return 1 if failures else 0

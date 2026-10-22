@@ -10,6 +10,8 @@
 # Examples:
 #   Rscript visualize_perturbation.R
 #   Rscript visualize_perturbation.R /path/to/results/ --genes RASSF2,CBWD2,CDH1
+#   Rscript visualize_perturbation.R results/test/RUNX1_KLF1_each/ --intervention RUNX1
+#   Without --intervention, draw each separate KO into figures_R/<TF>/.
 # =============================================================================
 
 # ==============================================================================
@@ -29,6 +31,9 @@ PROJECT_DIR <- if (length(vis_source_files)) {
 
 # Input results directory: select the run to visualize.
 RESULT_DIR <- file.path(PROJECT_DIR, "results/example")
+# Separate KO selection: NULL draws all TFs; select a prefix or stable gene ID.
+# Override with --intervention or CAUSALBRIDGE_VIS_INTERVENTION; unset for legacy/joint KO directories.
+INTERVENTION_TF <- NULL
 # Original ATAC counts for trajectories; must match the model run in RESULT_DIR.
 # Independent input path, not necessarily inside RESULT_DIR; update when switching datasets.
 # NULL reads the saved run configuration; --trajectory-atac-file overrides this value.
@@ -285,11 +290,45 @@ vis_layout_pathways <- function(df) {
   df
 }
 
+vis_interventions <- function(result_dir, selected = NULL) {
+  manifest <- file.path(result_dir, "intervention_outputs.json")
+  if (!file.exists(manifest)) {
+    if (!is.null(selected) && !selected %in% c("ALL", "__ALL__"))
+      stop("--intervention requires intervention_outputs.json")
+    return(data.frame(id = "", prefix = "", stringsAsFactors = FALSE))
+  }
+  if (!requireNamespace("jsonlite", quietly = TRUE)) stop("Intervention manifest requires R package jsonlite")
+  mapping <- jsonlite::fromJSON(manifest)$filename_prefixes
+  if (!is.list(mapping) && !is.character(mapping)) stop("Invalid intervention filename manifest")
+  prefixes <- unlist(mapping, use.names = FALSE)
+  ids <- names(mapping)
+  if (!length(prefixes) || length(ids) != length(prefixes) || anyDuplicated(prefixes) ||
+      !is.character(prefixes) || any(is.na(prefixes)) || any(!nzchar(prefixes)) ||
+      any(prefixes %in% c(".", "..")) || any(grepl("/", prefixes, fixed = TRUE)) ||
+      any(grepl(intToUtf8(92), prefixes, fixed = TRUE))) stop("Invalid intervention filename prefixes")
+  result <- data.frame(id = ids, prefix = prefixes, stringsAsFactors = FALSE)
+  if (!is.null(selected) && !selected %in% c("ALL", "__ALL__")) {
+    result <- result[result$id == selected | result$prefix == selected, , drop = FALSE]
+    if (nrow(result) != 1L) stop(paste("Unknown or ambiguous intervention; choose", paste(prefixes, collapse = ", ")))
+  }
+  result
+}
+
+vis_result_file <- function(name, directory = RESULT_DIR, prefix = INPUT_PREFIX) {
+  intervention_files <- c("perturbation_results.csv", "perturbation_merged.csv",
+    "perturbation_pathways.csv", "atac_changes_merged.csv", "perturbation_projection_bin_history.csv",
+    "projection_history.csv", "perturbation_cell_projection.csv")
+  if (nzchar(prefix) && name %in% intervention_files) name <- paste0(prefix, "_", name)
+  file.path(directory, name)
+}
+
 vis_config <- function(args = commandArgs(trailingOnly = TRUE),
                        result_dir = RESULT_DIR, output_dir = OUTPUT_DIR,
-                       pathway_genes = PATHWAY_GENES) {
+                       pathway_genes = PATHWAY_GENES, intervention = INTERVENTION_TF) {
   # Resolve overrides without creating directories or loading plotting packages.
   result_dir <- Sys.getenv("CAUSALBRIDGE_RESULT_DIR", unset = result_dir)
+  intervention_env <- Sys.getenv("CAUSALBRIDGE_VIS_INTERVENTION", unset = "")
+  if (nzchar(intervention_env)) intervention <- intervention_env
   output_env <- Sys.getenv("CAUSALBRIDGE_OUTPUT_DIR", unset = "")
   if (nzchar(output_env)) output_dir <- output_env
   genes_env <- Sys.getenv("CAUSALBRIDGE_PATHWAY_GENES", unset = "")
@@ -299,15 +338,16 @@ vis_config <- function(args = commandArgs(trailingOnly = TRUE),
   result_arg <- NULL
   i <- 1
   while (i <= length(args)) {
-    if (args[i] %in% c("--trajectory-genes", "--trajectory-top-paths", "--tf-response-top-n",
+    if (args[i] %in% c("--trajectory-genes", "--trajectory-peaks", "--workers", "--trajectory-top-paths", "--tf-response-top-n",
         "--tf-response-min-r2", "--model-diagnostic-plots", "--trajectory-atac-file")) {
       if (i == length(args)) stop(paste("Missing value for", args[i]))
       i <- i + 2
-    } else if (args[i] %in% c("--result-dir", "--output-dir", "--genes")) {
+    } else if (args[i] %in% c("--result-dir", "--output-dir", "--genes", "--intervention")) {
       if (i == length(args)) stop(paste("Missing value for", args[i]))
       if (args[i] == "--result-dir") result_arg <- args[i + 1]
       if (args[i] == "--output-dir") output_dir <- args[i + 1]
       if (args[i] == "--genes") pathway_genes <- parse_genes(args[i + 1])
+      if (args[i] == "--intervention") intervention <- args[i + 1]
       i <- i + 2
     } else {
       if (!startsWith(args[i], "--")) positional <- c(positional, args[i])
@@ -316,8 +356,14 @@ vis_config <- function(args = commandArgs(trailingOnly = TRUE),
   }
   if (length(positional)) result_dir <- positional[1]
   if (!is.null(result_arg)) result_dir <- result_arg
-  if (is.null(output_dir)) output_dir <- file.path(result_dir, "figures_R")
-  list(result_dir = result_dir, output_dir = output_dir, pathway_genes = pathway_genes)
+  interventions <- vis_interventions(result_dir, intervention)
+  if (is.null(output_dir)) {
+    output_dir <- file.path(result_dir, "figures_R")
+    if (nrow(interventions) == 1L && nzchar(interventions$prefix[1]))
+      output_dir <- file.path(output_dir, interventions$prefix[1])
+  }
+  list(result_dir = result_dir, output_dir = output_dir, pathway_genes = pathway_genes,
+       interventions = interventions)
 }
 
 vis_select_pathway_genes <- function(merged, specified = NULL, top_n = TOP_PATHWAY_N) {
@@ -515,7 +561,29 @@ if (!identical(Sys.getenv("CAUSALBRIDGE_VIS_ADAPTERS_ONLY"), "1")) {
 # ==============================================================================
 
 resolved_config <- vis_config()
-RESULT_DIR <- file.path(PROJECT_DIR, "results/example")
+if (nrow(resolved_config$interventions) > 1L) {
+  # Sequential child sessions keep each intervention's tables and figures isolated.
+  failures <- character()
+  for (i in seq_len(nrow(resolved_config$interventions))) {
+    selected <- resolved_config$interventions[i, ]
+    destination <- file.path(resolved_config$output_dir, selected$prefix)
+    message("Single KO: ", selected$prefix, "; figures: ", destination)
+    child_args <- c(file.path(PROJECT_DIR, "visualize_perturbation.R"), commandArgs(trailingOnly = TRUE),
+      "--result-dir", resolved_config$result_dir, "--output-dir", destination,
+      "--intervention", selected$id)
+    status <- system2(file.path(R.home("bin"), "Rscript"), shQuote(child_args))
+    if (status != 0L) failures <- c(failures, selected$prefix)
+  }
+  if (length(failures)) stop(paste("Failed interventions:", paste(failures, collapse = ", ")))
+  message("All intervention figures saved to: ", resolved_config$output_dir)
+}
+}
+
+if (!identical(Sys.getenv("CAUSALBRIDGE_VIS_ADAPTERS_ONLY"), "1") &&
+    nrow(resolved_config$interventions) == 1L) {
+INPUT_PREFIX <- resolved_config$interventions$prefix[1]
+INTERVENTION_ID <- resolved_config$interventions$id[1]
+RESULT_DIR <- resolved_config$result_dir
 OUTPUT_DIR <- resolved_config$output_dir
 specified_genes <- resolved_config$pathway_genes
 dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
@@ -536,6 +604,7 @@ if (length(new_vis_config$genes) || length(new_vis_config$peaks) || new_vis_conf
   if (length(new_vis_config$genes)) helper_args <- c(helper_args, "--trajectory-genes", paste(new_vis_config$genes, collapse = ","))
   if (length(new_vis_config$peaks)) helper_args <- c(helper_args, "--trajectory-peaks", paste(new_vis_config$peaks, collapse = ","))
   if (!is.null(new_vis_config$atac)) helper_args <- c(helper_args, "--trajectory-atac-file", new_vis_config$atac)
+  if (nzchar(INTERVENTION_ID)) helper_args <- c(helper_args, "--intervention", INTERVENTION_ID)
   helper_log <- file.path(OUTPUT_DIR, "model_diagnostics.log")
   python_resolution <- vis_resolve_python()
   helper_python <- python_resolution$python
@@ -643,14 +712,14 @@ if (!is.null(specified_genes)) {
 cat("\n--- Loading data ---\n")
 data_load_started <- proc.time()[["elapsed"]]
 
-pert_res <- vis_effects(read.csv(file.path(RESULT_DIR, "perturbation_results.csv")))
+pert_res <- vis_effects(read.csv(vis_result_file("perturbation_results.csv")))
 cat(sprintf("perturbation_results: %d rows, %d unique genes\n",
             nrow(pert_res), length(unique(pert_res$affected_gene))))
 
-pert_merged <- vis_effects(read.csv(file.path(RESULT_DIR, "perturbation_merged.csv")), merged = TRUE)
+pert_merged <- vis_effects(read.csv(vis_result_file("perturbation_merged.csv")), merged = TRUE)
 cat(sprintf("perturbation_merged: %d rows\n", nrow(pert_merged)))
 
-pathways <- vis_pathways(read.csv(file.path(RESULT_DIR, "perturbation_pathways.csv")))
+pathways <- vis_pathways(read.csv(vis_result_file("perturbation_pathways.csv")))
 cat(sprintf("pathways: %d rows\n", nrow(pathways)))
 
 # Load TF→peak weights to get lag information (per TF, per peak, per cluster)
@@ -671,6 +740,8 @@ cat(sprintf("Data loading and joins finished in %.1f s\n", proc.time()[["elapsed
 # intervention as a comma- or plus-delimited string (for example KLF1,GATA1),
 # while pathway tf_name values remain individual gene symbols.
 target_gene_names <- vis_targets(pert_merged)$ids
+if (nzchar(INTERVENTION_ID) && !setequal(target_gene_names, INTERVENTION_ID))
+  stop("Selected result intervention differs from filename manifest")
 target_gene_name <- paste(vis_targets(pert_merged)$names, collapse = " + ")
 for (table in list(pert_res, pathways)) {
   if (nrow(table) && !setequal(vis_targets(table)$ids, target_gene_names))
@@ -1272,7 +1343,8 @@ plot_radial_cluster_pathway <- function(gene_name, pw_df, cluster_res, merged_df
     node_labels$node_type, drop = TRUE))
   for (g in label_groups) if (nrow(g) > 1) {
     g <- g[order(g$theta), , drop = FALSE]
-    half_width <- g$label_chars * .0065 * g$label_size / g$label_r
+    # Text extent is the full width; use half on each side of the label center.
+    half_width <- g$label_chars * .0065 * g$label_size / (2 * g$label_r)
     stopifnot(all(g$theta[-nrow(g)] + half_width[-nrow(g)] <=
       g$theta[-1] - half_width[-1] + 1e-9))
   }
@@ -1724,7 +1796,7 @@ cat(sprintf("[OK] Cross-cluster heatmap saved: %s\n",
 # ==============================================================================
 cat("\n--- Chromosome-wide ATAC accessibility change ---\n")
 
-atac_changes_path <- file.path(RESULT_DIR, "atac_changes_merged.csv")
+atac_changes_path <- vis_result_file("atac_changes_merged.csv")
 if (!file.exists(atac_changes_path)) {
   warning(sprintf(
     "Missing optional ATAC accessibility file: %s; skipping chromosome-wide plot",
@@ -2301,8 +2373,8 @@ if (file.exists(rna_h5ad_path) && file.exists(pseudotime_path)) {
     }
   }
 
-  history_path <- file.path(RESULT_DIR, "perturbation_projection_bin_history.csv")
-  if (!file.exists(history_path)) history_path <- file.path(RESULT_DIR, "intermediate", "projection_history.csv")
+  history_path <- vis_result_file("perturbation_projection_bin_history.csv")
+  if (!file.exists(history_path)) history_path <- vis_result_file("projection_history.csv", file.path(RESULT_DIR, "intermediate"))
   if (file.exists(history_path)) {
     # Saturating models export complete bin states, not allocated pathway RNA
     # contributions. Use each bin's actual KO−WT response without accumulating
@@ -2527,7 +2599,7 @@ if (file.exists(rna_h5ad_path) && file.exists(pseudotime_path)) {
 # ===============================================================================
 # Show the projection shift on the existing cell embedding; colour carries the
 # signed change in pseudotime while source contexts remain separately readable.
-projection_file <- file.path(RESULT_DIR, "perturbation_cell_projection.csv")
+projection_file <- vis_result_file("perturbation_cell_projection.csv")
 if (!file.exists(projection_file)) {
   warning(sprintf(
     "Missing %s; skip projection overview",

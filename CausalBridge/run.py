@@ -1538,6 +1538,52 @@ def _run_modeling_for_subset(
         tf_model_registry=tf_model_registry)
 
 
+
+def _merge_atac_changes(cluster_results, cluster_cell_counts, config):
+    """Keep separate KO conditions apart during cell-weighted ATAC merging."""
+    frames = []
+    for result in cluster_results:
+        frame = result.get("atac_changes")
+        if frame is None or frame.empty:
+            continue
+        frame = frame.copy()
+        frame["cluster"] = str(result.get("cluster", ""))
+        frame["_weight"] = cluster_cell_counts.get(str(result.get("cluster", "")), 0)
+        frames.append(frame)
+    if not frames:
+        return pd.DataFrame()
+    all_changes = pd.concat(frames, ignore_index=True)
+    total_cells = sum(cluster_cell_counts.values())
+    if total_cells <= 0 or len(cluster_cell_counts) <= 1:
+        return pd.concat([r["atac_changes"] for r in cluster_results
+                          if r.get("atac_changes") is not None and not r["atac_changes"].empty],
+                         ignore_index=True)
+    keys = (["target_gene"] if "target_gene" in all_changes else []) + ["peak_id"]
+    rows = []
+    for identity, group in all_changes.groupby(keys, sort=True, dropna=False):
+        if group["_weight"].sum() == 0:
+            continue
+        if not isinstance(identity, tuple):
+            identity = (identity,)
+        row = dict(zip(keys, identity))
+        row.update(chr=group["chr"].iloc[0], start=int(group["start"].iloc[0]),
+                   end=int(group["end"].iloc[0]),
+                   delta_accessibility_signed=float((group.delta_accessibility * group._weight).sum() / total_cells),
+                   delta_accessibility=float((group.delta_accessibility.abs() * group._weight).sum() / total_cells),
+                   n_clusters_observed=group.cluster.nunique())
+        for unit in ("atac_state_unit", "atac_intervention_unit"):
+            if unit in group:
+                row[unit] = group[unit].iloc[0]
+        if "z_score" in group:
+            row["z_score"] = float((group.z_score * group._weight).sum() / total_cells)
+            row["is_significant"] = abs(row["z_score"]) >= config.get("perturbation", {}).get("atac_significance_zscore", 2.)
+        if "status" in group and group.status.eq("unavailable").any():
+            row.update(status="unavailable", delta_accessibility=np.nan,
+                       delta_accessibility_signed=np.nan, z_score=np.nan, is_significant=False)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def _finish_modeling_for_subset(*, rna_adata, atac_adata, target_genes,
         gene_types, config, _cfg, suffix, pseudotime_df, plan_kwargs, enabled,
         identity_mode, binning_output_metadata, granger_results, causal_edges,
@@ -2223,54 +2269,10 @@ def run_pipeline(config_path: str) -> dict:
     # modeled contexts, so skipped/failed contexts must not enter this
     # denominator.  Keep this count local to preserve the prior ATAC behavior.
     modeled_total_cells = sum(cluster_cell_counts.values())
-    if atac_changes_dfs and modeled_total_cells > 0 and len(cluster_cell_counts) > 1:
-        ac_tagged = []
-        for r in all_cluster_results:
-            ac = r.get("atac_changes")
-            if ac is None or ac.empty:
-                continue
-            ac = ac.copy()
-            cl = str(r.get("cluster", ""))
-            ac["cluster"] = cl
-            ac["_weight"] = cluster_cell_counts.get(cl, 0)
-            ac_tagged.append(ac)
-        ac_full = pd.concat(ac_tagged, ignore_index=True)
-        merged_atac_rows = []
-        for peak_id, grp in ac_full.groupby("peak_id"):
-            wsum = grp["_weight"].sum()
-            if wsum == 0:
-                continue
-            row = {
-                "peak_id": peak_id,
-                "chr": grp["chr"].iloc[0],
-                "start": int(grp["start"].iloc[0]),
-                "end": int(grp["end"].iloc[0]),
-                "delta_accessibility_signed": float(
-                    (grp["delta_accessibility"] * grp["_weight"]).sum() / modeled_total_cells
-                ),
-                "delta_accessibility": float(
-                    (grp["delta_accessibility"].abs() * grp["_weight"]).sum() / modeled_total_cells
-                ),
-                "n_clusters_observed": len(grp),
-            }
-            if "z_score" in grp.columns:
-                row["z_score"] = float(
-                    (grp["z_score"] * grp["_weight"]).sum() / modeled_total_cells
-                )
-                row["is_significant"] = abs(row["z_score"]) >= config.get("perturbation", {}).get(
-                    "atac_significance_zscore", 2.0
-                )
-            if "status" in grp and grp["status"].eq("unavailable").any():
-                row.update(status="unavailable",delta_accessibility=np.nan,
-                    delta_accessibility_signed=np.nan,z_score=np.nan,is_significant=False)
-            merged_atac_rows.append(row)
-        all_results['atac_changes_merged'] = pd.DataFrame(merged_atac_rows)
-    else:
-        all_results['atac_changes_merged'] = all_results['atac_changes'].copy() if not all_results['atac_changes'].empty else pd.DataFrame()
+    all_results['atac_changes_merged'] = _merge_atac_changes(
+        all_cluster_results, cluster_cell_counts, config)
 
     del atac_changes_dfs
-    if "ac_full" in locals():
-        del ac_full, ac_tagged, ac, grp
 
     # 合并各簇的上游 TF 归因 (peak KO 模式; gene 模式下为空)
     upstream_dfs = [

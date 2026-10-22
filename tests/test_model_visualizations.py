@@ -252,6 +252,7 @@ def test_r_python_failure_reports_command_exit_status_and_stderr(tmp_path):
     env = dict(os.environ, CAUSALBRIDGE_VIS_PYTHON=str(executable),
                CAUSALBRIDGE_OUTPUT_DIR=str(output))
     result = subprocess.run(["Rscript", str(ROOT / "visualize_perturbation.R"),
+                             "--result-dir", str(tmp_path / "legacy-results"),
                              "--new-visualizations-only"], cwd=tmp_path, env=env,
                             text=True, capture_output=True)
     assert result.returncode == 23
