@@ -432,7 +432,13 @@ This ridge **includes the intercept**, rather than penalizing only interactions 
 
 [LaTeX](docs/equations/response-6-5-03.tex)
 
-**spline groups** first apply each input's WT min–max transformation to obtain $`z_j`$. Let $`m_j=\operatorname{median}_i z_{ij}`$. $`N_{j1},N_{j2}`$ are natural cubic interpolation bases at knots $`(0,m_j,1)`$, with respective values $`(0,1,0)`$ and $`(0,0,1)`$ and zero second derivatives at endpoints. Extend every basis with $`T_\tau`$ from 6.4 and define:
+**spline groups** first apply each input's WT min–max transformation to obtain $`z_j`$, with the WT median of each input defining its internal knot:
+
+![WT median knot](docs/equations/response-6-5-median.svg)
+
+[LaTeX](docs/equations/response-6-5-median.tex)
+
+Here, $`N_{j1},N_{j2}`$ are natural cubic interpolation bases at knots $`(0,m_j,1)`$, with respective values $`(0,1,0)`$ and $`(0,0,1)`$ and zero second derivatives at endpoints. Extend every basis with $`T_\tau`$ from 6.4 and define:
 
 ![Equation 6.5.4](docs/equations/response-6-5-04.svg)
 
