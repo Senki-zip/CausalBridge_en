@@ -1213,7 +1213,7 @@ Methods and resources:
 - [JASPAR](https://jaspar.elixir.no/), [gimmemotifs](https://github.com/vanheeringen-lab/gimmemotifs): record actual motif / mapping versions.
 - [regulatory_pseudotime_design.md](regulatory_pseudotime_design.md): research-design discussion; current code / this guide define execution semantics.
 
-This repository has no separate LICENSE file. External dependency licenses are not the project's license. For publication / reuse, record actual methods, assembly, databases, software, and input provenance; do not invent a project citation.
+CausalBridge source code is released under the [MIT License](LICENSE). External dependencies, third-party artwork and datasets retain their respective licenses and terms. For publication / reuse, record actual methods, assembly, databases, software, and input provenance; do not invent a project citation.
 
 <a id="changelog"></a>
 ## 14. Release history
